@@ -4,6 +4,8 @@ import gc
 import base64
 import csv
 import concurrent.futures
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -15,6 +17,7 @@ import threading
 import textwrap
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import pandas as pd
@@ -218,6 +221,10 @@ _RE_THINK_INCOMPLETE = re.compile(
 class Bridge:
     """Exposed to JavaScript via pywebview window.api."""
 
+    TRIAL_DAYS = 30
+    PASSKEY_ENV = "SIMPLIAI_PASSKEY"
+    DEFAULT_PASSKEY = "SIMPLIAI-FULL-ACCESS"
+
     def __init__(self):
         # ── State ──────────────────────────────────────────────
         # Chat state
@@ -287,6 +294,7 @@ class Bridge:
         self._build_config()
         self._load_model_configs()
         self._load_app_settings()
+        self._initialize_activation_state()
         self._load_chats()
         self._init_rag()
         self._load_system_prompts()
@@ -529,6 +537,118 @@ class Bridge:
         if saved_theme:
             self.current_theme = saved_theme[0].upper() + saved_theme[1:].lower()
 
+    def _utc_now_iso(self) -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    def _parse_iso_datetime(self, value):
+        try:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _activation_secret(self) -> str:
+        return str(os.environ.get(self.PASSKEY_ENV, self.DEFAULT_PASSKEY)).strip()
+
+    def _activation_machine_hint(self) -> str:
+        return f"{uuid.getnode()}:{os.environ.get('COMPUTERNAME', '')}"
+
+    def _activation_signature(self, first_opened_at: str, activated_at: str) -> str:
+        payload = f"{first_opened_at}|{activated_at}|{self._activation_machine_hint()}|{self._activation_secret()}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _initialize_activation_state(self):
+        """Persist first-open timestamp and validate existing activation record."""
+        changed = False
+        if not isinstance(self.app_settings, dict):
+            self.app_settings = {}
+            changed = True
+
+        first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip()
+        if not first_opened_at:
+            self.app_settings["trial_first_opened_at"] = self._utc_now_iso()
+            changed = True
+
+        activation = self.app_settings.get("activation", {})
+        if not isinstance(activation, dict):
+            self.app_settings["activation"] = {"activated": False}
+            changed = True
+        elif activation.get("activated"):
+            first_opened = str(self.app_settings.get("trial_first_opened_at", "")).strip()
+            activated_at = str(activation.get("activated_at", "")).strip()
+            sig = str(activation.get("sig", "")).strip()
+            expected = self._activation_signature(first_opened, activated_at) if first_opened and activated_at else ""
+            if not expected or not sig or not hmac.compare_digest(sig, expected):
+                self.app_settings["activation"] = {"activated": False}
+                changed = True
+
+        if changed:
+            self.chat_db.set_kv("app_settings", self.app_settings)
+
+    def _get_activation_status(self) -> dict:
+        first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip()
+        first_dt = self._parse_iso_datetime(first_opened_at)
+        if not first_dt:
+            first_opened_at = self._utc_now_iso()
+            self.app_settings["trial_first_opened_at"] = first_opened_at
+            self.chat_db.set_kv("app_settings", self.app_settings)
+            first_dt = self._parse_iso_datetime(first_opened_at)
+
+        now_dt = datetime.now(timezone.utc)
+        days_used = max(0, (now_dt - first_dt).days) if first_dt else 0
+        is_trial_active = days_used < self.TRIAL_DAYS
+        days_left = max(0, self.TRIAL_DAYS - days_used)
+
+        activation = self.app_settings.get("activation", {})
+        is_activated = False
+        activated_at = ""
+        if isinstance(activation, dict) and activation.get("activated"):
+            activated_at = str(activation.get("activated_at", "")).strip()
+            sig = str(activation.get("sig", "")).strip()
+            expected = self._activation_signature(first_opened_at, activated_at) if first_opened_at and activated_at else ""
+            is_activated = bool(expected and sig and hmac.compare_digest(sig, expected))
+
+        return {
+            "trial_days_total": self.TRIAL_DAYS,
+            "first_opened_at": first_opened_at,
+            "days_used": days_used,
+            "days_left": days_left,
+            "is_trial_active": is_trial_active,
+            "is_activated": is_activated,
+            "activated_at": activated_at,
+            "requires_passkey": (not is_activated and not is_trial_active),
+        }
+
+    def _has_full_access(self) -> bool:
+        status = self._get_activation_status()
+        return bool(status.get("is_trial_active") or status.get("is_activated"))
+
+    def get_activation_status(self):
+        """Return current trial/license status for frontend activation UI."""
+        return self._get_activation_status()
+
+    def activate_full_access(self, passkey: str):
+        """Activate full access after trial expiration using passkey."""
+        provided = str(passkey or "").strip()
+        expected = self._activation_secret()
+        if not provided:
+            return {"ok": False, "error": "Passkey is required"}
+        if not expected or not hmac.compare_digest(provided, expected):
+            return {"ok": False, "error": "Invalid passkey"}
+
+        first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip() or self._utc_now_iso()
+        activated_at = self._utc_now_iso()
+        self.app_settings["trial_first_opened_at"] = first_opened_at
+        self.app_settings["activation"] = {
+            "activated": True,
+            "activated_at": activated_at,
+            "sig": self._activation_signature(first_opened_at, activated_at),
+        }
+        self.chat_db.set_kv("app_settings", self.app_settings)
+        return {"ok": True, "status": self._get_activation_status()}
+
     def _load_chats(self):
         self.chats = self.chat_db.load_all_chats()
         if self.chats:
@@ -690,6 +810,8 @@ class Bridge:
 
     def load_model(self):
         """Load the selected model. Returns immediately; sends events."""
+        if not self._has_full_access():
+            return {"error": "Trial expired. Enter passkey to activate full access."}
         if not self.model_path:
             return {"error": "No model selected"}
         if self.model is not None:
@@ -1717,6 +1839,8 @@ class Bridge:
     def agent_chat(self, text: str, role: str = "", task: str = "", steps: str = ""):
         """Synchronous AI chat for the Agent panel with Role-Task-Steps config."""
         try:
+            if not self._has_full_access():
+                return {"error": "Trial expired. Enter passkey to activate full access."}
             self.stop_generation_flag = False
             self.generation_in_progress = True
 
@@ -1833,6 +1957,8 @@ class Bridge:
                     - content (plain text) OR content_base64 (binary payload)
         """
         try:
+            if not self._has_full_access():
+                return {"error": "Trial expired. Enter passkey to activate full access."}
             self.stop_generation_flag = False
             self.generation_in_progress = True
 
@@ -6245,6 +6371,8 @@ Rules:
 
     def send_message(self, text: str):
         """Process user message. Returns immediately; streams via events."""
+        if not self._has_full_access():
+            return {"error": "Trial expired. Enter passkey to activate full access."}
         text = text.strip()
         if not text:
             return {"error": "Empty message"}
@@ -7796,6 +7924,7 @@ Rules:
             "model_loaded": self.model is not None,
             "model_name": Path(self.model_path).name if self.model_path else None,
             "n_ctx": self.actual_n_ctx,
+            "activation": self._get_activation_status(),
         }
 
     def set_theme(self, theme: str):

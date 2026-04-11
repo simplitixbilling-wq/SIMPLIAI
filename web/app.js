@@ -75,6 +75,7 @@ let contextLimitTokens = 0;
 let actualContext = { used: 0, total: 0 };
 let pendingExportTarget = null;
 let isSpeaking = false;
+let fullAccessGranted = true;
 
 const FALLBACK_PIPER_VOICES = [
   // English US
@@ -256,6 +257,75 @@ function showPrompt(title = 'Rename', defaultValue = '') {
     input.addEventListener('keydown', onKey);
     modal.addEventListener('click', onBackdrop);
   });
+}
+
+function applyAccessLockUi(locked, statusText = '') {
+  fullAccessGranted = !locked;
+
+  const input = $('#user-input');
+  const send = $('#btn-send');
+  const agentInput = $('#agent-input');
+  const agentSend = $('#btn-agent-send');
+
+  if (input) input.disabled = locked;
+  if (agentInput) agentInput.disabled = locked;
+  if (send) send.disabled = locked;
+  if (agentSend) agentSend.disabled = locked;
+
+  if (locked && statusText) {
+    setStatus(statusText, true);
+  }
+
+  updateSendButton();
+}
+
+async function ensureActivationGate(forcePrompt = false) {
+  if (!api || typeof api.get_activation_status !== 'function') {
+    return true;
+  }
+
+  let status = null;
+  try {
+    status = await api.get_activation_status();
+  } catch (_) {
+    return true;
+  }
+
+  if (!status?.requires_passkey) {
+    applyAccessLockUi(false);
+    return true;
+  }
+
+  if (!forcePrompt) {
+    applyAccessLockUi(true, `Trial expired after ${status.days_used || 30} days. Activation required.`);
+    return false;
+  }
+
+  let unlocked = false;
+  let attempts = 0;
+  while (!unlocked && attempts < 3) {
+    const entered = await showPrompt('Trial expired - Enter passkey for full access', '');
+    if (entered == null) break;
+
+    try {
+      const result = await api.activate_full_access(entered);
+      if (result?.ok) {
+        unlocked = true;
+        applyAccessLockUi(false);
+        showToast('Activation successful. Full access unlocked.', 'success', 5000);
+        break;
+      }
+      showToast(result?.error || 'Invalid passkey', 'error', 4500);
+    } catch (e) {
+      showToast(`Activation failed: ${e?.message || e}`, 'error', 4500);
+    }
+    attempts += 1;
+  }
+
+  if (!unlocked) {
+    applyAccessLockUi(true, `Trial expired after ${status.days_used || 30} days. Activation required.`);
+  }
+  return unlocked;
 }
 
 function showConfirm(message, title = 'Confirm', okLabel = 'Delete') {
@@ -690,6 +760,11 @@ async function init() {
   setStatus(`${info.config?.mode || 'READY'} | RAM: ${info.system_ram}GB | VRAM: ${info.gpu?.vram ?? '?'}GB`);
   document.documentElement.setAttribute('data-theme', String(info.theme || 'Dark').toLowerCase());
   switchHljsTheme(String(info.theme || 'Dark').toLowerCase());
+
+  const activationOk = await ensureActivationGate(true);
+  if (!activationOk) {
+    showToast('Trial expired. Enter passkey to use full features.', 'warn', 6000);
+  }
 
   // Run independent tasks in parallel for faster load
   const [_, ms, chats] = await Promise.all([
@@ -1265,13 +1340,21 @@ stopBtn.addEventListener('click', async () => {
 
 function updateSendButton() {
   const hasText = inputEl.value.trim().length > 0;
-  sendBtn.disabled = !hasText;
+  sendBtn.disabled = !hasText || !fullAccessGranted;
 }
 
 let streamingBubble = null;
 let isGenerating = false;
 
 async function sendMessage() {
+  if (!fullAccessGranted) {
+    const unlocked = await ensureActivationGate(true);
+    if (!unlocked) {
+      showToast('Activation required to continue.', 'warn');
+      return;
+    }
+  }
+
   const text = inputEl.value.trim();
   if (!text) return;
 
@@ -2725,7 +2808,7 @@ function setAgentActionButtons(processing) {
     send.disabled = true;
     stop.disabled = false;
   } else {
-    send.disabled = false;
+    send.disabled = !fullAccessGranted;
     stop.disabled = true;
   }
 }
@@ -3259,6 +3342,14 @@ $('#agent-input')?.addEventListener('input', function() {
 });
 
 async function agentSend() {
+  if (!fullAccessGranted) {
+    const unlocked = await ensureActivationGate(true);
+    if (!unlocked) {
+      showToast('Activation required to continue.', 'warn');
+      return;
+    }
+  }
+
   if (agentGenerationInProgress) {
     showToast('AI generation is already in progress', 'warning');
     return;

@@ -1,0 +1,41 @@
+RECONCILIATION INSTRUCTIONS
+===========================
+
+You have two CSV files:
+1. test_data_sales.csv - Sales order records
+2. test_data_billing.csv - Billing verification records
+
+RECONCILIATION TASKS:
+
+1. IDENTIFY MISSING ORDERS
+   - Find orders that exist in Sales but NOT in Billing
+   - Find orders that exist in Billing but NOT in Sales
+
+2. MATCH CUSTOMER NAMES
+   - Compare customer names between both files
+   - Identify discrepancies (e.g., "TechStart Inc" vs "TechStart")
+   - Flag potential duplicate customers with different names
+
+3. VERIFY AMOUNTS
+   - Compare Total_Amount / Amount fields for matching orders
+   - If unit prices differ (Unit_Price vs Price), calculate expected totals
+   - Flag orders where amounts don't match after reconciliation
+
+4. HIGHLIGHT DISCREPANCIES
+   - Product name differences (e.g., "Laptop Stand" vs "Monitor Stand")
+   - Quantity differences
+   - Price differences
+   - Status/Verification differences
+
+5. CREATE SUMMARY
+   - Count of matched orders
+   - Count of unmatched orders
+   - List of all discrepancies found
+   - Recommended actions for each discrepancy
+
+Please provide the results in a clear, structured format with:
+- Summary statistics
+- Table of matched orders (good records)
+- Table of mismatched orders (with discrepancies highlighted)
+- Table of orders appearing in only one file
+- Prepared action items for data team

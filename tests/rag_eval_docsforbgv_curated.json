@@ -1,0 +1,32 @@
+[
+  {
+    "label": "name",
+    "query": "What is the employee full name?",
+    "expected": "Apoorva Ratnakar"
+  },
+  {
+    "label": "ref_no",
+    "query": "What is the reference number?",
+    "expected": "61945BR"
+  },
+  {
+    "label": "cin",
+    "query": "What is the CIN number?",
+    "expected": "L74140DL1991PLC046369"
+  },
+  {
+    "label": "date",
+    "query": "Find the date 26-04-2024",
+    "expected": "26-04-2024"
+  },
+  {
+    "label": "amount",
+    "query": "Find the amount 98477.41",
+    "expected": "98477.41"
+  },
+  {
+    "label": "pan",
+    "query": "Find PAN ACGPR1234K",
+    "expected": "ACGPR1234K"
+  }
+]

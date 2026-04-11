@@ -1,0 +1,47 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+venv*/
+venv311_3.11/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Runtime data and logs
+*.log
+app_stdout.txt
+app_stderr.txt
+debug_chat*.log
+sql_debug.log
+
+# Local app state
+chats.db
+webview_data/
+agent_temp/
+exports/
+processed_files/
+rag_databases/
+
+# Large model assets
+models/
+*.gguf
+*.onnx
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Optional datasets and binaries
+*.wav
+*.pdf
+*.xlsx

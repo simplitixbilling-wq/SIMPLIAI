@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SIMPLE_AI</title>
+  <!-- highlight.js (code syntax highlighting) — local bundles -->
+  <link rel="stylesheet" href="hljs-dark.css" id="hljs-theme-dark">
+  <link rel="stylesheet" href="hljs-light.css" id="hljs-theme-light" disabled>
+  <script src="highlight.min.js"></script>
+  <!-- marked.js (markdown parser) — local bundle -->
+  <script src="marked.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- ═══ TOP BAR ═══ -->
+  <header id="topbar">
+    <button id="sidebar-toggle" title="Toggle sidebar (Ctrl+B)">☰</button>
+    <span class="app-title">SIMPLE_AI</span>
+    <button id="btn-chat-mode" class="btn ghost active" title="Chat mode">💬 Chat</button>
+    <button id="btn-agent-mode" class="btn ghost" title="Agent mode">🤖 Agent</button>
+    <select id="model-select"><option value="">Loading models…</option></select>
+    <button id="btn-load-model" class="btn accent" disabled>Load</button>
+    <button id="btn-model-settings" class="btn ghost" title="Per-model settings">⚙</button>
+    <button id="btn-system-prompt" class="btn ghost" title="System prompt">📝</button>
+    <button id="btn-hf-download" class="btn ghost" title="Download models">⬇</button>
+    <button id="btn-reload-app" class="btn ghost hidden" title="Reload app (Ctrl+Shift+R)" onclick="location.reload()">🔄</button>
+    <div id="status-bar" class="status-pill">
+      <span id="status-dot">●</span>
+      <span id="status-text">Initializing…</span>
+    </div>
+  </header>
+
+  <div id="main-container">
+    <!-- ═══ SIDEBAR ═══ -->
+    <aside id="sidebar">
+      <!-- Model status -->
+      <div id="model-status-area">
+        <div id="loaded-model-label" class="muted">No model loaded</div>
+        <div id="progress-bar-container">
+          <div id="progress-bar"></div>
+        </div>
+        <div id="context-bar-container" style="display:none;">
+          <div class="context-label">Context: <span id="context-label-text">0/0 (0%)</span></div>
+          <div id="context-details" class="muted small" style="display:none;">
+            Prompt tokens: <span id="context-usage">0/0</span>
+          </div>
+          <div id="context-bar"><div id="context-fill"></div></div>
+        </div>
+      </div>
+
+      <!-- New chat -->
+      <button id="btn-new-chat" class="btn accent sidebar-btn">+ New Chat</button>
+
+      <!-- Chat search -->
+      <input type="text" id="chat-search" placeholder="Search chats…">
+
+      <!-- CHATS section -->
+      <div class="section-label">CHATS</div>
+      <div id="chat-list" class="scrollable-list"></div>
+
+      <!-- Separator -->
+      <hr class="sidebar-sep">
+
+      <!-- KNOWLEDGE section -->
+      <div class="section-label">
+        KNOWLEDGE
+        <button id="btn-add-rag" class="btn-icon" title="Create RAG database">+</button>
+      </div>
+      <div id="rag-list" class="scrollable-list"></div>
+      <div id="rag-progress-bar" class="rag-progress hidden">
+        <div class="rag-progress-label"><span id="rag-progress-text">Processing...</span></div>
+        <div class="rag-progress-track"><div id="rag-progress-fill" class="rag-progress-fill"></div></div>
+      </div>
+
+      <!-- Bottom area -->
+      <div class="sidebar-bottom">
+        <hr class="sidebar-sep">
+        <button id="btn-settings" class="btn ghost sidebar-btn">Settings</button>
+        <div id="system-monitor" class="muted small">CPU: —% | RAM: —%</div>
+      </div>
+    </aside>
+
+    <!-- ═══ CHAT AREA ═══ -->
+    <main id="chat-area">
+      <div id="messages-container"></div>
+
+      <!-- Input bar -->
+      <div id="input-bar">
+        <div id="input-actions">
+          <button id="btn-web-search" class="btn-icon" title="Toggle web search">🌐</button>
+          <button id="btn-upload" class="btn-icon" title="Upload file, CSV, or Excel">📎</button>
+          <button id="btn-image" class="btn-icon" title="Attach image">▦</button>
+          <button id="btn-voice" class="btn-icon" title="Voice input">◉</button>
+        </div>
+        <textarea id="user-input" rows="1" placeholder="Type a message…"></textarea>
+        <span id="token-counter" class="muted small">0 tokens</span>
+        <button id="btn-send" class="btn accent" disabled>➤</button>
+        <button id="btn-stop" class="btn danger" style="display:none;">■</button>
+      </div>
+    </main>
+
+    <!-- ═══ AGENT PANEL (Split-screen) ═══ -->
+    <main id="agent-area" class="hidden">
+      <!-- Status indicator — top-right corner -->
+      <div id="agent-status-bar">
+        <span id="agent-status-icon">●</span>
+        <span id="agent-status-text">Ready</span>
+      </div>
+
+      <div class="agent-split">
+        <!-- LEFT: Saved Instructions -->
+        <div id="agent-instructions-panel" class="agent-panel">
+          <div class="agent-panel-header">
+            <h3>📋 Instructions</h3>
+            <button id="btn-new-instruction" class="btn ghost btn-sm" title="Create new instruction">+ New</button>
+          </div>
+          <div id="instruction-list" class="scrollable-list">
+            <!-- Instruction template cards rendered here -->
+          </div>
+
+          <!-- Output files section -->
+          <div id="agent-files-section">
+            <div class="agent-panel-header" style="border-top:1px solid var(--border);border-bottom:none;">
+              <h3>📁 Output Files</h3>
+              <button id="btn-refresh-files" class="btn ghost btn-sm" title="Refresh">⟳</button>
+            </div>
+            <div id="processed-files-list" class="scrollable-list">
+              <p class="muted small" style="padding:12px;text-align:center;">No output files yet.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Resize handle -->
+        <div id="agent-resize-handle" class="resize-handle" title="Drag to resize"></div>
+
+        <!-- RIGHT: Dynamic content area -->
+        <div id="agent-chat-panel" class="agent-panel">
+          <button id="btn-expand-chat" class="btn ghost btn-sm agent-expand-btn" title="Expand to full width">⤢</button>
+
+          <!-- STATE 1: Empty / welcome -->
+          <div id="agent-view-empty" class="agent-view">
+            <div class="agent-empty-msg">
+              <div style="font-size:48px;margin-bottom:12px;">🤖</div>
+              <h3>Agent</h3>
+              <p class="muted">Select a saved instruction from the left<br>or click <strong>+ New</strong> to create one.</p>
+            </div>
+          </div>
+
+          <!-- STATE 2: Create / Edit instruction form -->
+          <div id="agent-view-create" class="agent-view hidden">
+            <div class="agent-create-form">
+              <h3 id="agent-form-title">New Instruction</h3>
+              <div class="form-group">
+                <label>Name</label>
+                <input type="text" id="agent-instr-name" placeholder="e.g., Sales Reconciliation">
+              </div>
+              <div class="form-group">
+                <label>🎭 Role <span class="muted small">(Who is the agent?)</span></label>
+                <input type="text" id="agent-instr-role" placeholder="e.g., You are a senior data analyst specializing in financial reconciliation">
+              </div>
+              <div class="form-group">
+                <label>🎯 Task <span class="muted small">(What to accomplish)</span></label>
+                <textarea id="agent-instr-task" rows="3" placeholder="e.g., Reconcile these two CSV files. Match orders by ID, find missing records, verify amounts, and highlight discrepancies."></textarea>
+              </div>
+              <div class="form-group">
+                <label>📝 Steps <span class="muted small">(Workflow — one step per line)</span></label>
+                <textarea id="agent-instr-steps" rows="6" placeholder="1. Load and parse both data files&#10;2. Match records by Order ID&#10;3. Compare amounts and flag mismatches&#10;4. List missing records from each file&#10;5. Generate summary with totals"></textarea>
+              </div>
+              <div class="form-group">
+                <label>Default Output Format</label>
+                <select id="agent-instr-format">
+                  <option value="excel">Excel (.xlsx)</option>
+                  <option value="csv">CSV (.csv)</option>
+                  <option value="pdf">PDF Report</option>
+                  <option value="txt">Text (.txt)</option>
+                </select>
+              </div>
+              <div class="agent-form-actions">
+                <button id="btn-save-instruction" class="btn accent">💾 Save Instruction</button>
+                <button id="btn-rewrite-ai" class="btn outline" title="Polish role, task & steps with AI">✨ Rewrite with AI</button>
+                <button id="btn-cancel-instruction" class="btn ghost">Cancel</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- STATE 3: Agent chat (shown after selecting an instruction) -->
+          <div id="agent-view-chat" class="agent-view hidden">
+            <!-- Active instruction label -->
+            <div id="agent-active-instruction">
+              <span id="agent-active-name"></span>
+              <button id="btn-back-to-instructions" class="btn ghost btn-sm" title="Back">✕</button>
+            </div>
+
+            <!-- Agent chat messages -->
+            <div id="agent-messages"></div>
+
+            <!-- Agent input bar -->
+            <div id="agent-input-bar">
+              <!-- Uploaded files display -->
+              <div id="agent-file-chips"></div>
+
+              <div class="agent-input-row">
+                <div class="agent-input-actions">
+                  <button id="btn-agent-upload" class="btn-icon" title="Upload files">📎</button>
+                  <input id="agent-file-input" type="file" multiple style="display:none;" accept=".xlsx,.xls,.csv,.pdf,.txt,.md,.docx,.png,.jpg,.jpeg,.webp,.bmp,.tiff">
+                  <button id="btn-agent-web" class="btn-icon" title="Toggle web search">🌐</button>
+                </div>
+                <textarea id="agent-input" rows="1" placeholder="Upload files and send, or ask a question…"></textarea>
+                <button id="btn-agent-send" class="btn accent" title="Send">➤</button>
+                <button id="btn-agent-stop" class="btn danger" title="Stop" disabled>■</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ═══ MODALS ═══ -->
+
+  <!-- Prompt (input) dialog modal -->
+  <div id="modal-prompt" class="modal hidden">
+    <div class="modal-content" style="width:360px;">
+      <h3 id="prompt-title">Rename</h3>
+      <div class="modal-body">
+        <input id="prompt-input" type="text" class="text-input" style="width:100%;padding:8px 10px;font-size:14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);outline:none;" />
+      </div>
+      <div class="modal-footer">
+        <button id="prompt-cancel" class="btn ghost">Cancel</button>
+        <button id="prompt-ok" class="btn primary">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm dialog modal -->
+  <div id="modal-confirm" class="modal hidden">
+    <div class="modal-content" style="width:360px;">
+      <h3 id="confirm-title">Confirm</h3>
+      <div class="modal-body">
+        <p id="confirm-message" style="margin:0;color:var(--text-secondary);"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="confirm-cancel" class="btn ghost">Cancel</button>
+        <button id="confirm-ok" class="btn primary">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="modal-settings" class="modal hidden">
+    <div class="modal-content">
+      <h3>Settings</h3>
+      <div class="modal-body">
+        <div class="settings-section">
+          <label>Theme</label>
+          <select id="setting-theme">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+          </select>
+        </div>
+        <hr>
+        <h4>Generation Defaults</h4>
+        <div class="settings-section">
+          <label>Temperature: <span id="s-temp-val">0.25</span></label>
+          <input type="range" id="s-temperature" min="5" max="150" value="25">
+        </div>
+        <div class="settings-section">
+          <label>Top-p: <span id="s-topp-val">0.90</span></label>
+          <input type="range" id="s-top-p" min="10" max="100" value="90">
+        </div>
+        <div class="settings-section">
+          <label>Repeat penalty: <span id="s-reppen-val">1.10</span></label>
+          <input type="range" id="s-repeat-penalty" min="100" max="150" value="110">
+        </div>
+        <div class="settings-section">
+          <label>Max response tokens</label>
+          <select id="s-max-tokens">
+            <option value="256">256</option>
+            <option value="512" selected>512</option>
+            <option value="1024">1024</option>
+            <option value="2048">2048</option>
+            <option value="4096">4096</option>
+            <option value="8192">8192</option>
+            <option value="16384">16384</option>
+          </select>
+        </div>
+        <hr>
+        <div class="settings-section">
+          <label>GPU</label>
+          <span id="s-gpu-info" class="muted">Detecting…</span>
+        </div>
+        <div class="settings-section">
+          <label>System</label>
+          <span id="s-system-info" class="muted"></span>
+        </div>
+        <div class="settings-section">
+          <label>Voice (Speak + WAV)</label>
+          <select id="s-voice">
+            <option value="">Default system voice</option>
+          </select>
+          <div id="s-voice-help" class="muted small">Select a voice for playback and WAV export.</div>
+        </div>
+        <div class="settings-section">
+          <label>Free Piper Voices (Download to folder)</label>
+          <select id="s-piper-voice-catalog">
+            <option value="">Select a Piper voice...</option>
+          </select>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+            <button class="btn ghost" id="btn-download-piper-voice">Download</button>
+            <span id="s-piper-download-status" class="muted small"></span>
+          </div>
+          <div class="muted small" style="margin-top:6px;">Downloads are saved to models/voices/piper inside the app folder.</div>
+        </div>
+        <hr>
+        <h4>Web Search</h4>
+        <div class="settings-section">
+          <label>Brave Search API Key <span class="muted small">(optional — <a href="https://brave.com/search/api/" target="_blank" rel="noopener">free 2000/month</a>)</span></label>
+          <input type="password" id="s-brave-api-key" placeholder="BSA..." autocomplete="off" style="width:100%;margin-top:4px">
+        </div>
+        <div class="settings-section muted small">Without a key, Bing is used as fallback. With a key, Brave gives better results.</div>
+        <hr>
+        <h4>Tools</h4>
+        <div class="settings-section">
+          <button class="btn ghost" id="btn-settings-compare">Compare Models</button>
+        </div>
+        <div class="settings-section">
+          <button class="btn ghost" id="btn-settings-plugins">Plugins</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-save-settings">Save</button>
+        <button class="btn ghost" onclick="closeModal('modal-settings')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- System prompt modal -->
+  <div id="modal-system-prompt" class="modal hidden">
+    <div class="modal-content">
+      <h3>System Prompt</h3>
+      <p class="muted small">Custom instructions for this chat. Leave blank for default.</p>
+      <textarea id="system-prompt-input" rows="6" placeholder="e.g. You are a helpful coding assistant…"></textarea>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-save-system-prompt">Save</button>
+        <button class="btn ghost" onclick="closeModal('modal-system-prompt')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-model settings modal -->
+  <div id="modal-model-settings" class="modal hidden">
+    <div class="modal-content">
+      <h3>Model Settings</h3>
+      <div id="model-settings-name" class="muted"></div>
+      <div class="settings-section">
+        <label>Temperature: <span id="ms-temp-val">0.25</span></label>
+        <input type="range" id="ms-temperature" min="5" max="150" value="25">
+      </div>
+      <div class="settings-section">
+        <label>Context window</label>
+        <select id="ms-n-ctx">
+          <option value="default">default</option>
+          <option value="1024">1024</option>
+          <option value="2048">2048</option>
+          <option value="4096">4096</option>
+          <option value="8192">8192</option>
+          <option value="16384">16384</option>
+          <option value="32768">32768</option>
+          <option value="65536">65536</option>
+        </select>
+      </div>
+      <div class="settings-section">
+        <label>CPU threads: <span id="ms-threads-val">4</span></label>
+        <input type="range" id="ms-threads" min="1" max="16" value="4">
+      </div>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-save-model-settings">Save</button>
+        <button class="btn ghost" id="btn-reset-model-settings">Reset</button>
+        <button class="btn ghost" onclick="closeModal('modal-model-settings')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HuggingFace downloader modal -->
+  <div id="modal-hf" class="modal hidden">
+    <div class="modal-content modal-large">
+      <h3>⬇ Download Models</h3>
+      <p id="hf-system-info" class="muted small"></p>
+      <div class="search-row">
+        <input type="text" id="hf-query" placeholder="Search GGUF models… e.g. gemma, qwen, llama">
+        <button class="btn accent" id="btn-hf-search">Search</button>
+      </div>
+      <div id="hf-status" class="muted small"></div>
+      <div id="hf-results" class="scrollable-list"></div>
+      <div id="hf-download-area" style="display:none;">
+        <div class="progress-row">
+          <span id="hf-dl-status"></span>
+          <div id="hf-dl-progress-container"><div id="hf-dl-progress"></div></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn ghost" onclick="closeModal('modal-hf')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- RAG create modal -->
+  <div id="modal-rag-create" class="modal hidden">
+    <div class="modal-content">
+      <h3>Create Knowledge Base</h3>
+      <div class="settings-section">
+        <label>Source type</label>
+        <select id="rag-source-type">
+          <option value="folder" selected>Folder</option>
+          <option value="url">URL</option>
+        </select>
+      </div>
+      <div class="settings-section">
+        <label>Name</label>
+        <input type="text" id="rag-name" placeholder="e.g. MyDocs">
+      </div>
+      <div class="settings-section">
+        <label id="rag-path-label">Folder path</label>
+        <input type="text" id="rag-path" placeholder="C:\Documents\notes">
+      </div>
+      <div class="settings-section">
+        <label>Chunk size: <span id="rag-chunk-val">512</span></label>
+        <input type="range" id="rag-chunk-size" min="128" max="1024" value="512" step="64">
+      </div>
+      <div class="settings-section">
+        <label>Overlap: <span id="rag-overlap-val">100</span></label>
+        <input type="range" id="rag-overlap" min="0" max="256" value="100" step="1">
+      </div>
+      <div id="rag-create-status" class="muted small"></div>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-create-rag">Create</button>
+        <button class="btn ghost" onclick="closeModal('modal-rag-create')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Compare models modal -->
+  <div id="modal-compare" class="modal hidden">
+    <div class="modal-content modal-large">
+      <h3>Compare Models</h3>
+      <div class="search-row">
+        <select id="compare-model-a"></select>
+        <select id="compare-model-b"></select>
+      </div>
+      <textarea id="compare-prompt" rows="3" placeholder="Enter prompt to compare..."></textarea>
+      <div class="modal-footer" style="justify-content:flex-start;">
+        <button class="btn accent" id="btn-run-compare">Run Compare</button>
+      </div>
+      <div class="search-row" style="align-items:flex-start;">
+        <div style="flex:1;">
+          <label class="muted small">Model A response</label>
+          <textarea id="compare-res-a" rows="10" readonly></textarea>
+        </div>
+        <div style="flex:1;">
+          <label class="muted small">Model B response</label>
+          <textarea id="compare-res-b" rows="10" readonly></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn ghost" onclick="closeModal('modal-compare')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Plugins modal -->
+  <div id="modal-plugins" class="modal hidden">
+    <div class="modal-content">
+      <h3>Plugins</h3>
+      <div id="plugins-list" class="scrollable-list" style="max-height:300px;"></div>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-reload-plugins">Reload</button>
+        <button class="btn accent" id="btn-create-plugin-ai" onclick="openPluginAiModal()">✨ Create with AI</button>
+        <button class="btn ghost" onclick="closeModal('modal-plugins')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Plugin with AI modal -->
+  <div id="modal-plugin-ai" class="modal hidden">
+    <div class="modal-content modal-large">
+      <h3 id="plugin-ai-title">✨ Create Plugin with AI</h3>
+      <div class="modal-body">
+        <div class="form-row">
+          <label for="plugin-ai-name">Plugin name <span class="muted small">(used as filename)</span></label>
+          <input type="text" id="plugin-ai-name" placeholder="e.g. dice_roller" style="width:100%;"/>
+        </div>
+        <div class="form-row" style="margin-top:10px;">
+          <label for="plugin-ai-desc">What should this plugin do?</label>
+          <textarea id="plugin-ai-desc" rows="4" placeholder="Describe the plugin behaviour in plain English. E.g. 'Add a /weather city command that fetches weather and shows it as an assistant message.'" style="width:100%;resize:vertical;"></textarea>
+        </div>
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+          <button class="btn accent" id="btn-plugin-ai-generate">Generate</button>
+          <span id="plugin-ai-gen-status" class="muted small"></span>
+        </div>
+        <div class="form-row" style="margin-top:12px;">
+          <label for="plugin-ai-code">Generated code <span class="muted small">(you can edit before saving)</span></label>
+          <textarea id="plugin-ai-code" class="plugin-code-editor" rows="18" spellcheck="false" placeholder="Generated plugin code will appear here…"></textarea>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+          <button class="btn ghost" id="btn-plugin-ai-test">Test</button>
+          <span id="plugin-ai-test-status" class="muted small"></span>
+        </div>
+        <div id="plugin-ai-test-output" class="plugin-test-output hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-plugin-ai-save">Save &amp; Load</button>
+        <button class="btn ghost" id="btn-plugin-ai-stop">Stop</button>
+        <button class="btn ghost" onclick="closeModal('modal-plugin-ai')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-export" class="modal hidden">
+    <div class="modal-content">
+      <h3>Export Output</h3>
+      <div class="modal-body">
+        <div id="export-target-label" class="muted small">Export target</div>
+        <div class="settings-section">
+          <label>Format</label>
+          <select id="export-format-select">
+            <option value="txt">Text (.txt)</option>
+            <option value="pdf">PDF (.pdf)</option>
+            <option value="docx">Word (.docx)</option>
+            <option value="csv">CSV (.csv)</option>
+            <option value="xlsx">Excel (.xlsx)</option>
+            <option value="wav">WAV Audio (.wav)</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-confirm-export">Export</button>
+        <button class="btn ghost" onclick="closeModal('modal-export')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

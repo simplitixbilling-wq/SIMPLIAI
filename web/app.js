@@ -2853,14 +2853,124 @@ setAgentActionButtons(false);
 // ── Instruction Templates ─────────────────────────────────────
 const TEMPLATES_KEY = 'simple_ai_instruction_templates';
 
+function normalizeTemplateEntry(entry) {
+  let value = entry;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch (_) {
+      return { role: '', task: value, steps: '', format: 'excel' };
+    }
+  }
+
+  if (!value || typeof value !== 'object') {
+    return { role: '', task: '', steps: '', format: 'excel' };
+  }
+
+  return {
+    role: String(value.role || '').trim(),
+    task: String(value.task || value.text || '').trim(),
+    steps: String(value.steps || '').trim(),
+    format: String(value.format || 'excel').trim() || 'excel',
+  };
+}
+
 function getTemplates() {
   try {
-    return JSON.parse(localStorage.getItem(TEMPLATES_KEY) || '{}');
+    const raw = JSON.parse(localStorage.getItem(TEMPLATES_KEY) || '{}');
+    const normalized = {};
+    for (const [name, entry] of Object.entries(raw || {})) {
+      normalized[name] = normalizeTemplateEntry(entry);
+    }
+    return normalized;
   } catch { return {}; }
 }
 
 function saveTemplatesLocal(templates) {
   localStorage.setItem(TEMPLATES_KEY, JSON.stringify(templates));
+}
+
+async function syncTemplatesFromBackend() {
+  if (!api || typeof api.get_instruction_templates !== 'function') return;
+  try {
+    const remote = await api.get_instruction_templates();
+    if (!remote || typeof remote !== 'object') return;
+
+    const merged = getTemplates();
+    for (const [name, entry] of Object.entries(remote)) {
+      merged[name] = normalizeTemplateEntry(entry);
+    }
+    saveTemplatesLocal(merged);
+  } catch (_) {
+    // Keep local templates if backend templates are unavailable.
+  }
+}
+
+async function getPredefinedTemplates() {
+  if (!api || typeof api.get_instruction_templates !== 'function') {
+    return {};
+  }
+  try {
+    const remote = await api.get_instruction_templates();
+    if (!remote || typeof remote !== 'object') return {};
+    const out = {};
+    for (const [name, entry] of Object.entries(remote)) {
+      out[name] = normalizeTemplateEntry(entry);
+    }
+    return out;
+  } catch (_) {
+    return {};
+  }
+}
+
+function fillInstructionFormFromTemplate(name, tpl) {
+  const t = normalizeTemplateEntry(tpl);
+  const nameInput = $('#agent-instr-name');
+  const roleInput = $('#agent-instr-role');
+  const taskInput = $('#agent-instr-task');
+  const stepsInput = $('#agent-instr-steps');
+  const formatInput = $('#agent-instr-format');
+
+  if (nameInput && !nameInput.disabled) nameInput.value = String(name || '').trim();
+  if (roleInput) roleInput.value = t.role || '';
+  if (taskInput) taskInput.value = t.task || '';
+  if (stepsInput) stepsInput.value = t.steps || '';
+  if (formatInput) formatInput.value = t.format || 'excel';
+}
+
+async function openTemplateImportPicker() {
+  const templates = await getPredefinedTemplates();
+  const names = Object.keys(templates).sort();
+  if (!names.length) {
+    showToast('No predefined templates found', 'warn');
+    return;
+  }
+
+  const list = $('#template-import-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  for (const name of names) {
+    const tpl = templates[name];
+    const role = String(tpl.role || '').trim();
+    const task = String(tpl.task || '').trim();
+    const stepsCount = String(tpl.steps || '').split('\n').filter(s => s.trim()).length;
+    const item = document.createElement('div');
+    item.className = 'template-pick-item';
+    item.innerHTML = `
+      <div class="template-pick-name">${escapeHtml(name)}</div>
+      <div class="template-pick-meta">${escapeHtml(role || 'No role')} • ${escapeHtml(tpl.format || 'excel')} • ${stepsCount} step(s)</div>
+      <div class="template-pick-meta">${escapeHtml(task.substring(0, 120))}${task.length > 120 ? '…' : ''}</div>
+    `;
+    item.addEventListener('click', () => {
+      fillInstructionFormFromTemplate(name, tpl);
+      closeModal('modal-template-import');
+      showToast(`Loaded template: ${name}`, 'success');
+    });
+    list.appendChild(item);
+  }
+
+  openModal('modal-template-import');
 }
 
 // ── Processed Output Files List ───────────────────────────────
@@ -3129,6 +3239,27 @@ $('#btn-cancel-instruction')?.addEventListener('click', () => {
   } else {
     showAgentView('empty');
   }
+});
+
+// Import predefined templates on demand (no auto-import on startup).
+$('#btn-import-predefined')?.addEventListener('click', async () => {
+  const btn = $('#btn-import-predefined');
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Loading...';
+  try {
+    await openTemplateImportPicker();
+  } catch (e) {
+    showToast(`Import failed: ${e?.message || e}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+});
+
+$('#template-import-cancel')?.addEventListener('click', () => closeModal('modal-template-import'));
+$('#modal-template-import')?.addEventListener('click', (e) => {
+  if (e.target?.id === 'modal-template-import') closeModal('modal-template-import');
 });
 
 // Rewrite with AI

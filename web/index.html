@@ -184,6 +184,7 @@
                 <button id="btn-save-instruction" class="btn accent">💾 Save Instruction</button>
                 <button id="btn-rewrite-ai" class="btn outline" title="Polish role, task & steps with AI">✨ Rewrite with AI</button>
                 <button id="btn-cancel-instruction" class="btn ghost">Cancel</button>
+                <button id="btn-import-predefined" class="btn ghost" title="Import predefined instruction templates">Import Predefined Set</button>
               </div>
             </div>
           </div>
@@ -247,6 +248,20 @@
       <div class="modal-footer">
         <button id="confirm-cancel" class="btn ghost">Cancel</button>
         <button id="confirm-ok" class="btn primary">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Predefined template import picker -->
+  <div id="modal-template-import" class="modal hidden">
+    <div class="modal-content modal-large" style="max-width:680px;">
+      <h3>Import Predefined Template</h3>
+      <div class="modal-body">
+        <p class="muted small" style="margin-bottom:10px;">Choose a predefined template to auto-fill the instruction form.</p>
+        <div id="template-import-list" class="template-pick-list"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="template-import-cancel" class="btn ghost">Cancel</button>
       </div>
     </div>
   </div>

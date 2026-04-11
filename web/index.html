@@ -25,6 +25,9 @@
     <button id="btn-system-prompt" class="btn ghost" title="System prompt">📝</button>
     <button id="btn-hf-download" class="btn ghost" title="Download models">⬇</button>
     <button id="btn-reload-app" class="btn ghost hidden" title="Reload app (Ctrl+Shift+R)" onclick="location.reload()">🔄</button>
+    <div id="trial-pill" class="trial-pill" title="Free tier status">
+      <span id="trial-pill-text">Trial status...</span>
+    </div>
     <div id="status-bar" class="status-pill">
       <span id="status-dot">●</span>
       <span id="status-text">Initializing…</span>
@@ -170,6 +173,7 @@
               <div class="form-group">
                 <label>Default Output Format</label>
                 <select id="agent-instr-format">
+                  <option value="none">UI Only (no file export)</option>
                   <option value="excel">Excel (.xlsx)</option>
                   <option value="csv">CSV (.csv)</option>
                   <option value="pdf">PDF Report</option>

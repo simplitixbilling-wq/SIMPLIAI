@@ -287,6 +287,7 @@ async function ensureActivationGate(forcePrompt = false) {
   let status = null;
   try {
     status = await api.get_activation_status();
+    updateTrialPill(status);
   } catch (_) {
     return true;
   }
@@ -312,6 +313,7 @@ async function ensureActivationGate(forcePrompt = false) {
       if (result?.ok) {
         unlocked = true;
         applyAccessLockUi(false);
+        updateTrialPill(result?.status || null);
         showToast('Activation successful. Full access unlocked.', 'success', 5000);
         break;
       }
@@ -359,6 +361,37 @@ function setStatus(text, active) {
   const pill = $('#status-bar');
   if (el) el.textContent = text;
   if (pill) pill.classList.toggle('active', !!active);
+}
+
+function updateTrialPill(status) {
+  const pill = $('#trial-pill');
+  const text = $('#trial-pill-text');
+  if (!pill || !text) return;
+
+  pill.classList.remove('warn', 'expired', 'activated');
+
+  if (!status || typeof status !== 'object') {
+    text.textContent = 'Trial: unknown';
+    return;
+  }
+
+  if (status.is_activated) {
+    pill.classList.add('activated');
+    text.textContent = 'Activated';
+    return;
+  }
+
+  const daysLeft = Number(status.days_left ?? 0);
+  if (status.requires_passkey || daysLeft <= 0) {
+    pill.classList.add('expired');
+    text.textContent = 'Trial expired';
+    return;
+  }
+
+  if (daysLeft <= 7) {
+    pill.classList.add('warn');
+  }
+  text.textContent = `Free trial: ${daysLeft} day${daysLeft === 1 ? '' : 's'} left`;
 }
 
 /** Switch highlight.js stylesheet for dark/light theme */
@@ -757,6 +790,7 @@ async function init() {
     gpu: { vram: '?' },
     theme: 'Dark',
   };
+  updateTrialPill(info.activation || null);
   setStatus(`${info.config?.mode || 'READY'} | RAM: ${info.system_ram}GB | VRAM: ${info.gpu?.vram ?? '?'}GB`);
   document.documentElement.setAttribute('data-theme', String(info.theme || 'Dark').toLowerCase());
   switchHljsTheme(String(info.theme || 'Dark').toLowerCase());
@@ -3119,9 +3153,38 @@ $('#btn-rewrite-ai')?.addEventListener('click', async () => {
       showToast(r.error, 'error');
       return;
     }
-    if ('role' in r) $('#agent-instr-role').value = r.role;
-    if ('task' in r) $('#agent-instr-task').value = r.task;
-    if ('steps' in r) $('#agent-instr-steps').value = r.steps;
+
+    // Normalize payload variants without changing backend rewrite logic.
+    let payload = r;
+    if (typeof payload === 'string') {
+      try { payload = JSON.parse(payload); } catch (_) { payload = { task: payload }; }
+    }
+
+    const normRole = String(payload?.role ?? payload?.Role ?? '').trim();
+    let normTask = String(payload?.task ?? payload?.Task ?? '').trim();
+    let normSteps = String(payload?.steps ?? payload?.Steps ?? '').trim();
+
+    // Some models return a JSON object string in task; extract and map to fields.
+    if (normTask.startsWith('{') && normTask.endsWith('}')) {
+      try {
+        const nested = JSON.parse(normTask);
+        if (!normRole && nested?.role != null) {
+          $('#agent-instr-role').value = String(nested.role).trim();
+        }
+        if (nested?.task != null) {
+          normTask = String(nested.task).trim();
+        }
+        if (!normSteps && nested?.steps != null) {
+          normSteps = String(nested.steps).trim();
+        }
+      } catch (_) {
+        // keep original task text
+      }
+    }
+
+    if (normRole) $('#agent-instr-role').value = normRole;
+    if (normTask) $('#agent-instr-task').value = normTask;
+    if (normSteps) $('#agent-instr-steps').value = normSteps;
     showToast('Instruction polished by AI', 'success');
   } catch (e) {
     showToast('Rewrite failed: ' + e.message, 'error');
@@ -3452,9 +3515,13 @@ async function agentSend() {
         setAgentStatus('Complete', false);
         refreshProcessedFiles();
       } else {
-        // No file_path and no error — show response_text or generic failure
+        // No file_path and no error: UI-only mode or partial result.
         const msg = result?.response_text || 'Analysis completed but no output file was generated.';
-        addAgentMessage('assistant', `⚠ ${renderMarkdown(msg)}`);
+        if (result?.success) {
+          addAgentMessage('assistant', renderMarkdown(msg));
+        } else {
+          addAgentMessage('assistant', `⚠ ${renderMarkdown(msg)}`);
+        }
         setAgentStatus(result?.success ? 'Complete' : 'Failed', false);
       }
     } else if (text) {

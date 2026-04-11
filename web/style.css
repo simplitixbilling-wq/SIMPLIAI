@@ -120,6 +120,33 @@ body {
   transition: all 0.3s ease;
 }
 
+.trial-pill {
+  display: flex;
+  align-items: center;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.trial-pill.warn {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.trial-pill.expired {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.trial-pill.activated {
+  border-color: var(--success);
+  color: var(--success);
+}
+
 #status-dot {
   font-size: 8px;
   color: var(--text-muted);

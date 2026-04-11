@@ -555,9 +555,51 @@ class Bridge:
     def _activation_machine_hint(self) -> str:
         return f"{uuid.getnode()}:{os.environ.get('COMPUTERNAME', '')}"
 
+    def _activation_system_code(self) -> str:
+        """Short stable code derived from local machine identity."""
+        raw = self._activation_machine_hint().encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:12].upper()
+
+    def _build_machine_bound_key(self, system_code: str) -> str:
+        secret = self._activation_secret().encode("utf-8")
+        msg = str(system_code or "").strip().upper().encode("utf-8")
+        digest = hmac.new(secret, msg, hashlib.sha256).hexdigest()[:24].upper()
+        return f"{str(system_code).strip().upper()}-{digest}"
+
+    def _is_valid_activation_key(self, entered_key: str) -> bool:
+        expected = self._build_machine_bound_key(self._activation_system_code())
+        provided = str(entered_key or "").strip().upper()
+        return bool(provided and hmac.compare_digest(provided, expected))
+
     def _activation_signature(self, first_opened_at: str, activated_at: str) -> str:
         payload = f"{first_opened_at}|{activated_at}|{self._activation_machine_hint()}|{self._activation_secret()}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _activation_store_path(self) -> str:
+        """Persistent activation file in user profile (survives app folder delete)."""
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, "SIMPLIAI")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, "activation_state.json")
+
+    def _load_activation_store(self) -> dict:
+        path = self._activation_store_path()
+        try:
+            if not os.path.exists(path):
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_activation_store(self, payload: dict):
+        path = self._activation_store_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload or {}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[ACTIVATION] Could not write activation store: {e}")
 
     def _initialize_activation_state(self):
         """Persist first-open timestamp and validate existing activation record."""
@@ -566,23 +608,40 @@ class Bridge:
             self.app_settings = {}
             changed = True
 
-        first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip()
-        if not first_opened_at:
-            self.app_settings["trial_first_opened_at"] = self._utc_now_iso()
-            changed = True
+        # Prefer user-profile activation state so deleting app folder won't reset trial.
+        persisted = self._load_activation_store()
 
-        activation = self.app_settings.get("activation", {})
+        first_opened_at = str(persisted.get("trial_first_opened_at", "")).strip()
+        if not first_opened_at:
+            first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip()
+        if not first_opened_at:
+            first_opened_at = self._utc_now_iso()
+            changed = True
+        self.app_settings["trial_first_opened_at"] = first_opened_at
+
+        activation = persisted.get("activation", {}) if isinstance(persisted.get("activation", {}), dict) else {}
+        if not activation:
+            activation = self.app_settings.get("activation", {})
         if not isinstance(activation, dict):
-            self.app_settings["activation"] = {"activated": False}
+            activation = {"activated": False}
             changed = True
         elif activation.get("activated"):
-            first_opened = str(self.app_settings.get("trial_first_opened_at", "")).strip()
+            first_opened = first_opened_at
             activated_at = str(activation.get("activated_at", "")).strip()
             sig = str(activation.get("sig", "")).strip()
             expected = self._activation_signature(first_opened, activated_at) if first_opened and activated_at else ""
             if not expected or not sig or not hmac.compare_digest(sig, expected):
-                self.app_settings["activation"] = {"activated": False}
+                activation = {"activated": False}
                 changed = True
+
+        self.app_settings["activation"] = activation
+
+        persisted_payload = {
+            "trial_first_opened_at": first_opened_at,
+            "activation": activation,
+        }
+        if persisted_payload != persisted:
+            self._save_activation_store(persisted_payload)
 
         if changed:
             self.chat_db.set_kv("app_settings", self.app_settings)
@@ -619,6 +678,7 @@ class Bridge:
             "is_activated": is_activated,
             "activated_at": activated_at,
             "requires_passkey": (not is_activated and not is_trial_active),
+            "system_code": self._activation_system_code(),
         }
 
     def _has_full_access(self) -> bool:
@@ -631,11 +691,10 @@ class Bridge:
 
     def activate_full_access(self, passkey: str):
         """Activate full access after trial expiration using passkey."""
-        provided = str(passkey or "").strip()
-        expected = self._activation_secret()
+        provided = str(passkey or "").strip().upper()
         if not provided:
             return {"ok": False, "error": "Passkey is required"}
-        if not expected or not hmac.compare_digest(provided, expected):
+        if not self._is_valid_activation_key(provided):
             return {"ok": False, "error": "Invalid passkey"}
 
         first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip() or self._utc_now_iso()
@@ -647,6 +706,10 @@ class Bridge:
             "sig": self._activation_signature(first_opened_at, activated_at),
         }
         self.chat_db.set_kv("app_settings", self.app_settings)
+        self._save_activation_store({
+            "trial_first_opened_at": first_opened_at,
+            "activation": self.app_settings["activation"],
+        })
         return {"ok": True, "status": self._get_activation_status()}
 
     def _load_chats(self):
@@ -2209,6 +2272,15 @@ Validation rules:
             
             # Parse response for structured data (tables)
             result_data = self._parse_ai_response(ai_response)
+
+            if str(output_format).strip().lower() == "none":
+                result = {"response_text": ai_response, "success": True}
+                if extraction_warnings:
+                    result["warning"] = "\n".join(extraction_warnings)
+                if tabular_warning:
+                    existing = result.get("warning")
+                    result["warning"] = f"{existing}\n{tabular_warning}" if existing else tabular_warning
+                return result
             
             # Generate output file
             output_dir = os.path.join(app_data_path(), "processed_files")
@@ -3639,13 +3711,18 @@ Rules:
                 )
 
                 # Determine file extension based on output_format
-                ext_map = {"excel": "xlsx", "csv": "csv", "pdf": "pdf", "txt": "txt"}
+                ext_map = {"none": "", "excel": "xlsx", "csv": "csv", "pdf": "pdf", "txt": "txt"}
                 ext = ext_map.get(output_format, "xlsx")
-                output_file = os.path.join(output_dir, f"analysis_{timestamp}.{ext}")
+                output_file = os.path.join(output_dir, f"analysis_{timestamp}.{ext}") if ext else ""
 
-                msg = f"[SQL] Saving to {ext.upper()} file..."
-                status_messages.append(msg)
-                print(msg)
+                if ext:
+                    msg = f"[SQL] Saving to {ext.upper()} file..."
+                    status_messages.append(msg)
+                    print(msg)
+                else:
+                    msg = "[SQL] UI-only mode: no file export requested."
+                    status_messages.append(msg)
+                    print(msg)
 
                 saved_paths = []
                 if wants_multi_excel:
@@ -3675,6 +3752,9 @@ Rules:
                     msg = f"[SQL] ✓ Saved multi-CSV output ({len(saved_paths)} files): {csv_dir}"
                     status_messages.append(msg)
                     print(msg)
+                elif ext == "":
+                    # UI-only mode: skip file generation.
+                    saved_paths = []
                 elif ext == "xlsx":
                     result_df.to_excel(output_file, index=False)
                     saved_paths.append(output_file)
@@ -3688,7 +3768,7 @@ Rules:
                     result_df.to_csv(output_file, sep='\t', index=False)
                     saved_paths.append(output_file)
 
-                if not wants_multi_excel and not wants_multi_csv:
+                if ext and not wants_multi_excel and not wants_multi_csv:
                     msg = f"[SQL] ✓ Saved results to: {output_file}"
                     status_messages.append(msg)
                     print(msg)
@@ -3700,7 +3780,7 @@ Rules:
                 return {
                     "ok": True,
                     "response_text": summary,
-                    "file_path": output_file,
+                    "file_path": output_file if ext else None,
                     "file_paths": saved_paths,
                 }
             except Exception as e:

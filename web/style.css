@@ -577,6 +577,34 @@ body {
   text-align: right;
 }
 
+#chat-reply-limit-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 110px;
+  align-self: center;
+}
+
+#chat-reply-limit-wrap label {
+  font-size: 10px;
+  line-height: 1;
+}
+
+#chat-max-tokens {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+@media (max-width: 920px) {
+  #chat-reply-limit-wrap {
+    min-width: 90px;
+  }
+  #chat-max-tokens {
+    font-size: 11px;
+    padding: 5px 6px;
+  }
+}
+
 /* ═══ FORMS ═══ */
 input[type="text"], textarea, select {
   background: var(--bg-input);

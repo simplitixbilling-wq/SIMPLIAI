@@ -23,6 +23,7 @@ os.chdir(APP_DIR)
 import webview
 from webview.errors import JavascriptException
 from bridge import Bridge
+from local_api_server import LocalApiServer
 from utils import resource_path
 
 
@@ -54,6 +55,13 @@ def main():
     _install_pywebview_callback_race_guard()
     bridge = Bridge()
 
+    # Start secure localhost API for external integrations (Excel/Docs/scripts).
+    api_server = LocalApiServer(bridge)
+    api_meta = api_server.start()
+    print(f"[LOCAL API] http://{api_meta['host']}:{api_meta['port']}")
+    print(f"[LOCAL API] X-API-Key: {api_meta['api_key']}")
+    print(f"[LOCAL API] API key file: {api_meta['api_key_file']}")
+
     # web/ is a read-only bundled resource (--add-data puts it in _MEIPASS)
     web_dir = resource_path("web")
     index_url = os.path.join(web_dir, "index.html")
@@ -70,6 +78,11 @@ def main():
         min_size=(900, 600),
         text_select=True,
     )
+
+    try:
+        window.events.closed += lambda: api_server.stop()
+    except Exception:
+        pass
 
     webview.start(
         debug=("--debug" in sys.argv),

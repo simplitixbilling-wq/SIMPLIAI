@@ -1,8 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
 # NOTE: Do not bundle local model files in web build.
 datas = [('web', 'web'), ('instruction_templates.json', '.')]
+
+# Bundle Tesseract OCR if installed on the build machine
+_TESS_CANDIDATES = [
+    os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "Tesseract-OCR"),
+    os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), "Tesseract-OCR"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR"),
+]
+for _tess_dir in _TESS_CANDIDATES:
+    if _tess_dir and os.path.isfile(os.path.join(_tess_dir, "tesseract.exe")):
+        print(f"[spec] Bundling Tesseract-OCR from: {_tess_dir}")
+        datas += [(_tess_dir, "Tesseract-OCR")]
+        break
+else:
+    print("[spec] WARNING: Tesseract-OCR not found — OCR for scanned PDFs/images will be unavailable.")
 binaries = []
 hiddenimports = ['webview', 'requests', 'bs4', 'pandas', 'openpyxl', 'reportlab', 'docx', 'fitz', 'pytesseract', 'PIL', 'PIL.Image', 'duckdb', 'sklearn', 'joblib', 'numpy', 'scipy', 'scipy.sparse', 'pyttsx3', 'pyttsx3.drivers', 'pyttsx3.drivers.sapi5', 'pyttsx3.voice', 'comtypes', 'comtypes.client', 'win32com', 'win32com.client']
 tmp_ret = collect_all('llama_cpp')

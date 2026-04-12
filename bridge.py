@@ -814,6 +814,130 @@ class Bridge:
         self._status(f"Plugin command: {cmd}")
         return {"handled": True, "result": result}
 
+    def execute_python_snippet(self, code: str, timeout: int = 8, allowed_imports=None) -> dict:
+        """Execute a Python snippet in a restricted subprocess.
+
+        Intended for plugin command handlers that need lightweight computation.
+        Blocks filesystem/network/process access and enforces a timeout.
+        """
+        snippet = str(code or "").strip()
+        if not snippet:
+            return {"error": "Empty code"}
+
+        if len(snippet) > 12000:
+            return {"error": "Code too long (max 12000 chars)"}
+
+        # Fast deny-list to prevent obvious unsafe operations.
+        blocked_patterns = [
+            r"\bimport\s+os\b",
+            r"\bimport\s+sys\b",
+            r"\bimport\s+subprocess\b",
+            r"\bimport\s+socket\b",
+            r"\bimport\s+shutil\b",
+            r"\bimport\s+pathlib\b",
+            r"\bopen\s*\(",
+            r"\bexec\s*\(",
+            r"\beval\s*\(",
+            r"__import__",
+            r"os\.system",
+            r"subprocess\.",
+            r"socket\.",
+        ]
+        lowered = snippet.lower()
+        for pat in blocked_patterns:
+            if re.search(pat, lowered):
+                return {"error": "Unsafe code blocked by policy"}
+
+        whitelist = allowed_imports or ["math", "statistics", "random", "re", "json"]
+        safe_imports = [str(x).strip() for x in whitelist if str(x).strip()]
+
+        runner = r'''
+import json
+import traceback
+import importlib
+import builtins as _builtins
+import sys
+
+payload = json.loads(sys.stdin.read())
+code = payload.get("code", "")
+allowed = set(payload.get("allowed_imports", []))
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = (name or "").split(".", 1)[0]
+    if root not in allowed:
+        raise ImportError(f"Import blocked: {root}")
+    return importlib.import_module(name)
+
+safe_builtins = {
+    "abs": _builtins.abs,
+    "all": _builtins.all,
+    "any": _builtins.any,
+    "bool": _builtins.bool,
+    "dict": _builtins.dict,
+    "enumerate": _builtins.enumerate,
+    "float": _builtins.float,
+    "int": _builtins.int,
+    "len": _builtins.len,
+    "list": _builtins.list,
+    "max": _builtins.max,
+    "min": _builtins.min,
+    "pow": _builtins.pow,
+    "print": _builtins.print,
+    "range": _builtins.range,
+    "round": _builtins.round,
+    "set": _builtins.set,
+    "sorted": _builtins.sorted,
+    "str": _builtins.str,
+    "sum": _builtins.sum,
+    "tuple": _builtins.tuple,
+    "zip": _builtins.zip,
+    "__import__": _safe_import,
+}
+
+scope = {"__builtins__": safe_builtins}
+try:
+    exec(code, scope, scope)
+except Exception:
+    traceback.print_exc()
+    raise
+'''
+
+        try:
+            payload = json.dumps({"code": snippet, "allowed_imports": safe_imports})
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", runner],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=max(1, int(timeout)),
+            )
+        except subprocess.TimeoutExpired:
+            return {"error": f"Execution timed out after {timeout}s"}
+        except Exception as e:
+            return {"error": f"Execution failed: {e}"}
+
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if len(stdout) > 4000:
+            stdout = stdout[:4000] + "\n...[truncated]"
+        if len(stderr) > 4000:
+            stderr = stderr[:4000] + "\n...[truncated]"
+
+        if proc.returncode != 0:
+            return {
+                "error": "Python execution failed",
+                "stdout": stdout,
+                "stderr": stderr,
+                "returncode": proc.returncode,
+            }
+
+        return {
+            "ok": True,
+            "stdout": stdout,
+            "stderr": stderr,
+            "returncode": proc.returncode,
+        }
+
     def _start_auto_save_loop(self):
         def _loop():
             while True:
@@ -1771,27 +1895,29 @@ class Bridge:
             return {"error": "Nothing to rewrite"}
 
         prompt_parts = [
-            "Rewrite the following agent instruction fields into an execution-ready data task. "
-            "Do more than grammar correction: convert vague business wording into precise, operational steps that an AI data agent can execute. "
+            "Rewrite the following agent instruction fields into an execution-ready task. "
+            "Do more than grammar correction: convert vague wording into precise, operational steps an AI agent can execute. "
             "Keep the original intent, but make the instructions concrete, explicit, and implementation-ready.\n"
             "Return ONLY a JSON object with keys \"role\", \"task\", \"steps\" "
             "(steps as a single string). No markdown fences.\n"
             "REWRITE RULES:\n"
-            "- Preserve the user's goal, but rewrite it into precise data operations.\n"
-            "- Make joins, aggregations, filters, comparisons, grouping keys, and output columns explicit when they are implied by the request.\n"
-            "- If the user already mentions table names, sheet names, columns, or keys, keep them exactly.\n"
+            "- Preserve the user's goal and domain (learning, support, coding, finance, etc.).\n"
+            "- Keep the same section intent and labels when present (e.g., Assessment, Planning, Feedback).\n"
+            "- For data tasks, make joins, aggregations, filters, comparisons, grouping keys, and output columns explicit only when relevant.\n"
+            "- If the user mentions table names, sheet names, columns, or keys, keep them exactly.\n"
             "- Do NOT invent schema details that are not present in the input.\n"
             "- Do NOT change the business meaning.\n"
-            "- Prefer deterministic wording such as aggregate, join, group by, filter, rename, compare, and return.\n"
+            "- Prefer deterministic action wording and clear deliverables.\n"
             "- The task field should be a short execution objective, not a generic summary.\n"
-            "CRITICAL STEPS FORMAT: Use numbered section headers with '*' bullets exactly like:\n"
-            "1. Data Selection & Aggregation:\n"
-            "* Aggregate table A by key_x.\n"
-            "* Sum columns col_1 and col_2.\n"
-            "2. Joining and Mapping:\n"
-            "* Join the aggregated result with table B on key_x.\n"
-            "3. Final Output:\n"
-            "* Return key_x and the required comparison columns.\n"
+            "CRITICAL STEPS FORMAT: Use numbered section headers with '*' bullets.\n"
+            "Example:\n"
+            "1. Assessment:\n"
+            "* Evaluate current level and goals.\n"
+            "2. Planning:\n"
+            "* Build a phased roadmap with milestones.\n"
+            "3. Feedback:\n"
+            "* Define checkpoints and next focus areas.\n"
+            "Do NOT force section names like 'Data Selection & Aggregation', 'Joining and Mapping', or 'Final Output' unless the input is explicitly a data-reconciliation task.\n"
             "Do not return paragraph-style steps.\n"
         ]
         if role:
@@ -1806,8 +1932,8 @@ class Bridge:
         try:
             formatted_prompt = self._build_chat_prompt(
                 system=(
-                    "You are an expert data-workflow designer. "
-                    "Rewrite user instructions into precise, execution-ready data-processing steps. "
+                    "You are an expert workflow designer. "
+                    "Rewrite user instructions into precise, execution-ready steps while preserving the original domain and section intent. "
                     "Return ONLY valid JSON with keys \"role\", \"task\", \"steps\". "
                     "No markdown fences, no explanation."
                 ),
@@ -2005,7 +2131,12 @@ class Bridge:
                 return {"error": "Generation stopped by user", "stopped": True}
             ai_text = response.get("choices", [{}])[0].get("text", "").strip()
             if not ai_text:
-                return {"error": "No response from model"}
+                return {
+                    "text": (
+                        "I could not generate a stable response for this input. "
+                        "Please try with fewer rows/columns or simpler instruction."
+                    )
+                }
             return {"text": ai_text}
         except Exception as e:
             return {"error": str(e)}
@@ -8066,6 +8197,7 @@ def unregister(app):  # optional
 - `app.plugin_manager` — PluginManager instance
 - `app.register_plugin_command('/name', handler, plugin_name='...', description='...')`
 - `app.unregister_plugin_command('/name')`
+- `app.execute_python_snippet(code, timeout=8)` — restricted Python runner for plugin commands
 - `app._DEFAULT_SYSTEM` — default system prompt string (can be overridden)
 - `app.send_message(text)` — send a message programmatically (wraps the full generation pipeline)
 

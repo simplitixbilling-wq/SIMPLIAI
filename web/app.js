@@ -73,6 +73,35 @@ let attachedImageName = null;
 let attachedDocName = null;
 let contextLimitTokens = 0;
 let actualContext = { used: 0, total: 0 };
+
+function normalizeReplyTokenLimit(value) {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  if (Number.isFinite(n) && n > 0) return n;
+  return 0;
+}
+
+function applyReplyTokenLimitUi(value) {
+  const normalized = normalizeReplyTokenLimit(value);
+  const asString = String(normalized);
+  const chatSelect = $('#chat-max-tokens');
+  const settingsSelect = $('#s-max-tokens');
+
+  if (chatSelect) {
+    if (!Array.from(chatSelect.options).some(o => o.value === asString)) {
+      chatSelect.value = '0';
+    } else {
+      chatSelect.value = asString;
+    }
+  }
+
+  if (settingsSelect) {
+    if (!Array.from(settingsSelect.options).some(o => o.value === asString)) {
+      settingsSelect.value = normalized > 0 ? '512' : '0';
+    } else {
+      settingsSelect.value = asString;
+    }
+  }
+}
 let pendingExportTarget = null;
 let isSpeaking = false;
 let fullAccessGranted = true;
@@ -794,6 +823,9 @@ async function init() {
   setStatus(`${info.config?.mode || 'READY'} | RAM: ${info.system_ram}GB | VRAM: ${info.gpu?.vram ?? '?'}GB`);
   document.documentElement.setAttribute('data-theme', String(info.theme || 'Dark').toLowerCase());
   switchHljsTheme(String(info.theme || 'Dark').toLowerCase());
+
+  const startupSettings = await safeStep('Loading app settings', () => api.get_app_settings()) || {};
+  applyReplyTokenLimitUi(startupSettings.max_response_tokens);
 
   const activationOk = await ensureActivationGate(true);
   if (!activationOk) {
@@ -2119,9 +2151,7 @@ $('#btn-settings').addEventListener('click', async () => {
   $('#s-topp-val').textContent = (settings.top_p || 0.9).toFixed(2);
   $('#s-repeat-penalty').value = Math.round((settings.repeat_penalty || 1.1) * 100);
   $('#s-reppen-val').textContent = (settings.repeat_penalty || 1.1).toFixed(2);
-  if (settings.max_response_tokens) {
-    $('#s-max-tokens').value = String(settings.max_response_tokens);
-  }
+  applyReplyTokenLimitUi(settings.max_response_tokens);
   $('#s-brave-api-key').value = settings.brave_api_key || '';
   await populateVoiceOptions(settings.tts_voice_id || '');
   await populatePiperCatalog();
@@ -2180,18 +2210,33 @@ $('#btn-save-settings').addEventListener('click', async () => {
   switchHljsTheme(theme);
   await api.set_theme(theme.charAt(0).toUpperCase() + theme.slice(1));
 
+  const maxResponseTokens = normalizeReplyTokenLimit($('#s-max-tokens').value);
   await api.save_app_settings({
     theme: theme.charAt(0).toUpperCase() + theme.slice(1),
     temperature: parseFloat(($('#s-temperature').value / 100).toFixed(3)),
     top_p: parseFloat(($('#s-top-p').value / 100).toFixed(3)),
     repeat_penalty: parseFloat(($('#s-repeat-penalty').value / 100).toFixed(3)),
-    max_response_tokens: parseInt($('#s-max-tokens').value),
+    max_response_tokens: maxResponseTokens,
     brave_api_key: ($('#s-brave-api-key').value || '').trim(),
     tts_voice_id: ($('#s-voice')?.value || '').trim(),
   });
 
+  applyReplyTokenLimitUi(maxResponseTokens);
+
   closeModal('modal-settings');
   showToast('Settings saved', 'info');
+});
+
+$('#chat-max-tokens')?.addEventListener('change', async function() {
+  const maxResponseTokens = normalizeReplyTokenLimit(this.value);
+  await api.save_app_settings({ max_response_tokens: maxResponseTokens });
+  applyReplyTokenLimitUi(maxResponseTokens);
+  showToast(
+    maxResponseTokens > 0
+      ? `Reply length limit set to ${maxResponseTokens} tokens`
+      : 'Reply length set to Auto (context-based)',
+    'info'
+  );
 });
 
 window.addEventListener('export_ready', (e) => {
@@ -3295,6 +3340,25 @@ $('#btn-rewrite-ai')?.addEventListener('click', async () => {
     let normTask = String(payload?.task ?? payload?.Task ?? '').trim();
     let normSteps = String(payload?.steps ?? payload?.Steps ?? '').trim();
 
+    const extractLabeled = (text, label) => {
+      const src = String(text || '');
+      const re = new RegExp(`(?:^|\\n)\\s*${label}\\s*:\\s*([\\s\\S]*?)(?=\\n\\s*(?:Role|Task|Steps)\\s*:|$)`, 'i');
+      const m = src.match(re);
+      return m ? String(m[1]).trim() : '';
+    };
+
+    const stripTaskNoise = (text) => {
+      let t = String(text || '').trim();
+      if (!t) return '';
+      // If task accidentally contains steps-style bullets/sections, keep first sentence/line only.
+      if (/\n\s*(?:\d+\.|\*|[-•])\s+/.test(t) || /^\s*\d+\./m.test(t)) {
+        t = t.split(/\n/)[0].trim();
+      }
+      // Remove leading "Task:" label if present.
+      t = t.replace(/^\s*Task\s*:\s*/i, '').trim();
+      return t;
+    };
+
     // Some models return a JSON object string in task; extract and map to fields.
     if (normTask.startsWith('{') && normTask.endsWith('}')) {
       try {
@@ -3311,6 +3375,20 @@ $('#btn-rewrite-ai')?.addEventListener('click', async () => {
       } catch (_) {
         // keep original task text
       }
+    }
+
+    // Handle plaintext/markdown responses with explicit labels.
+    if (!normTask && typeof payload === 'string') {
+      normTask = extractLabeled(payload, 'Task');
+    }
+    if (!normSteps && typeof payload === 'string') {
+      normSteps = extractLabeled(payload, 'Steps');
+    }
+
+    normTask = stripTaskNoise(normTask);
+    if (!normTask) {
+      // Keep user's current task rather than writing unrelated content.
+      normTask = task;
     }
 
     if (normRole) $('#agent-instr-role').value = normRole;

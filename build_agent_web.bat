@@ -41,20 +41,7 @@ if exist processed_files xcopy /E /I /Y processed_files dist\SIMPLE_AI_WEB\proce
 if exist exports xcopy /E /I /Y exports dist\SIMPLE_AI_WEB\exports >nul
 if exist saved_chats xcopy /E /I /Y saved_chats dist\SIMPLE_AI_WEB\saved_chats >nul
 
-REM Bundle Tesseract OCR (if installed)
-set "TESSDIR=%ProgramFiles%\Tesseract-OCR"
-if exist "%TESSDIR%\tesseract.exe" (
-  echo Bundling Tesseract OCR...
-  if not exist "dist\SIMPLE_AI_WEB\Tesseract-OCR" mkdir "dist\SIMPLE_AI_WEB\Tesseract-OCR"
-  if not exist "dist\SIMPLE_AI_WEB\Tesseract-OCR\tessdata" mkdir "dist\SIMPLE_AI_WEB\Tesseract-OCR\tessdata"
-  copy /Y "%TESSDIR%\tesseract.exe" "dist\SIMPLE_AI_WEB\Tesseract-OCR\" >nul
-  copy /Y "%TESSDIR%\*.dll" "dist\SIMPLE_AI_WEB\Tesseract-OCR\" >nul
-  if exist "%TESSDIR%\tessdata\eng.traineddata" copy /Y "%TESSDIR%\tessdata\eng.traineddata" "dist\SIMPLE_AI_WEB\Tesseract-OCR\tessdata\" >nul
-  if exist "%TESSDIR%\tessdata\osd.traineddata" copy /Y "%TESSDIR%\tessdata\osd.traineddata" "dist\SIMPLE_AI_WEB\Tesseract-OCR\tessdata\" >nul
-  echo Tesseract bundled.
-) else (
-  echo NOTE: Tesseract not found at %TESSDIR% - OCR for scanned PDFs/images will not be available.
-)
+REM Tesseract OCR is bundled automatically by SIMPLE_AI_WEB.spec (datas block)
 
 echo.
 echo Build successful.

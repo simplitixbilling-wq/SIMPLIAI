@@ -97,6 +97,19 @@
           <button id="btn-voice" class="btn-icon" title="Voice input">◉</button>
         </div>
         <textarea id="user-input" rows="1" placeholder="Type a message…"></textarea>
+        <div id="chat-reply-limit-wrap" title="Control assistant reply length for chat">
+          <label for="chat-max-tokens" class="muted small">Reply length</label>
+          <select id="chat-max-tokens">
+            <option value="0">Auto</option>
+            <option value="256">256</option>
+            <option value="512">512</option>
+            <option value="1024">1024</option>
+            <option value="2048">2048</option>
+            <option value="4096">4096</option>
+            <option value="8192">8192</option>
+            <option value="16384">16384</option>
+          </select>
+        </div>
         <span id="token-counter" class="muted small">0 tokens</span>
         <button id="btn-send" class="btn accent" disabled>➤</button>
         <button id="btn-stop" class="btn danger" style="display:none;">■</button>
@@ -295,6 +308,7 @@
         <div class="settings-section">
           <label>Max response tokens</label>
           <select id="s-max-tokens">
+            <option value="0">Auto (context-based)</option>
             <option value="256">256</option>
             <option value="512" selected>512</option>
             <option value="1024">1024</option>

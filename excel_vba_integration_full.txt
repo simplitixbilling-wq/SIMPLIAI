@@ -1,0 +1,340 @@
+Option Explicit
+
+Private Const AI_CFG_SHEET As String = "_AI_CONFIG"
+
+Private Function ReadAllText(filePath As String) As String
+    Dim fso As Object, ts As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.OpenTextFile(filePath, 1, False)
+    ReadAllText = ts.ReadAll
+    ts.Close
+End Function
+
+Private Function SelectFolderPath(dialogTitle As String) As String
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFolderPicker)
+    With fd
+        .Title = dialogTitle
+        .AllowMultiSelect = False
+        If .Show = -1 Then
+            SelectFolderPath = .SelectedItems(1)
+        Else
+            SelectFolderPath = ""
+        End If
+    End With
+End Function
+
+Private Function EnsureConfigSheet() As Worksheet
+    On Error Resume Next
+    Set EnsureConfigSheet = ThisWorkbook.Worksheets(AI_CFG_SHEET)
+    On Error GoTo 0
+
+    If EnsureConfigSheet Is Nothing Then
+        Set EnsureConfigSheet = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+        EnsureConfigSheet.Name = AI_CFG_SHEET
+        EnsureConfigSheet.Cells(1, 1).Value = "key"
+        EnsureConfigSheet.Cells(1, 2).Value = "value"
+        EnsureConfigSheet.Cells(2, 1).Value = "app_folder"
+        EnsureConfigSheet.Visible = xlSheetVeryHidden
+    End If
+End Function
+
+Private Function GetConfiguredAppFolder() As String
+    Dim cfg As Worksheet
+    Dim appFolder As String
+    Dim keyFile As String
+
+    Set cfg = EnsureConfigSheet()
+    appFolder = Trim$(CStr(cfg.Cells(2, 2).Value2))
+
+    If Len(appFolder) > 0 Then
+        keyFile = appFolder & "\local_api_key.txt"
+        If Len(Dir$(keyFile)) > 0 Then
+            GetConfiguredAppFolder = appFolder
+            Exit Function
+        End If
+    End If
+
+    appFolder = SelectFolderPath("Select SIMPLE_AI app folder (must contain local_api_key.txt)")
+    If Len(appFolder) = 0 Then
+        GetConfiguredAppFolder = ""
+        Exit Function
+    End If
+
+    keyFile = appFolder & "\local_api_key.txt"
+    If Len(Dir$(keyFile)) = 0 Then
+        MsgBox "local_api_key.txt not found in selected folder." & vbCrLf & keyFile, vbCritical
+        GetConfiguredAppFolder = ""
+        Exit Function
+    End If
+
+    cfg.Cells(2, 2).Value = appFolder
+    cfg.Visible = xlSheetVeryHidden
+    GetConfiguredAppFolder = appFolder
+End Function
+
+Public Sub ResetSimpleAIAppPath()
+    Dim cfg As Worksheet
+    Set cfg = EnsureConfigSheet()
+    cfg.Cells(2, 2).Value = ""
+    cfg.Visible = xlSheetVeryHidden
+    MsgBox "SIMPLE_AI app path reset. You will be asked again on next run.", vbInformation
+End Sub
+
+Private Function JsonEscape(ByVal s As String) As String
+    s = Replace(s, "\", "\\")
+    s = Replace(s, """", "\""")
+    s = Replace(s, vbCrLf, "\n")
+    s = Replace(s, vbCr, "\n")
+    s = Replace(s, vbLf, "\n")
+    JsonEscape = s
+End Function
+
+Private Function JsonUnescape(ByVal s As String) As String
+    s = Replace(s, "\n", vbLf)
+    s = Replace(s, "\""", """")
+    s = Replace(s, "\\", "\")
+    JsonUnescape = s
+End Function
+
+Private Function CellToJsonValue(v As Variant) As String
+    If IsError(v) Then
+        CellToJsonValue = """"""
+    ElseIf IsEmpty(v) Then
+        CellToJsonValue = """"""
+    ElseIf VarType(v) = vbBoolean Then
+        If CBool(v) Then
+            CellToJsonValue = "true"
+        Else
+            CellToJsonValue = "false"
+        End If
+    ElseIf IsNumeric(v) Then
+        CellToJsonValue = CStr(v)
+    Else
+        CellToJsonValue = """" & JsonEscape(CStr(v)) & """"
+    End If
+End Function
+
+Private Function BuildHeadersJson(rng As Range) As String
+    Dim c As Long, arr As String
+    arr = "["
+    For c = 1 To rng.Columns.Count
+        If c > 1 Then arr = arr & ","
+        arr = arr & """" & JsonEscape(CStr(rng.Cells(1, c).Value2)) & """"
+    Next c
+    arr = arr & "]"
+    BuildHeadersJson = arr
+End Function
+
+Private Function BuildRowsJson(rng As Range) As String
+    Dim r As Long, c As Long, out As String
+    out = "["
+    For r = 2 To rng.Rows.Count
+        If r > 2 Then out = out & ","
+        out = out & "["
+        For c = 1 To rng.Columns.Count
+            If c > 1 Then out = out & ","
+            out = out & CellToJsonValue(rng.Cells(r, c).Value2)
+        Next c
+        out = out & "]"
+    Next r
+    out = out & "]"
+    BuildRowsJson = out
+End Function
+
+Private Function ExtractJsonTextField(ByVal json As String) As String
+    Dim p As Long, i As Long, n As Long
+    Dim ch As String
+    Dim inStr As Boolean, esc As Boolean
+    Dim out As String
+
+    p = InStr(1, json, """text""", vbTextCompare)
+    If p = 0 Then
+        ExtractJsonTextField = ""
+        Exit Function
+    End If
+
+    p = InStr(p, json, ":")
+    If p = 0 Then
+        ExtractJsonTextField = ""
+        Exit Function
+    End If
+
+    i = p + 1
+    n = Len(json)
+
+    Do While i <= n And Mid$(json, i, 1) <> """"
+        i = i + 1
+    Loop
+    If i > n Then
+        ExtractJsonTextField = ""
+        Exit Function
+    End If
+
+    i = i + 1
+    inStr = True
+    esc = False
+    out = ""
+
+    Do While i <= n And inStr
+        ch = Mid$(json, i, 1)
+        If esc Then
+            out = out & "\" & ch
+            esc = False
+        ElseIf ch = "\" Then
+            esc = True
+        ElseIf ch = """" Then
+            inStr = False
+        Else
+            out = out & ch
+        End If
+        i = i + 1
+    Loop
+
+    ExtractJsonTextField = JsonUnescape(out)
+End Function
+
+Private Function GetOrCreateSheet(sheetName As String) As Worksheet
+    On Error Resume Next
+    Set GetOrCreateSheet = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+
+    If GetOrCreateSheet Is Nothing Then
+        Set GetOrCreateSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        GetOrCreateSheet.Name = sheetName
+    End If
+End Function
+
+Private Sub EnsureOutputHeaders(ws As Worksheet)
+    If Len(Trim$(CStr(ws.Cells(1, 1).Value2))) = 0 Then
+        ws.Cells(1, 1).Value = "Timestamp"
+        ws.Cells(1, 2).Value = "Source Sheet"
+        ws.Cells(1, 3).Value = "Selection"
+        ws.Cells(1, 4).Value = "Instruction"
+        ws.Cells(1, 5).Value = "AI Text"
+        ws.Rows(1).Font.Bold = True
+    End If
+End Sub
+
+Private Sub EnsureJsonHeaders(ws As Worksheet)
+    If Len(Trim$(CStr(ws.Cells(1, 1).Value2))) = 0 Then
+        ws.Cells(1, 1).Value = "Timestamp"
+        ws.Cells(1, 2).Value = "Source Sheet"
+        ws.Cells(1, 3).Value = "Selection"
+        ws.Cells(1, 4).Value = "Instruction"
+        ws.Cells(1, 5).Value = "Raw JSON"
+        ws.Rows(1).Font.Bold = True
+    End If
+End Sub
+
+Public Sub AskSimpleAI_FromSelection()
+    On Error GoTo EH
+
+    Dim sel As Range
+    Dim apiKeyPath As String, apiKey As String
+    Dim instruction As String
+    Dim payload As String
+    Dim url As String
+    Dim http As Object
+    Dim sheetName As String
+    Dim responseText As String
+    Dim aiText As String
+    Dim outWs As Worksheet
+    Dim jsonWs As Worksheet
+    Dim outRow As Long
+    Dim jsonRow As Long
+    Dim sourceAddress As String
+    Dim appFolder As String
+
+    If TypeName(Selection) <> "Range" Then
+        MsgBox "Please select a table range first (header row + data rows).", vbExclamation
+        Exit Sub
+    End If
+
+    Set sel = Selection
+
+    If sel.Rows.Count < 2 Then
+        MsgBox "Selection must include at least 2 rows: header + one data row.", vbExclamation
+        Exit Sub
+    End If
+
+    instruction = InputBox("What should AI do with this selected range?", "SIMPLE_AI Excel Integration", "Summarize key insights and outliers.")
+    If Len(Trim$(instruction)) = 0 Then Exit Sub
+
+    appFolder = GetConfiguredAppFolder()
+    If Len(appFolder) = 0 Then
+        MsgBox "SIMPLE_AI app folder not configured.", vbExclamation
+        Exit Sub
+    End If
+
+    apiKeyPath = appFolder & "\local_api_key.txt"
+    apiKey = Trim$(ReadAllText(apiKeyPath))
+    If Len(apiKey) = 0 Then
+        MsgBox "API key file is empty: " & apiKeyPath, vbCritical
+        Exit Sub
+    End If
+
+    sheetName = ActiveSheet.Name
+
+    payload = "{"
+    payload = payload & """instruction"":""" & JsonEscape(instruction) & """," 
+    payload = payload & """sheet_name"":""" & JsonEscape(sheetName) & """," 
+    payload = payload & """headers"":" & BuildHeadersJson(sel) & ","
+    payload = payload & """rows"":" & BuildRowsJson(sel) & ","
+    payload = payload & """role"":""You are an expert spreadsheet analyst."""
+    payload = payload & "}"
+
+    url = "http://127.0.0.1:8765/v1/excel-range"
+
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    http.Open "POST", url, False
+    http.setRequestHeader "Content-Type", "application/json"
+    http.setRequestHeader "X-API-Key", apiKey
+    http.send payload
+
+    responseText = http.responseText
+    sourceAddress = sel.Address(False, False)
+
+    Set outWs = GetOrCreateSheet("AI_Output")
+    EnsureOutputHeaders outWs
+    outRow = outWs.Cells(outWs.Rows.Count, 1).End(xlUp).Row + 1
+
+    Set jsonWs = GetOrCreateSheet("_AI_JSON_LOG")
+    EnsureJsonHeaders jsonWs
+    jsonWs.Visible = xlSheetVeryHidden
+    jsonRow = jsonWs.Cells(jsonWs.Rows.Count, 1).End(xlUp).Row + 1
+
+    jsonWs.Cells(jsonRow, 1).Value = Now
+    jsonWs.Cells(jsonRow, 2).Value = sheetName
+    jsonWs.Cells(jsonRow, 3).Value = sourceAddress
+    jsonWs.Cells(jsonRow, 4).Value = instruction
+    jsonWs.Cells(jsonRow, 5).Value = responseText
+
+    If http.Status >= 200 And http.Status < 300 Then
+        aiText = ExtractJsonTextField(responseText)
+        If Len(Trim$(aiText)) = 0 Then aiText = responseText
+
+        outWs.Cells(outRow, 1).Value = Now
+        outWs.Cells(outRow, 2).Value = sheetName
+        outWs.Cells(outRow, 3).Value = sourceAddress
+        outWs.Cells(outRow, 4).Value = instruction
+        outWs.Cells(outRow, 5).Value = aiText
+
+        outWs.Columns("A:E").EntireColumn.AutoFit
+        MsgBox "AI response written to sheet: AI_Output (row " & outRow & ")", vbInformation
+    Else
+        outWs.Cells(outRow, 1).Value = Now
+        outWs.Cells(outRow, 2).Value = sheetName
+        outWs.Cells(outRow, 3).Value = sourceAddress
+        outWs.Cells(outRow, 4).Value = instruction
+        outWs.Cells(outRow, 5).Value = "API error " & http.Status & ": " & responseText
+
+        outWs.Columns("A:E").EntireColumn.AutoFit
+        MsgBox "API error " & http.Status & ": " & responseText, vbCritical
+    End If
+
+    Exit Sub
+
+EH:
+    MsgBox "Error: " & Err.Description, vbCritical
+End Sub

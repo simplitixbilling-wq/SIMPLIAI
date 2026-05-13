@@ -1,6 +1,13 @@
 Option Explicit
 
 Private Const AI_CFG_SHEET As String = "_AI_CONFIG"
+Private Const API_PORT As String = "8765"
+Private Const AI_CHAT_SHEET As String = "AI_Chat"
+Private Const CHAT_MAX_HISTORY As Long = 20  ' max messages to send for context
+
+' ══════════════════════════════════════════════════════════════
+'  UTILITY FUNCTIONS
+' ══════════════════════════════════════════════════════════════
 
 Private Function ReadAllText(filePath As String) As String
     Dim fso As Object, ts As Object
@@ -23,6 +30,10 @@ Private Function SelectFolderPath(dialogTitle As String) As String
         End If
     End With
 End Function
+
+' ══════════════════════════════════════════════════════════════
+'  CONFIG PERSISTENCE
+' ══════════════════════════════════════════════════════════════
 
 Private Function EnsureConfigSheet() As Worksheet
     On Error Resume Next
@@ -81,6 +92,10 @@ Public Sub ResetSimpleAIAppPath()
     MsgBox "SIMPLE_AI app path reset. You will be asked again on next run.", vbInformation
 End Sub
 
+' ══════════════════════════════════════════════════════════════
+'  JSON HELPERS
+' ══════════════════════════════════════════════════════════════
+
 Private Function JsonEscape(ByVal s As String) As String
     s = Replace(s, "\", "\\")
     s = Replace(s, """", "\""")
@@ -103,11 +118,7 @@ Private Function CellToJsonValue(v As Variant) As String
     ElseIf IsEmpty(v) Then
         CellToJsonValue = """"""
     ElseIf VarType(v) = vbBoolean Then
-        If CBool(v) Then
-            CellToJsonValue = "true"
-        Else
-            CellToJsonValue = "false"
-        End If
+        CellToJsonValue = IIf(CBool(v), "true", "false")
     ElseIf IsNumeric(v) Then
         CellToJsonValue = CStr(v)
     Else
@@ -145,7 +156,7 @@ End Function
 Private Function ExtractJsonTextField(ByVal json As String) As String
     Dim p As Long, i As Long, n As Long
     Dim ch As String
-    Dim inStr As Boolean, esc As Boolean
+    Dim inQuote As Boolean, escFlag As Boolean
     Dim out As String
 
     p = InStr(1, json, """text""", vbTextCompare)
@@ -172,19 +183,19 @@ Private Function ExtractJsonTextField(ByVal json As String) As String
     End If
 
     i = i + 1
-    inStr = True
-    esc = False
+    inQuote = True
+    escFlag = False
     out = ""
 
-    Do While i <= n And inStr
+    Do While i <= n And inQuote
         ch = Mid$(json, i, 1)
-        If esc Then
+        If escFlag Then
             out = out & "\" & ch
-            esc = False
+            escFlag = False
         ElseIf ch = "\" Then
-            esc = True
+            escFlag = True
         ElseIf ch = """" Then
-            inStr = False
+            inQuote = False
         Else
             out = out & ch
         End If
@@ -194,63 +205,1819 @@ Private Function ExtractJsonTextField(ByVal json As String) As String
     ExtractJsonTextField = JsonUnescape(out)
 End Function
 
-Private Function GetOrCreateSheet(sheetName As String) As Worksheet
+''' Extract a JSON block { ... } from a string that may have surrounding text.
+Private Function ExtractJsonBlock(ByVal s As String) As String
+    Dim startPos As Long, depth As Long, i As Long
+    startPos = InStr(1, s, "{")
+    If startPos = 0 Then
+        ExtractJsonBlock = ""
+        Exit Function
+    End If
+    depth = 0
+    For i = startPos To Len(s)
+        If Mid$(s, i, 1) = "{" Then depth = depth + 1
+        If Mid$(s, i, 1) = "}" Then depth = depth - 1
+        If depth = 0 Then
+            ExtractJsonBlock = Mid$(s, startPos, i - startPos + 1)
+            Exit Function
+        End If
+    Next i
+    ExtractJsonBlock = Mid$(s, startPos)
+End Function
+
+''' Simple JSON value extractor — returns value for a key (string, number, or raw).
+Private Function JsonValue(ByVal json As String, ByVal key As String) As String
+    Dim pattern As String, p As Long, startChar As String
+    pattern = """" & key & """"
+    p = InStr(1, json, pattern, vbTextCompare)
+    If p = 0 Then
+        JsonValue = ""
+        Exit Function
+    End If
+    p = InStr(p + Len(pattern), json, ":")
+    If p = 0 Then JsonValue = "": Exit Function
+    p = p + 1
+    ' Skip whitespace
+    Do While p <= Len(json) And (Mid$(json, p, 1) = " " Or Mid$(json, p, 1) = vbTab)
+        p = p + 1
+    Loop
+    startChar = Mid$(json, p, 1)
+    If startChar = """" Then
+        ' String value
+        Dim j As Long, esc2 As Boolean
+        j = p + 1
+        esc2 = False
+        Do While j <= Len(json)
+            If esc2 Then
+                esc2 = False
+            ElseIf Mid$(json, j, 1) = "\" Then
+                esc2 = True
+            ElseIf Mid$(json, j, 1) = """" Then
+                JsonValue = JsonUnescape(Mid$(json, p + 1, j - p - 1))
+                Exit Function
+            End If
+            j = j + 1
+        Loop
+        JsonValue = Mid$(json, p + 1)
+    ElseIf startChar = "[" Then
+        ' Array — return raw
+        Dim depth2 As Long, k As Long
+        depth2 = 0
+        For k = p To Len(json)
+            If Mid$(json, k, 1) = "[" Then depth2 = depth2 + 1
+            If Mid$(json, k, 1) = "]" Then depth2 = depth2 - 1
+            If depth2 = 0 Then
+                JsonValue = Mid$(json, p, k - p + 1)
+                Exit Function
+            End If
+        Next k
+        JsonValue = Mid$(json, p)
+    Else
+        ' Number/bool — read until comma, }, or ]
+        Dim endP As Long
+        endP = p
+        Do While endP <= Len(json)
+            Dim ec As String
+            ec = Mid$(json, endP, 1)
+            If ec = "," Or ec = "}" Or ec = "]" Or ec = vbLf Then Exit Do
+            endP = endP + 1
+        Loop
+        JsonValue = Trim$(Mid$(json, p, endP - p))
+    End If
+End Function
+
+''' Return the first non-empty JSON key match from a list of possible key names.
+Private Function JsonValueAny(ByVal json As String, ParamArray keys() As Variant) As String
+    Dim i As Long
+    For i = LBound(keys) To UBound(keys)
+        Dim v As String
+        v = JsonValue(json, CStr(keys(i)))
+        If Len(Trim$(v)) > 0 Then
+            JsonValueAny = v
+            Exit Function
+        End If
+    Next i
+    JsonValueAny = ""
+End Function
+
+''' Extract first bracket array block from a string, e.g. [1,2,3].
+Private Function ExtractFirstArray(ByVal s As String) As String
+    Dim p As Long, i As Long, depth As Long
+    p = InStr(1, s, "[")
+    If p = 0 Then
+        ExtractFirstArray = ""
+        Exit Function
+    End If
+    depth = 0
+    For i = p To Len(s)
+        If Mid$(s, i, 1) = "[" Then depth = depth + 1
+        If Mid$(s, i, 1) = "]" Then depth = depth - 1
+        If depth = 0 Then
+            ExtractFirstArray = Mid$(s, p, i - p + 1)
+            Exit Function
+        End If
+    Next i
+    ExtractFirstArray = ""
+End Function
+
+''' Split a JSON array of strings into a VBA array.
+Private Function JsonArrayToStrings(ByVal arrStr As String) As Variant
+    Dim result() As String
+    Dim cleaned As String, item As String
+    Dim count As Long, i As Long
+    
+    cleaned = arrStr
+    If Left$(cleaned, 1) = "[" Then cleaned = Mid$(cleaned, 2)
+    If Right$(cleaned, 1) = "]" Then cleaned = Left$(cleaned, Len(cleaned) - 1)
+    cleaned = Trim$(cleaned)
+    
+    If Len(cleaned) = 0 Then
+        JsonArrayToStrings = Array()
+        Exit Function
+    End If
+    
+    ' Simple split by ","  — handles quoted strings
+    Dim parts() As String
+    parts = Split(cleaned, ",")
+    
+    ReDim result(0 To UBound(parts))
+    For i = 0 To UBound(parts)
+        item = Trim$(parts(i))
+        ' Strip quotes
+        If Left$(item, 1) = """" Then item = Mid$(item, 2)
+        If Right$(item, 1) = """" Then item = Left$(item, Len(item) - 1)
+        result(i) = JsonUnescape(item)
+    Next i
+    
+    JsonArrayToStrings = result
+End Function
+
+Private Function GetOrCreateSheet(wb As Workbook, sheetName As String) As Worksheet
     On Error Resume Next
-    Set GetOrCreateSheet = ThisWorkbook.Worksheets(sheetName)
+    Set GetOrCreateSheet = wb.Worksheets(sheetName)
     On Error GoTo 0
 
     If GetOrCreateSheet Is Nothing Then
-        Set GetOrCreateSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        Set GetOrCreateSheet = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
         GetOrCreateSheet.Name = sheetName
     End If
 End Function
 
-Private Sub EnsureOutputHeaders(ws As Worksheet)
-    If Len(Trim$(CStr(ws.Cells(1, 1).Value2))) = 0 Then
-        ws.Cells(1, 1).Value = "Timestamp"
-        ws.Cells(1, 2).Value = "Source Sheet"
-        ws.Cells(1, 3).Value = "Selection"
-        ws.Cells(1, 4).Value = "Instruction"
-        ws.Cells(1, 5).Value = "AI Text"
-        ws.Rows(1).Font.Bold = True
+''' Find column index by header name (case-insensitive) in a selection range.
+Private Function FindColumnIndex(rng As Range, colName As String) As Long
+    Dim c As Long
+    For c = 1 To rng.Columns.Count
+        If LCase$(Trim$(CStr(rng.Cells(1, c).Value2))) = LCase$(Trim$(colName)) Then
+            FindColumnIndex = c
+            Exit Function
+        End If
+    Next c
+    FindColumnIndex = 0
+End Function
+
+''' Returns True when a line likely starts a new bullet/point.
+Private Function IsPointStart(ByVal lineText As String) As Boolean
+    Dim t As String
+    t = Trim$(lineText)
+    If Len(t) = 0 Then
+        IsPointStart = False
+        Exit Function
+    End If
+
+    Dim c1 As String
+    c1 = Left$(t, 1)
+    If c1 = "-" Or c1 = "*" Then
+        IsPointStart = True
+        Exit Function
+    End If
+
+    ' Numbered points like "1." or "2)"
+    Dim i As Long
+    i = 1
+    Do While i <= Len(t) And Mid$(t, i, 1) >= "0" And Mid$(t, i, 1) <= "9"
+        i = i + 1
+    Loop
+    If i > 1 And i <= Len(t) Then
+        Dim mark As String
+        mark = Mid$(t, i, 1)
+        If mark = "." Or mark = ")" Then
+            IsPointStart = True
+            Exit Function
+        End If
+    End If
+
+    ' Section headers ending with ':'
+    If Right$(t, 1) = ":" Then
+        IsPointStart = True
+        Exit Function
+    End If
+
+    IsPointStart = False
+End Function
+
+''' Removes leading bullet/number marker from a point line.
+Private Function StripPointPrefix(ByVal lineText As String) As String
+    Dim t As String
+    t = Trim$(lineText)
+    If Len(t) = 0 Then
+        StripPointPrefix = ""
+        Exit Function
+    End If
+
+    If Left$(t, 1) = "-" Or Left$(t, 1) = "*" Then
+        StripPointPrefix = Trim$(Mid$(t, 2))
+        Exit Function
+    End If
+
+    Dim i As Long
+    i = 1
+    Do While i <= Len(t) And Mid$(t, i, 1) >= "0" And Mid$(t, i, 1) <= "9"
+        i = i + 1
+    Loop
+    If i > 1 And i <= Len(t) Then
+        Dim mark As String
+        mark = Mid$(t, i, 1)
+        If mark = "." Or mark = ")" Then
+            StripPointPrefix = Trim$(Mid$(t, i + 1))
+            Exit Function
+        End If
+    End If
+
+    StripPointPrefix = t
+End Function
+
+Private Function RequestedChartTypeFromInstruction(ByVal instruction As String, ByVal fallbackType As String) As String
+    Dim t As String
+    t = LCase$(instruction)
+
+    If InStr(t, "bar chart") > 0 Or InStr(t, " bar ") > 0 Then
+        RequestedChartTypeFromInstruction = "bar"
+    ElseIf InStr(t, "line chart") > 0 Or InStr(t, " line ") > 0 Then
+        RequestedChartTypeFromInstruction = "line"
+    ElseIf InStr(t, "pie chart") > 0 Or InStr(t, " pie ") > 0 Then
+        RequestedChartTypeFromInstruction = "pie"
+    ElseIf InStr(t, "column chart") > 0 Or InStr(t, " column ") > 0 Then
+        RequestedChartTypeFromInstruction = "column"
+    ElseIf InStr(t, "scatter") > 0 Then
+        RequestedChartTypeFromInstruction = "scatter"
+    ElseIf InStr(t, "area chart") > 0 Or InStr(t, " area ") > 0 Then
+        RequestedChartTypeFromInstruction = "area"
+    Else
+        RequestedChartTypeFromInstruction = LCase$(fallbackType)
+    End If
+End Function
+
+Private Function FindBestHeaderMatch(ByVal rng As Range, ByVal phrase As String) As String
+    Dim target As String
+    target = LCase$(Trim$(phrase))
+    If Len(target) = 0 Then
+        FindBestHeaderMatch = ""
+        Exit Function
+    End If
+
+    Dim c As Long
+    For c = 1 To rng.Columns.Count
+        Dim h As String
+        h = Trim$(CStr(rng.Cells(1, c).Value2))
+        If LCase$(h) = target Then
+            FindBestHeaderMatch = h
+            Exit Function
+        End If
+    Next c
+
+    For c = 1 To rng.Columns.Count
+        Dim h2 As String
+        h2 = Trim$(CStr(rng.Cells(1, c).Value2))
+        If InStr(1, LCase$(h2), target, vbTextCompare) > 0 Or InStr(1, target, LCase$(h2), vbTextCompare) > 0 Then
+            FindBestHeaderMatch = h2
+            Exit Function
+        End If
+    Next c
+
+    FindBestHeaderMatch = ""
+End Function
+
+Private Sub ParseInstructionChartColumns(ByVal instruction As String, ByVal rng As Range, _
+                                         ByRef xCol As String, ByRef yCol As String, _
+                                         ByRef wantsTotal As Boolean)
+    Dim t As String
+    t = LCase$(instruction)
+    wantsTotal = (InStr(t, " total ") > 0 Or InStr(t, " sum ") > 0 Or InStr(t, " total") > 0)
+
+    Dim re As Object, m As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+
+    re.Pattern = "on\s+([a-zA-Z0-9_\-\s]+?)\s+column"
+    If re.Test(instruction) Then
+        Set m = re.Execute(instruction)(0)
+        xCol = FindBestHeaderMatch(rng, m.SubMatches(0))
+    End If
+
+    re.Pattern = "with\s+([a-zA-Z0-9_\-\s]+?)(\s+column|\s*$)"
+    If re.Test(instruction) Then
+        Set m = re.Execute(instruction)(0)
+        yCol = FindBestHeaderMatch(rng, m.SubMatches(0))
     End If
 End Sub
 
-Private Sub EnsureJsonHeaders(ws As Worksheet)
-    If Len(Trim$(CStr(ws.Cells(1, 1).Value2))) = 0 Then
-        ws.Cells(1, 1).Value = "Timestamp"
-        ws.Cells(1, 2).Value = "Source Sheet"
-        ws.Cells(1, 3).Value = "Selection"
-        ws.Cells(1, 4).Value = "Instruction"
-        ws.Cells(1, 5).Value = "Raw JSON"
-        ws.Rows(1).Font.Bold = True
+Private Function FindFirstMentionedHeader(ByVal rng As Range, ByVal instruction As String, Optional ByVal skipHeader As String = "") As String
+    Dim t As String
+    t = LCase$(instruction)
+
+    Dim c As Long
+    For c = 1 To rng.Columns.Count
+        Dim h As String
+        h = Trim$(CStr(rng.Cells(1, c).Value2))
+        If Len(h) > 0 Then
+            If LCase$(h) <> LCase$(skipHeader) Then
+                If InStr(1, t, LCase$(h), vbTextCompare) > 0 Then
+                    FindFirstMentionedHeader = h
+                    Exit Function
+                End If
+            End If
+        End If
+    Next c
+    FindFirstMentionedHeader = ""
+End Function
+
+Private Function FindFirstNumericHeader(ByVal rng As Range) As String
+    Dim c As Long
+    For c = 1 To rng.Columns.Count
+        Dim r As Long
+        For r = 2 To rng.Rows.Count
+            If IsNumeric(rng.Cells(r, c).Value2) Then
+                FindFirstNumericHeader = Trim$(CStr(rng.Cells(1, c).Value2))
+                Exit Function
+            End If
+        Next r
+    Next c
+    FindFirstNumericHeader = ""
+End Function
+
+Private Function ParseCountFromInstruction(ByVal instruction As String, ByVal fallbackValue As Long) As Long
+    On Error GoTo Fallback
+    Dim re As Object, m As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.Pattern = "next\s+([0-9]+)"
+    If re.Test(instruction) Then
+        Set m = re.Execute(instruction)(0)
+        ParseCountFromInstruction = CLng(m.SubMatches(0))
+        If ParseCountFromInstruction <= 0 Then ParseCountFromInstruction = fallbackValue
+        Exit Function
     End If
+Fallback:
+    ParseCountFromInstruction = fallbackValue
+End Function
+
+Private Function ParseThreshold(ByVal instruction As String, ByRef opName As String, ByRef threshold As Double) As Boolean
+    On Error GoTo Fail
+    Dim re As Object, m As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.Pattern = "(greater than|more than|above|>|less than|below|<|equal to|=)\s*([0-9]+(\.[0-9]+)?)"
+    If re.Test(instruction) Then
+        Set m = re.Execute(instruction)(0)
+        Dim opRaw As String
+        opRaw = LCase$(m.SubMatches(0))
+        threshold = CDbl(m.SubMatches(1))
+        If opRaw = "greater than" Or opRaw = "more than" Or opRaw = "above" Or opRaw = ">" Then
+            opName = "greater_than"
+        ElseIf opRaw = "less than" Or opRaw = "below" Or opRaw = "<" Then
+            opName = "less_than"
+        Else
+            opName = "equals"
+        End If
+        ParseThreshold = True
+        Exit Function
+    End If
+Fail:
+    ParseThreshold = False
+End Function
+
+Private Function ParseColor(ByVal instruction As String) As String
+    Dim t As String
+    t = LCase$(instruction)
+    If InStr(t, " red") > 0 Then ParseColor = "red": Exit Function
+    If InStr(t, " green") > 0 Then ParseColor = "green": Exit Function
+    If InStr(t, " blue") > 0 Then ParseColor = "blue": Exit Function
+    If InStr(t, " orange") > 0 Then ParseColor = "orange": Exit Function
+    ParseColor = "yellow"
+End Function
+
+Private Function EvalThreshold(ByVal valueText As Variant, ByVal opName As String, ByVal threshold As Double) As Boolean
+    If Not IsNumeric(valueText) Then
+        If IsNumeric(Replace(CStr(valueText), ",", "")) Then
+            valueText = CDbl(Replace(CStr(valueText), ",", ""))
+        Else
+            EvalThreshold = False
+            Exit Function
+        End If
+    End If
+
+    Select Case opName
+        Case "greater_than": EvalThreshold = (CDbl(valueText) > threshold)
+        Case "less_than": EvalThreshold = (CDbl(valueText) < threshold)
+        Case Else: EvalThreshold = (CDbl(valueText) = threshold)
+    End Select
+End Function
+
+Private Function ColorToRgb(ByVal clr As String) As Long
+    Select Case LCase$(clr)
+        Case "red": ColorToRgb = RGB(255, 200, 200)
+        Case "green": ColorToRgb = RGB(200, 255, 200)
+        Case "blue": ColorToRgb = RGB(200, 220, 255)
+        Case "orange": ColorToRgb = RGB(255, 220, 180)
+        Case Else: ColorToRgb = RGB(255, 255, 200)
+    End Select
+End Function
+
+Private Sub WritePredictionDeterministic(sel As Range, sheetName As String, instruction As String)
+    Dim targetCol As String
+    targetCol = FindFirstMentionedHeader(sel, instruction)
+    If Len(targetCol) = 0 Then targetCol = FindFirstNumericHeader(sel)
+
+    Dim colIdx As Long
+    colIdx = FindColumnIndex(sel, targetCol)
+    If colIdx <= 0 Then
+        MsgBox "Could not determine a numeric column for prediction.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim vals() As Double
+    Dim n As Long, r As Long
+    n = 0
+    ReDim vals(1 To sel.Rows.Count)
+    For r = 2 To sel.Rows.Count
+        Dim v As Variant
+        v = sel.Cells(r, colIdx).Value2
+        If IsNumeric(v) Then
+            n = n + 1
+            vals(n) = CDbl(v)
+        ElseIf IsNumeric(Replace(CStr(v), ",", "")) Then
+            n = n + 1
+            vals(n) = CDbl(Replace(CStr(v), ",", ""))
+        End If
+    Next r
+
+    If n < 2 Then
+        MsgBox "Need at least 2 numeric values for deterministic prediction.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim avgDiff As Double
+    avgDiff = 0
+    For r = 2 To n
+        avgDiff = avgDiff + (vals(r) - vals(r - 1))
+    Next r
+    avgDiff = avgDiff / (n - 1)
+
+    Dim stepsCount As Long
+    stepsCount = ParseCountFromInstruction(instruction, 5)
+    If stepsCount > 30 Then stepsCount = 30
+
+    Dim predWs As Worksheet
+    Set predWs = GetOrCreateSheet(ActiveWorkbook, "AI_Predictions")
+    If Len(Trim$(CStr(predWs.Cells(1, 1).Value2))) = 0 Then
+        predWs.Cells(1, 1).Value = "Timestamp"
+        predWs.Cells(1, 2).Value = "Source"
+        predWs.Cells(1, 3).Value = "Column"
+        predWs.Cells(1, 4).Value = "Method"
+        predWs.Cells(1, 5).Value = "Confidence"
+        predWs.Cells(1, 6).Value = "Predicted Values"
+        predWs.Cells(1, 7).Value = "Explanation"
+        predWs.Rows(1).Font.Bold = True
+    End If
+
+    Dim outRow As Long
+    outRow = predWs.Cells(predWs.Rows.Count, 1).End(xlUp).Row + 1
+    predWs.Cells(outRow, 1).Value = Now
+    predWs.Cells(outRow, 2).Value = sheetName
+    predWs.Cells(outRow, 3).Value = targetCol
+    predWs.Cells(outRow, 4).Value = "Deterministic average-delta"
+    predWs.Cells(outRow, 5).Value = "Medium"
+
+    Dim lastVal As Double
+    lastVal = vals(n)
+    Dim i As Long
+    For i = 1 To stepsCount
+        lastVal = lastVal + avgDiff
+        predWs.Cells(outRow, 5 + i).Value = lastVal
+        predWs.Cells(outRow, 5 + i).Font.Bold = True
+        predWs.Cells(outRow, 5 + i).Font.Color = RGB(0, 100, 200)
+    Next i
+
+    predWs.Cells(outRow + 1, 1).Value = "Explanation:"
+    predWs.Cells(outRow + 1, 2).Value = "Generated locally from average step difference."
+    predWs.Range(predWs.Cells(outRow + 1, 2), predWs.Cells(outRow + 1, 7)).MergeCells = True
+    predWs.Cells(outRow + 1, 2).WrapText = True
+    predWs.Columns("A:K").EntireColumn.AutoFit
+    predWs.Activate
 End Sub
+
+Private Sub ApplyAnomaliesDeterministic(sel As Range, sheetName As String, instruction As String)
+    Dim targetCol As String
+    targetCol = FindFirstMentionedHeader(sel, instruction)
+    If Len(targetCol) = 0 Then targetCol = FindFirstNumericHeader(sel)
+
+    Dim colIdx As Long
+    colIdx = FindColumnIndex(sel, targetCol)
+    If colIdx <= 0 Then
+        MsgBox "Could not determine anomaly column.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim opName As String
+    Dim threshold As Double
+    Dim hasThreshold As Boolean
+    hasThreshold = ParseThreshold(instruction, opName, threshold)
+
+    Dim countMarked As Long
+    countMarked = 0
+    Dim r As Long
+
+    If hasThreshold Then
+        For r = 2 To sel.Rows.Count
+            If EvalThreshold(sel.Cells(r, colIdx).Value2, opName, threshold) Then
+                sel.Cells(r, colIdx).Interior.Color = RGB(255, 200, 200)
+                countMarked = countMarked + 1
+            End If
+        Next r
+    Else
+        Dim sumV As Double, sumSq As Double, n As Long
+        sumV = 0: sumSq = 0: n = 0
+        For r = 2 To sel.Rows.Count
+            Dim nv As Variant
+            nv = sel.Cells(r, colIdx).Value2
+            If IsNumeric(nv) Then
+                n = n + 1
+                sumV = sumV + CDbl(nv)
+                sumSq = sumSq + CDbl(nv) * CDbl(nv)
+            End If
+        Next r
+        If n >= 2 Then
+            Dim meanV As Double, sd As Double
+            meanV = sumV / n
+            sd = Sqr((sumSq / n) - (meanV * meanV))
+            For r = 2 To sel.Rows.Count
+                Dim nv2 As Variant
+                nv2 = sel.Cells(r, colIdx).Value2
+                If IsNumeric(nv2) Then
+                    If sd > 0 And Abs((CDbl(nv2) - meanV) / sd) > 2 Then
+                        sel.Cells(r, colIdx).Interior.Color = RGB(255, 200, 200)
+                        countMarked = countMarked + 1
+                    End If
+                End If
+            Next r
+        End If
+    End If
+
+    MsgBox "Deterministic anomalies highlighted: " & countMarked & " in " & targetCol, vbInformation
+End Sub
+
+Private Sub ApplyFormattingDeterministic(sel As Range, sheetName As String, instruction As String)
+    Dim targetCol As String
+    targetCol = FindFirstMentionedHeader(sel, instruction)
+    If Len(targetCol) = 0 Then targetCol = FindFirstNumericHeader(sel)
+
+    Dim colIdx As Long
+    colIdx = FindColumnIndex(sel, targetCol)
+    If colIdx <= 0 Then
+        MsgBox "Could not determine formatting column.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim opName As String
+    Dim threshold As Double
+    If Not ParseThreshold(instruction, opName, threshold) Then
+        MsgBox "Provide explicit threshold, e.g. 'Amount greater than 1000 red'.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim fillColor As Long
+    fillColor = ColorToRgb(ParseColor(instruction))
+
+    Dim countFmt As Long
+    countFmt = 0
+    Dim r As Long
+    For r = 2 To sel.Rows.Count
+        If EvalThreshold(sel.Cells(r, colIdx).Value2, opName, threshold) Then
+            sel.Cells(r, colIdx).Interior.Color = fillColor
+            countFmt = countFmt + 1
+        End If
+    Next r
+
+    MsgBox "Deterministic formatting applied to " & countFmt & " cells.", vbInformation
+End Sub
+
+Private Sub ApplyFormulaDeterministic(sel As Range, sheetName As String, instruction As String)
+    Dim eqPos As Long
+    eqPos = InStr(1, instruction, "=")
+    If eqPos = 0 Then
+        MsgBox "Provide explicit formula, e.g. 'in Total column =B2*C2'.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim formulaText As String
+    formulaText = Trim$(Mid$(instruction, eqPos))
+    If Left$(formulaText, 1) <> "=" Then formulaText = "=" & formulaText
+
+    Dim targetCol As String
+    targetCol = FindFirstMentionedHeader(sel, instruction)
+
+    Dim targetIdx As Long
+    targetIdx = FindColumnIndex(sel, targetCol)
+    If targetIdx <= 0 Then
+        targetIdx = sel.Columns.Count + 1
+        sel.Cells(1, targetIdx).Value = IIf(Len(targetCol) > 0, targetCol, "AI_Formula")
+    End If
+
+    Dim r As Long
+    For r = 2 To sel.Rows.Count
+        sel.Cells(r, targetIdx).Formula = formulaText
+        sel.Cells(r, targetIdx).Font.Color = RGB(0, 100, 0)
+    Next r
+
+    MsgBox "Deterministic formula applied to column " & sel.Cells(1, targetIdx).Value2, vbInformation
+End Sub
+
+Private Sub ApplyCleaningDeterministic(sel As Range, sheetName As String, instruction As String)
+    Dim t As String
+    t = LCase$(instruction)
+
+    If InStr(t, "remove duplicate") > 0 Then
+        Dim keyCol As String
+        keyCol = FindFirstMentionedHeader(sel, instruction)
+        Dim keyIdx As Long
+        keyIdx = FindColumnIndex(sel, keyCol)
+        If keyIdx <= 0 Then keyIdx = 1
+        sel.RemoveDuplicates Columns:=Array(keyIdx), Header:=xlYes
+        MsgBox "Deterministic clean: duplicates removed by column " & sel.Cells(1, keyIdx).Value2, vbInformation
+        Exit Sub
+    End If
+
+    Dim r As Long, c As Long, fixed As Long
+    fixed = 0
+    For r = 2 To sel.Rows.Count
+        For c = 1 To sel.Columns.Count
+            Dim v As Variant
+            v = sel.Cells(r, c).Value2
+            If VarType(v) = vbString Then
+                Dim tv As String
+                tv = Trim$(CStr(v))
+                If tv <> CStr(v) Then
+                    sel.Cells(r, c).Value = tv
+                    fixed = fixed + 1
+                End If
+            End If
+        Next c
+    Next r
+    MsgBox "Deterministic clean: trimmed " & fixed & " text cells.", vbInformation
+End Sub
+
+Private Sub WriteSummaryDeterministic(sel As Range, sheetName As String)
+    Dim dWs As Worksheet
+    Set dWs = GetOrCreateSheet(ActiveWorkbook, "AI_Dashboard")
+    dWs.Cells.Clear
+
+    dWs.Cells(1, 1).Value = "Deterministic Summary - " & sheetName
+    dWs.Cells(1, 1).Font.Bold = True
+    dWs.Cells(2, 1).Value = "Rows:"
+    dWs.Cells(2, 2).Value = sel.Rows.Count - 1
+    dWs.Cells(3, 1).Value = "Columns:"
+    dWs.Cells(3, 2).Value = sel.Columns.Count
+
+    dWs.Cells(5, 1).Value = "Column"
+    dWs.Cells(5, 2).Value = "Min"
+    dWs.Cells(5, 3).Value = "Max"
+    dWs.Cells(5, 4).Value = "Average"
+    dWs.Cells(5, 1).Resize(1, 4).Font.Bold = True
+
+    Dim outRow As Long, c As Long, r As Long
+    outRow = 6
+    For c = 1 To sel.Columns.Count
+        Dim hasNum As Boolean
+        hasNum = False
+        Dim minV As Double, maxV As Double, sumV As Double, n As Long
+        For r = 2 To sel.Rows.Count
+            Dim v As Variant
+            v = sel.Cells(r, c).Value2
+            If IsNumeric(v) Then
+                If Not hasNum Then
+                    minV = CDbl(v): maxV = CDbl(v)
+                    hasNum = True
+                Else
+                    If CDbl(v) < minV Then minV = CDbl(v)
+                    If CDbl(v) > maxV Then maxV = CDbl(v)
+                End If
+                sumV = sumV + CDbl(v)
+                n = n + 1
+            End If
+        Next r
+
+        If hasNum And n > 0 Then
+            dWs.Cells(outRow, 1).Value = sel.Cells(1, c).Value2
+            dWs.Cells(outRow, 2).Value = minV
+            dWs.Cells(outRow, 3).Value = maxV
+            dWs.Cells(outRow, 4).Value = sumV / n
+            outRow = outRow + 1
+        End If
+    Next c
+
+    dWs.Columns("A:D").EntireColumn.AutoFit
+    dWs.Activate
+    MsgBox "Deterministic summary created.", vbInformation
+End Sub
+
+Private Function TryDeterministicAction(sel As Range, action As String, instruction As String, sheetName As String) As Boolean
+    On Error GoTo FailDet
+
+    Select Case action
+        Case "chart"
+            Dim cType As String, xCol As String, yCol As String, wantsTotal As Boolean
+            cType = RequestedChartTypeFromInstruction(instruction, "")
+            xCol = "": yCol = "": wantsTotal = False
+            ParseInstructionChartColumns instruction, sel, xCol, yCol, wantsTotal
+            If Len(cType) > 0 And Len(xCol) > 0 And Len(yCol) > 0 Then
+                Dim fakeJson As String
+                fakeJson = "{""chart_type"":""" & JsonEscape(cType) & """,""x_column"":""" & JsonEscape(xCol) & """,""y_column"":""" & JsonEscape(yCol) & """,""title"":""" & JsonEscape(cType & " chart") & """,""insight"":""Deterministic from instruction""}"
+                CreateChartFromAI sel, fakeJson, sheetName, instruction
+                TryDeterministicAction = True
+                Exit Function
+            End If
+
+        Case "predict"
+            If InStr(1, LCase$(instruction), "predict", vbTextCompare) > 0 Or InStr(1, LCase$(instruction), "forecast", vbTextCompare) > 0 Then
+                WritePredictionDeterministic sel, sheetName, instruction
+                TryDeterministicAction = True
+                Exit Function
+            End If
+
+        Case "anomalies"
+            ApplyAnomaliesDeterministic sel, sheetName, instruction
+            TryDeterministicAction = True
+            Exit Function
+
+        Case "format"
+            If InStr(1, LCase$(instruction), "greater", vbTextCompare) > 0 Or InStr(1, LCase$(instruction), "less", vbTextCompare) > 0 Or InStr(1, instruction, ">") > 0 Or InStr(1, instruction, "<") > 0 Then
+                ApplyFormattingDeterministic sel, sheetName, instruction
+                TryDeterministicAction = True
+                Exit Function
+            End If
+
+        Case "formula"
+            If InStr(1, instruction, "=") > 0 Then
+                ApplyFormulaDeterministic sel, sheetName, instruction
+                TryDeterministicAction = True
+                Exit Function
+            End If
+
+        Case "clean"
+            ApplyCleaningDeterministic sel, sheetName, instruction
+            TryDeterministicAction = True
+            Exit Function
+
+        Case "summary"
+            WriteSummaryDeterministic sel, sheetName
+            TryDeterministicAction = True
+            Exit Function
+
+        Case "analyze"
+            Dim txt As String
+            txt = "- Deterministic analyze mode executed." & vbLf & _
+                  "- Rows: " & (sel.Rows.Count - 1) & vbLf & _
+                  "- Columns: " & sel.Columns.Count & vbLf & _
+                  "- For deeper semantic insights, remove explicit deterministic wording to use AI."
+            WriteAnalysisOutput ActiveWorkbook, txt, sheetName, sel.Address(False, False), instruction, action
+            TryDeterministicAction = True
+            Exit Function
+    End Select
+
+    TryDeterministicAction = False
+    Exit Function
+
+FailDet:
+    TryDeterministicAction = False
+End Function
+
+' ══════════════════════════════════════════════════════════════
+'  ACTION PICKER (chat-style — user types naturally)
+' ══════════════════════════════════════════════════════════════
+
+''' Infer the action from a natural-language instruction.
+Private Function InferAction(ByVal instruction As String) As String
+    Dim t As String
+    t = LCase$(Trim$(instruction))
+
+    ' Chart
+    If InStr(t, "chart") > 0 Or InStr(t, "graph") > 0 Or InStr(t, "plot") > 0 Or _
+       InStr(t, "visuali") > 0 Or InStr(t, "bar ") > 0 Or InStr(t, "pie ") > 0 Or _
+       InStr(t, "line chart") > 0 Or InStr(t, "scatter") > 0 Or InStr(t, "histogram") > 0 Then
+        InferAction = "chart"
+        Exit Function
+    End If
+
+    ' Predict / Forecast
+    If InStr(t, "predict") > 0 Or InStr(t, "forecast") > 0 Or InStr(t, "project") > 0 Or _
+       InStr(t, "extrapolat") > 0 Or InStr(t, "next ") > 0 Or InStr(t, "future ") > 0 Or _
+       InStr(t, "trend") > 0 Then
+        InferAction = "predict"
+        Exit Function
+    End If
+
+    ' Anomalies
+    If InStr(t, "anomal") > 0 Or InStr(t, "outlier") > 0 Or InStr(t, "unusual") > 0 Or _
+       InStr(t, "spike") > 0 Or InStr(t, "deviation") > 0 Or InStr(t, "odd") > 0 Then
+        InferAction = "anomalies"
+        Exit Function
+    End If
+
+    ' Conditional Formatting
+    If InStr(t, "format") > 0 Or InStr(t, "color") > 0 Or InStr(t, "colour") > 0 Or _
+       InStr(t, "highlight") > 0 Or InStr(t, "conditional") > 0 Or InStr(t, "heatmap") > 0 Then
+        InferAction = "format"
+        Exit Function
+    End If
+
+    ' Formulas
+    If InStr(t, "formula") > 0 Or InStr(t, "calculate") > 0 Or InStr(t, "computation") > 0 Or _
+       InStr(t, "vlookup") > 0 Or InStr(t, "sumif") > 0 Or InStr(t, "function") > 0 Then
+        InferAction = "formula"
+        Exit Function
+    End If
+
+    ' Data Cleaning
+    If InStr(t, "clean") > 0 Or InStr(t, "fix") > 0 Or InStr(t, "duplicate") > 0 Or _
+       InStr(t, "missing") > 0 Or InStr(t, "typo") > 0 Or InStr(t, "invalid") > 0 Or _
+       InStr(t, "standardiz") > 0 Or InStr(t, "normali") > 0 Then
+        InferAction = "clean"
+        Exit Function
+    End If
+
+    ' Summary / Dashboard
+    If InStr(t, "summary") > 0 Or InStr(t, "dashboard") > 0 Or InStr(t, "overview") > 0 Or _
+       InStr(t, "statistic") > 0 Or InStr(t, "kpi") > 0 Or InStr(t, "recap") > 0 Then
+        InferAction = "summary"
+        Exit Function
+    End If
+
+    ' Default: analyze
+    InferAction = "analyze"
+End Function
+
+''' Single chat-style prompt that infers the action from natural language.
+Private Function ChatPrompt(ByRef outInstruction As String, _
+                             Optional ByVal contextLabel As String = "") As String
+    Dim prompt As String
+    prompt = InputBox( _
+        "What would you like to do with " & IIf(Len(contextLabel) > 0, contextLabel, "the selected data") & "?" & vbCrLf & vbCrLf & _
+        "Just type naturally, for example:" & vbCrLf & _
+        "  • ""Summarize key insights""" & vbCrLf & _
+        "  • ""Create a bar chart by region""" & vbCrLf & _
+        "  • ""Predict next 5 months of sales""" & vbCrLf & _
+        "  • ""Find outliers and anomalies""" & vbCrLf & _
+        "  • ""Add conditional formatting""" & vbCrLf & _
+        "  • ""Generate useful formulas""" & vbCrLf & _
+        "  • ""Clean up duplicates and missing data""" & vbCrLf & _
+        "  • ""Build a summary dashboard""", _
+        "SIMPLE_AI", "Summarize key insights and outliers")
+
+    If Len(Trim$(prompt)) = 0 Then
+        ChatPrompt = ""
+        outInstruction = ""
+        Exit Function
+    End If
+
+    outInstruction = Trim$(prompt)
+    ChatPrompt = InferAction(outInstruction)
+End Function
+
+' ══════════════════════════════════════════════════════════════
+'  API CALL
+' ══════════════════════════════════════════════════════════════
+
+Private Function CallAI(apiKey As String, action As String, instruction As String, _
+                         sel As Range, sheetName As String) As Object
+    Dim payload As String, url As String
+    
+    payload = "{"
+    payload = payload & """action"":""" & JsonEscape(action) & ""","
+    payload = payload & """instruction"":""" & JsonEscape(instruction) & ""","
+    payload = payload & """sheet_name"":""" & JsonEscape(sheetName) & ""","
+    payload = payload & """headers"":" & BuildHeadersJson(sel) & ","
+    payload = payload & """rows"":" & BuildRowsJson(sel) & ","
+    payload = payload & """role"":""You are an expert spreadsheet analyst and Excel specialist."""
+    payload = payload & "}"
+
+    url = "http://127.0.0.1:" & API_PORT & "/v1/excel-range"
+
+    Dim http As Object
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    http.Open "POST", url, False
+    http.setRequestHeader "Content-Type", "application/json"
+    http.setRequestHeader "X-API-Key", apiKey
+    http.send payload
+
+    Set CallAI = http
+End Function
+
+Private Function BuildSingleSheetJson(ws As Worksheet) As String
+    Dim rng As Range
+    Set rng = ws.UsedRange
+
+    If rng Is Nothing Then
+        BuildSingleSheetJson = ""
+        Exit Function
+    End If
+
+    If rng.Rows.Count < 2 Or rng.Columns.Count < 1 Then
+        BuildSingleSheetJson = ""
+        Exit Function
+    End If
+
+    Dim payload As String
+    payload = "{"
+    payload = payload & """sheet_name"":""" & JsonEscape(ws.Name) & ""","
+    payload = payload & """headers"":" & BuildHeadersJson(rng) & ","
+    payload = payload & """rows"":" & BuildRowsJson(rng)
+    payload = payload & "}"
+    BuildSingleSheetJson = payload
+End Function
+
+Private Function BuildWorkbookSheetsJson(wb As Workbook) As String
+    Dim ws As Worksheet
+    Dim out As String
+    Dim hasAny As Boolean
+
+    out = "["
+    hasAny = False
+
+    For Each ws In wb.Worksheets
+        ' Skip internal output/config sheets
+        If Left$(ws.Name, 3) = "AI_" Or ws.Name = "_AI_CONFIG" Then
+            GoTo NextWs
+        End If
+
+        Dim one As String
+        one = BuildSingleSheetJson(ws)
+        If Len(one) > 0 Then
+            If hasAny Then out = out & ","
+            out = out & one
+            hasAny = True
+        End If
+NextWs:
+    Next ws
+
+    out = out & "]"
+    BuildWorkbookSheetsJson = out
+End Function
+
+Private Function CallAIWorkbook(apiKey As String, action As String, instruction As String, wb As Workbook) As Object
+    Dim payload As String, url As String
+    Dim sheetsJson As String
+
+    sheetsJson = BuildWorkbookSheetsJson(wb)
+
+    payload = "{"
+    payload = payload & """action"":""" & JsonEscape(action) & ""","
+    payload = payload & """instruction"":""" & JsonEscape(instruction) & ""","
+    payload = payload & """sheet_name"":""" & JsonEscape(wb.Name) & ""","
+    payload = payload & """sheets"":" & sheetsJson & ","
+    payload = payload & """role"":""You are an expert spreadsheet analyst and Excel specialist."""
+    payload = payload & "}"
+
+    url = "http://127.0.0.1:" & API_PORT & "/v1/excel-range"
+
+    Dim http As Object
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    http.Open "POST", url, False
+    http.setRequestHeader "Content-Type", "application/json"
+    http.setRequestHeader "X-API-Key", apiKey
+    http.send payload
+
+    Set CallAIWorkbook = http
+End Function
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: WRITE TEXT ANALYSIS IN PROPER TABLE ROWS
+' ══════════════════════════════════════════════════════════════
+
+Private Sub WriteAnalysisOutput(wb As Workbook, aiText As String, _
+                                 sheetName As String, sourceAddr As String, _
+                                 instruction As String, action As String)
+    Dim outWs As Worksheet
+    Set outWs = GetOrCreateSheet(wb, "AI_Output")
+
+    ' Setup headers if new sheet
+    If Len(Trim$(CStr(outWs.Cells(1, 1).Value2))) = 0 Then
+        outWs.Cells(1, 1).Value = "#"
+        outWs.Cells(1, 2).Value = "Timestamp"
+        outWs.Cells(1, 3).Value = "Action"
+        outWs.Cells(1, 4).Value = "Source"
+        outWs.Cells(1, 5).Value = "Instruction"
+        outWs.Cells(1, 6).Value = "Finding"
+        outWs.Rows(1).Font.Bold = True
+        outWs.Columns("A").ColumnWidth = 5
+        outWs.Columns("B").ColumnWidth = 18
+        outWs.Columns("C").ColumnWidth = 12
+        outWs.Columns("D").ColumnWidth = 15
+        outWs.Columns("E").ColumnWidth = 30
+        outWs.Columns("F").ColumnWidth = 80
+    End If
+
+    Dim startRow As Long
+    startRow = outWs.Cells(outWs.Rows.Count, 1).End(xlUp).Row + 1
+    If startRow < 2 Then startRow = 2
+    
+    ' Build point-level items: merge wrapped continuation lines into one finding cell.
+    Dim lines() As String
+    Dim cleanText As String
+    cleanText = aiText
+
+    cleanText = Replace(cleanText, vbCrLf, vbLf)
+    cleanText = Replace(cleanText, vbCr, vbLf)
+    lines = Split(cleanText, vbLf)
+
+    Dim points() As String
+    Dim pointCount As Long
+    Dim currentPoint As String
+    Dim lineNum As Long
+
+    ReDim points(1 To 1)
+    pointCount = 0
+    currentPoint = ""
+
+    For lineNum = 0 To UBound(lines)
+        Dim ln As String
+        ln = Trim$(lines(lineNum))
+        If Len(ln) = 0 Then GoTo ParseNextLine
+
+        If IsPointStart(ln) Then
+            If Len(currentPoint) > 0 Then
+                pointCount = pointCount + 1
+                ReDim Preserve points(1 To pointCount)
+                points(pointCount) = Trim$(currentPoint)
+            End If
+            currentPoint = StripPointPrefix(ln)
+        Else
+            If Len(currentPoint) = 0 Then
+                currentPoint = ln
+            Else
+                currentPoint = currentPoint & " " & ln
+            End If
+        End If
+ParseNextLine:
+    Next lineNum
+
+    If Len(currentPoint) > 0 Then
+        pointCount = pointCount + 1
+        ReDim Preserve points(1 To pointCount)
+        points(pointCount) = Trim$(currentPoint)
+    End If
+    
+    Dim ts As String
+    ts = Format$(Now, "yyyy-mm-dd hh:mm")
+    
+    Dim writeRow As Long, pointNum As Long
+    writeRow = startRow
+    pointNum = 0
+
+    Dim pi As Long
+    For pi = 1 To pointCount
+        pointNum = pointNum + 1
+        outWs.Cells(writeRow, 1).Value = pointNum
+        outWs.Cells(writeRow, 2).Value = ts
+        outWs.Cells(writeRow, 3).Value = UCase$(action)
+        outWs.Cells(writeRow, 4).Value = sheetName & " " & sourceAddr
+        outWs.Cells(writeRow, 5).Value = instruction
+        outWs.Cells(writeRow, 6).Value = points(pi)
+        outWs.Cells(writeRow, 6).WrapText = True
+
+        writeRow = writeRow + 1
+    Next pi
+    
+    ' If nothing was written (empty response), write one row
+    If pointNum = 0 Then
+        outWs.Cells(writeRow, 1).Value = 1
+        outWs.Cells(writeRow, 2).Value = ts
+        outWs.Cells(writeRow, 3).Value = UCase$(action)
+        outWs.Cells(writeRow, 4).Value = sheetName & " " & sourceAddr
+        outWs.Cells(writeRow, 5).Value = instruction
+        outWs.Cells(writeRow, 6).Value = aiText
+        outWs.Cells(writeRow, 6).WrapText = True
+        writeRow = writeRow + 1
+    End If
+    
+    ' Format table area
+    Dim lastRow As Long
+    lastRow = writeRow - 1
+    
+    ' Add borders
+    Dim dataRange As Range
+    Set dataRange = outWs.Range(outWs.Cells(startRow, 1), outWs.Cells(lastRow, 6))
+    dataRange.Borders.LineStyle = xlContinuous
+    dataRange.Borders.Weight = xlThin
+    
+    ' Alternate row shading
+    Dim rw As Long
+    For rw = startRow To lastRow
+        If (rw - startRow) Mod 2 = 0 Then
+            outWs.Range(outWs.Cells(rw, 1), outWs.Cells(rw, 6)).Interior.Color = RGB(240, 245, 255)
+        End If
+    Next rw
+    
+    ' Auto-fit row heights
+    dataRange.Rows.EntireRow.AutoFit
+    
+    ' Navigate to results
+    outWs.Activate
+    outWs.Cells(startRow, 6).Select
+    
+    MsgBox "AI wrote " & pointNum & " findings to AI_Output (rows " & startRow & "-" & lastRow & ")", vbInformation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: CREATE CHART
+' ══════════════════════════════════════════════════════════════
+
+Private Sub CreateChartFromAI(sel As Range, aiText As String, sheetName As String, instruction As String)
+    On Error GoTo ChartErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim chartType As String, title As String
+    Dim xCol As String, yCols As String
+    Dim insight As String
+    
+    chartType = LCase$(JsonValue(json, "chart_type"))
+    title = JsonValue(json, "title")
+    xCol = JsonValue(json, "x_column")
+    yCols = JsonValue(json, "y_columns")
+    insight = JsonValue(json, "insight")
+
+    chartType = RequestedChartTypeFromInstruction(instruction, chartType)
+
+    Dim yCol As String
+    yCol = JsonValueAny(json, "y_column", "value_column", "measure_column")
+    If Len(Trim$(yCol)) = 0 And Left$(Trim$(yCols), 1) = "[" Then
+        Dim yArr As Variant
+        yArr = JsonArrayToStrings(yCols)
+        If IsArray(yArr) Then
+            If UBound(yArr) >= 0 Then yCol = Trim$(CStr(yArr(0)))
+        End If
+    End If
+
+    Dim instrX As String, instrY As String, wantsTotal As Boolean
+    instrX = "": instrY = "": wantsTotal = False
+    ParseInstructionChartColumns instruction, sel, instrX, instrY, wantsTotal
+    If Len(Trim$(instrX)) > 0 Then xCol = instrX
+    If Len(Trim$(instrY)) > 0 Then yCol = instrY
+    
+    If Len(title) = 0 Then title = "AI Chart - " & sheetName
+    
+    ' Create chart sheet
+    Dim chtObj As ChartObject
+    Dim chtSheet As Worksheet
+    Set chtSheet = GetOrCreateSheet(ActiveWorkbook, "AI_Chart")
+    
+    ' Clear previous charts on this sheet
+    Dim co As ChartObject
+    For Each co In chtSheet.ChartObjects
+        co.Delete
+    Next co
+    
+    Set chtObj = chtSheet.ChartObjects.Add(20, 20, 550, 350)
+    
+    Dim cht As Chart
+    Set cht = chtObj.Chart
+    
+    Dim xIdx As Long, yIdx As Long
+    xIdx = FindColumnIndex(sel, xCol)
+    yIdx = FindColumnIndex(sel, yCol)
+
+    Dim dataWs As Worksheet
+    Set dataWs = GetOrCreateSheet(ActiveWorkbook, "AI_Chart_Data")
+    dataWs.Cells.Clear
+    dataWs.Cells(1, 1).Value = IIf(Len(Trim$(xCol)) > 0, xCol, "Category")
+    dataWs.Cells(1, 2).Value = IIf(Len(Trim$(yCol)) > 0, yCol, "Value")
+
+    Dim outRow As Long
+    outRow = 2
+
+    If xIdx > 0 And yIdx > 0 Then
+        If wantsTotal Then
+            Dim agg As Object
+            Set agg = CreateObject("Scripting.Dictionary")
+            Dim r As Long
+            For r = 2 To sel.Rows.Count
+                Dim k As String
+                Dim rawVal As Variant
+                Dim numVal As Double
+                k = CStr(sel.Cells(r, xIdx).Value2)
+                rawVal = sel.Cells(r, yIdx).Value2
+                numVal = 0
+                If IsNumeric(rawVal) Then
+                    numVal = CDbl(rawVal)
+                ElseIf IsNumeric(Replace(CStr(rawVal), ",", "")) Then
+                    numVal = CDbl(Replace(CStr(rawVal), ",", ""))
+                End If
+
+                If agg.Exists(k) Then
+                    agg(k) = CDbl(agg(k)) + numVal
+                Else
+                    agg.Add k, numVal
+                End If
+            Next r
+
+            Dim key As Variant
+            For Each key In agg.Keys
+                dataWs.Cells(outRow, 1).Value = key
+                dataWs.Cells(outRow, 2).Value = agg(key)
+                outRow = outRow + 1
+            Next key
+        Else
+            Dim r2 As Long
+            For r2 = 2 To sel.Rows.Count
+                dataWs.Cells(outRow, 1).Value = sel.Cells(r2, xIdx).Value2
+                dataWs.Cells(outRow, 2).Value = sel.Cells(r2, yIdx).Value2
+                outRow = outRow + 1
+            Next r2
+        End If
+
+        cht.SetSourceData dataWs.Range(dataWs.Cells(1, 1), dataWs.Cells(outRow - 1, 2))
+    Else
+        ' Fallback to full selected range when headers could not be matched.
+        If xIdx = 0 Or yIdx = 0 Then
+    MsgBox "Could not detect columns properly. Please specify Product and Amount columns.", vbExclamation
+    Exit Sub
+End If
+    End If
+    
+    ' Map chart type
+    Select Case chartType
+        Case "bar": cht.ChartType = xlBarClustered
+        Case "line": cht.ChartType = xlLine
+        Case "pie": cht.ChartType = xlPie
+        Case "column": cht.ChartType = xlColumnClustered
+        Case "scatter": cht.ChartType = xlXYScatter
+        Case "area": cht.ChartType = xlArea
+        Case Else: cht.ChartType = xlColumnClustered
+    End Select
+    
+    cht.HasTitle = True
+    cht.ChartTitle.Text = title
+    
+    ' Add insight as text box below chart
+    If Len(insight) > 0 Then
+        chtSheet.Cells(25, 2).Value = "AI Insight: " & insight
+        chtSheet.Cells(25, 2).Font.Italic = True
+        chtSheet.Cells(25, 2).Font.Color = RGB(80, 80, 80)
+    End If
+    
+    chtSheet.Activate
+        MsgBox "Chart created on sheet: AI_Chart" & vbCrLf & _
+            "Type: " & chartType & vbCrLf & _
+            "X: " & IIf(Len(Trim$(xCol)) > 0, xCol, "(auto)") & vbCrLf & _
+            "Y: " & IIf(Len(Trim$(yCol)) > 0, yCol, "(auto)") & vbCrLf & _
+            "Total aggregation: " & IIf(wantsTotal, "Yes", "No") & vbCrLf & vbCrLf & _
+            "Insight: " & insight, vbInformation
+    Exit Sub
+
+ChartErr:
+    MsgBox "Could not create chart. AI suggestion:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: PREDICTION — WRITE FORECASTED VALUES
+' ══════════════════════════════════════════════════════════════
+
+Private Sub WritePrediction(sel As Range, aiText As String, sheetName As String)
+    On Error GoTo PredErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim colName As String, method As String, confidence As String, explanation As String
+    Dim valuesStr As String
+
+    ' Be tolerant to minor schema variations from model output.
+    colName = JsonValueAny(json, "column", "target_column", "series", "field")
+    valuesStr = JsonValueAny(json, "values", "predictions", "predicted_values", "forecast_values", "next_values")
+    method = JsonValueAny(json, "method", "model", "approach")
+    confidence = JsonValueAny(json, "confidence", "confidence_score", "score")
+    explanation = JsonValueAny(json, "explanation", "summary", "reasoning", "insight")
+
+    If Len(Trim$(valuesStr)) = 0 Then
+        valuesStr = ExtractFirstArray(json)
+    End If
+    
+    Dim predWs As Worksheet
+    Set predWs = GetOrCreateSheet(ActiveWorkbook, "AI_Predictions")
+    
+    ' Headers
+    If Len(Trim$(CStr(predWs.Cells(1, 1).Value2))) = 0 Then
+        predWs.Cells(1, 1).Value = "Timestamp"
+        predWs.Cells(1, 2).Value = "Source"
+        predWs.Cells(1, 3).Value = "Column"
+        predWs.Cells(1, 4).Value = "Method"
+        predWs.Cells(1, 5).Value = "Confidence"
+        predWs.Cells(1, 6).Value = "Predicted Values"
+        predWs.Cells(1, 7).Value = "Explanation"
+        predWs.Rows(1).Font.Bold = True
+    End If
+    
+    Dim r As Long
+    r = predWs.Cells(predWs.Rows.Count, 1).End(xlUp).Row + 1
+    
+    ' Parse values and write each in a separate column
+    Dim vals As Variant
+    vals = JsonArrayToStrings(valuesStr)
+    
+    predWs.Cells(r, 1).Value = Now
+    predWs.Cells(r, 2).Value = sheetName
+    predWs.Cells(r, 3).Value = colName
+    predWs.Cells(r, 4).Value = method
+    predWs.Cells(r, 5).Value = confidence
+    
+    ' Write predicted values across columns starting at F
+    Dim vi As Long
+    If IsArray(vals) And Len(Trim$(valuesStr)) > 0 Then
+        For vi = 0 To UBound(vals)
+            predWs.Cells(r, 6 + vi).Value = vals(vi)
+            predWs.Cells(r, 6 + vi).Font.Color = RGB(0, 100, 200)
+            predWs.Cells(r, 6 + vi).Font.Bold = True
+        Next vi
+    Else
+        predWs.Cells(r, 6).Value = valuesStr
+    End If
+
+    If Len(Trim$(predWs.Cells(r, 6).Value2)) = 0 Then
+        predWs.Cells(r, 6).Value = "(No structured values parsed)"
+        predWs.Cells(r, 6).Font.Color = RGB(180, 80, 0)
+    End If
+    
+    predWs.Cells(r + 1, 1).Value = "Explanation:"
+    If Len(Trim$(explanation)) = 0 Then explanation = aiText
+    predWs.Cells(r + 1, 2).Value = explanation
+    predWs.Range(predWs.Cells(r + 1, 2), predWs.Cells(r + 1, 7)).MergeCells = True
+    predWs.Cells(r + 1, 2).WrapText = True
+    predWs.Cells(r + 1, 2).Font.Italic = True
+
+    predWs.Cells(r + 2, 1).Value = "Raw Response:"
+    predWs.Cells(r + 2, 2).Value = aiText
+    predWs.Range(predWs.Cells(r + 2, 2), predWs.Cells(r + 2, 9)).MergeCells = True
+    predWs.Cells(r + 2, 2).WrapText = True
+    predWs.Cells(r + 2, 2).Font.Color = RGB(90, 90, 90)
+    
+    predWs.Columns("A:K").EntireColumn.AutoFit
+    predWs.Activate
+    predWs.Cells(r, 6).Select
+    
+    MsgBox "Predictions written to AI_Predictions" & vbCrLf & _
+           "Column: " & colName & vbCrLf & _
+           "Method: " & method & " (confidence: " & confidence & ")", vbInformation
+    Exit Sub
+
+PredErr:
+    MsgBox "Could not parse predictions. AI response:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: ANOMALIES — HIGHLIGHT IN ORIGINAL DATA
+' ══════════════════════════════════════════════════════════════
+
+Private Sub HighlightAnomalies(sel As Range, aiText As String, sheetName As String)
+    On Error GoTo AnomalyErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim summary As String
+    summary = JsonValue(json, "summary")
+    
+    ' Parse anomalies array — look for row/column pairs
+    Dim anomaliesStr As String
+    anomaliesStr = JsonValue(json, "anomalies")
+    
+    ' Simple parsing: find each {row:X, column:"Y"} block
+    Dim highlighted As Long
+    highlighted = 0
+    Dim pos As Long
+    pos = 1
+    
+    Do
+        Dim blockStart As Long
+        blockStart = InStr(pos, anomaliesStr, "{")
+        If blockStart = 0 Then Exit Do
+        
+        Dim blockEnd As Long
+        blockEnd = InStr(blockStart, anomaliesStr, "}")
+        If blockEnd = 0 Then Exit Do
+        
+        Dim block As String
+        block = Mid$(anomaliesStr, blockStart, blockEnd - blockStart + 1)
+        
+        Dim rowNum As Long, colIdx As Long
+        Dim colNameA As String, reason As String
+        
+        rowNum = CLng(Val(JsonValue(block, "row")))
+        colNameA = JsonValue(block, "column")
+        reason = JsonValue(block, "reason")
+        
+        If rowNum > 0 And Len(colNameA) > 0 Then
+            colIdx = FindColumnIndex(sel, colNameA)
+            If colIdx > 0 Then
+                ' +1 because row 1 in data is row 2 in selection (header is row 1)
+                Dim targetCell As Range
+                Set targetCell = sel.Cells(rowNum + 1, colIdx)
+                targetCell.Interior.Color = RGB(255, 200, 200)  ' Light red
+                targetCell.AddComment "AI: " & reason
+                highlighted = highlighted + 1
+            End If
+        End If
+        
+        pos = blockEnd + 1
+    Loop
+    
+    MsgBox "Highlighted " & highlighted & " anomalies in " & sheetName & vbCrLf & vbCrLf & _
+           "Summary: " & summary, vbInformation
+    Exit Sub
+
+AnomalyErr:
+    MsgBox "Could not parse anomalies. AI response:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: CONDITIONAL FORMATTING
+' ══════════════════════════════════════════════════════════════
+
+Private Sub ApplyFormatting(sel As Range, aiText As String, sheetName As String)
+    On Error GoTo FmtErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim summary As String
+    summary = JsonValue(json, "summary")
+    
+    Dim rulesStr As String
+    rulesStr = JsonValue(json, "rules")
+    
+    Dim applied As Long
+    applied = 0
+    Dim pos As Long
+    pos = 1
+    
+    Do
+        Dim bs As Long
+        bs = InStr(pos, rulesStr, "{")
+        If bs = 0 Then Exit Do
+        Dim be2 As Long
+        be2 = InStr(bs, rulesStr, "}")
+        If be2 = 0 Then Exit Do
+        
+        Dim rule As String
+        rule = Mid$(rulesStr, bs, be2 - bs + 1)
+        
+        Dim ruleCol As String, condition As String, threshold As String, clr As String
+        ruleCol = JsonValue(rule, "column")
+        condition = LCase$(JsonValue(rule, "condition"))
+        threshold = JsonValue(rule, "threshold")
+        clr = LCase$(JsonValue(rule, "color"))
+        
+        Dim colI As Long
+        colI = FindColumnIndex(sel, ruleCol)
+        
+        If colI > 0 Then
+            Dim cellColor As Long
+            Select Case clr
+                Case "red": cellColor = RGB(255, 200, 200)
+                Case "green": cellColor = RGB(200, 255, 200)
+                Case "yellow": cellColor = RGB(255, 255, 200)
+                Case "blue": cellColor = RGB(200, 220, 255)
+                Case "orange": cellColor = RGB(255, 220, 180)
+                Case Else: cellColor = RGB(255, 255, 200)
+            End Select
+            
+            Dim rw2 As Long
+            For rw2 = 2 To sel.Rows.Count
+                Dim cellVal As Variant
+                cellVal = sel.Cells(rw2, colI).Value2
+                Dim shouldFormat As Boolean
+                shouldFormat = False
+                
+                Select Case condition
+                    Case "greater_than"
+                        If IsNumeric(cellVal) And IsNumeric(threshold) Then
+                            shouldFormat = CDbl(cellVal) > CDbl(threshold)
+                        End If
+                    Case "less_than"
+                        If IsNumeric(cellVal) And IsNumeric(threshold) Then
+                            shouldFormat = CDbl(cellVal) < CDbl(threshold)
+                        End If
+                    Case "equals"
+                        shouldFormat = (CStr(cellVal) = threshold)
+                    Case "contains"
+                        shouldFormat = (InStr(1, CStr(cellVal), threshold, vbTextCompare) > 0)
+                End Select
+                
+                If shouldFormat Then
+                    sel.Cells(rw2, colI).Interior.Color = cellColor
+                    applied = applied + 1
+                End If
+            Next rw2
+        End If
+        
+        pos = be2 + 1
+    Loop
+    
+    MsgBox "Applied formatting to " & applied & " cells in " & sheetName & vbCrLf & vbCrLf & _
+           "Summary: " & summary, vbInformation
+    Exit Sub
+
+FmtErr:
+    MsgBox "Could not apply formatting. AI response:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: FORMULAS
+' ══════════════════════════════════════════════════════════════
+
+Private Sub InsertFormulas(sel As Range, aiText As String, sheetName As String)
+    On Error GoTo FormulaErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim formulasStr As String
+    formulasStr = JsonValue(json, "formulas")
+    
+    Dim inserted As Long
+    inserted = 0
+    Dim pos As Long
+    pos = 1
+    
+    Do
+        Dim bs3 As Long
+        bs3 = InStr(pos, formulasStr, "{")
+        If bs3 = 0 Then Exit Do
+        Dim be3 As Long
+        be3 = InStr(bs3, formulasStr, "}")
+        If be3 = 0 Then Exit Do
+        
+        Dim fBlock As String
+        fBlock = Mid$(formulasStr, bs3, be3 - bs3 + 1)
+        
+        Dim cellAddr As String, formula As String, desc As String
+        cellAddr = JsonValue(fBlock, "cell")
+        formula = JsonValue(fBlock, "formula")
+        desc = JsonValue(fBlock, "description")
+        
+        If Len(cellAddr) > 0 And Len(formula) > 0 Then
+            ActiveSheet.Range(cellAddr).formula = formula
+            ActiveSheet.Range(cellAddr).AddComment "AI: " & desc
+            ActiveSheet.Range(cellAddr).Font.Color = RGB(0, 100, 0)
+            inserted = inserted + 1
+        End If
+        
+        pos = be3 + 1
+    Loop
+    
+    MsgBox "Inserted " & inserted & " formulas in " & sheetName, vbInformation
+    Exit Sub
+
+FormulaErr:
+    MsgBox "Could not insert formulas. AI response:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: DATA CLEANING
+' ══════════════════════════════════════════════════════════════
+
+Private Sub ApplyDataCleaning(sel As Range, aiText As String, sheetName As String)
+    On Error GoTo CleanErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim summary As String
+    summary = JsonValue(json, "summary")
+    
+    Dim issuesStr As String
+    issuesStr = JsonValue(json, "issues")
+    
+    Dim fixed As Long
+    fixed = 0
+    Dim pos As Long
+    pos = 1
+    
+    Do
+        Dim bs4 As Long
+        bs4 = InStr(pos, issuesStr, "{")
+        If bs4 = 0 Then Exit Do
+        Dim be4 As Long
+        be4 = InStr(bs4, issuesStr, "}")
+        If be4 = 0 Then Exit Do
+        
+        Dim iBlock As String
+        iBlock = Mid$(issuesStr, bs4, be4 - bs4 + 1)
+        
+        Dim iRow As Long, iCol As Long
+        Dim iColName As String, sugVal As String, issueType As String
+        
+        iRow = CLng(Val(JsonValue(iBlock, "row")))
+        iColName = JsonValue(iBlock, "column")
+        sugVal = JsonValue(iBlock, "suggested_value")
+        issueType = JsonValue(iBlock, "issue_type")
+        
+        iCol = FindColumnIndex(sel, iColName)
+        
+        If iRow > 0 And iCol > 0 Then
+            Dim tc As Range
+            Set tc = sel.Cells(iRow + 1, iCol)
+            ' Highlight issue in yellow
+            tc.Interior.Color = RGB(255, 255, 180)
+            If Len(sugVal) > 0 Then
+                tc.AddComment "AI fix (" & issueType & "): " & sugVal
+            End If
+            fixed = fixed + 1
+        End If
+        
+        pos = be4 + 1
+    Loop
+    
+    MsgBox "Found " & fixed & " data issues in " & sheetName & vbCrLf & _
+           "(Yellow cells = issues, check comments for suggested fixes)" & vbCrLf & vbCrLf & _
+           "Summary: " & summary, vbInformation
+    Exit Sub
+
+CleanErr:
+    MsgBox "Could not parse cleaning suggestions. AI response:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT: SUMMARY DASHBOARD
+' ══════════════════════════════════════════════════════════════
+
+Private Sub WriteSummaryDashboard(aiText As String, sheetName As String)
+    On Error GoTo SumErr
+    
+    Dim json As String
+    json = ExtractJsonBlock(aiText)
+    If Len(json) = 0 Then json = aiText
+    
+    Dim dWs As Worksheet
+    Set dWs = GetOrCreateSheet(ActiveWorkbook, "AI_Dashboard")
+    dWs.Cells.Clear
+    
+    ' Title
+    dWs.Cells(1, 1).Value = "AI Summary Dashboard - " & sheetName
+    dWs.Cells(1, 1).Font.Size = 14
+    dWs.Cells(1, 1).Font.Bold = True
+    dWs.Range("A1:F1").MergeCells = True
+    
+    dWs.Cells(2, 1).Value = "Generated: " & Format$(Now, "yyyy-mm-dd hh:mm")
+    dWs.Cells(2, 1).Font.Italic = True
+    dWs.Cells(2, 1).Font.Color = RGB(120, 120, 120)
+    
+    ' Overview
+    Dim totalRows As String, qualityScore As String
+    totalRows = JsonValue(json, "total_rows")
+    qualityScore = JsonValue(json, "data_quality_score")
+    
+    dWs.Cells(4, 1).Value = "Total Rows:"
+    dWs.Cells(4, 1).Font.Bold = True
+    dWs.Cells(4, 2).Value = totalRows
+    
+    dWs.Cells(5, 1).Value = "Quality Score:"
+    dWs.Cells(5, 1).Font.Bold = True
+    dWs.Cells(5, 2).Value = qualityScore & " / 100"
+    If Val(qualityScore) >= 80 Then
+        dWs.Cells(5, 2).Font.Color = RGB(0, 150, 0)
+    ElseIf Val(qualityScore) >= 50 Then
+        dWs.Cells(5, 2).Font.Color = RGB(200, 150, 0)
+    Else
+        dWs.Cells(5, 2).Font.Color = RGB(200, 0, 0)
+    End If
+    
+    ' Top Insights
+    dWs.Cells(7, 1).Value = "Top Insights"
+    dWs.Cells(7, 1).Font.Bold = True
+    dWs.Cells(7, 1).Font.Size = 12
+    
+    Dim insightsStr As String
+    insightsStr = JsonValue(json, "top_insights")
+    Dim insights As Variant
+    insights = JsonArrayToStrings(insightsStr)
+    
+    Dim ir As Long
+    If IsArray(insights) Then
+        For ir = 0 To UBound(insights)
+            dWs.Cells(8 + ir, 1).Value = Chr(149) & " "  ' bullet
+            dWs.Cells(8 + ir, 2).Value = insights(ir)
+            dWs.Cells(8 + ir, 2).WrapText = True
+            dWs.Range(dWs.Cells(8 + ir, 2), dWs.Cells(8 + ir, 6)).MergeCells = True
+        Next ir
+    End If
+    
+    ' Stats section
+    Dim statsRow As Long
+    statsRow = 8 + ir + 2
+    
+    dWs.Cells(statsRow, 1).Value = "Column Statistics"
+    dWs.Cells(statsRow, 1).Font.Bold = True
+    dWs.Cells(statsRow, 1).Font.Size = 12
+    
+    statsRow = statsRow + 1
+    dWs.Cells(statsRow, 1).Value = "Column"
+    dWs.Cells(statsRow, 2).Value = "Min"
+    dWs.Cells(statsRow, 3).Value = "Max"
+    dWs.Cells(statsRow, 4).Value = "Average"
+    dWs.Cells(statsRow, 5).Value = "Sum"
+    dWs.Cells(statsRow, 6).Value = "Unique"
+    dWs.Range(dWs.Cells(statsRow, 1), dWs.Cells(statsRow, 6)).Font.Bold = True
+    dWs.Range(dWs.Cells(statsRow, 1), dWs.Cells(statsRow, 6)).Interior.Color = RGB(70, 130, 180)
+    dWs.Range(dWs.Cells(statsRow, 1), dWs.Cells(statsRow, 6)).Font.Color = RGB(255, 255, 255)
+    
+    ' Parse stats array
+    Dim statsStr As String
+    statsStr = JsonValue(json, "stats")
+    Dim sp As Long
+    sp = 1
+    statsRow = statsRow + 1
+    
+    Do
+        Dim sb As Long
+        sb = InStr(sp, statsStr, "{")
+        If sb = 0 Then Exit Do
+        Dim se2 As Long
+        se2 = InStr(sb, statsStr, "}")
+        If se2 = 0 Then Exit Do
+        
+        Dim statBlock As String
+        statBlock = Mid$(statsStr, sb, se2 - sb + 1)
+        
+        dWs.Cells(statsRow, 1).Value = JsonValue(statBlock, "column")
+        dWs.Cells(statsRow, 2).Value = JsonValue(statBlock, "min")
+        dWs.Cells(statsRow, 3).Value = JsonValue(statBlock, "max")
+        dWs.Cells(statsRow, 4).Value = JsonValue(statBlock, "avg")
+        dWs.Cells(statsRow, 5).Value = JsonValue(statBlock, "sum")
+        dWs.Cells(statsRow, 6).Value = JsonValue(statBlock, "unique_count")
+        
+        ' Alternate row color
+        If (statsRow Mod 2) = 0 Then
+            dWs.Range(dWs.Cells(statsRow, 1), dWs.Cells(statsRow, 6)).Interior.Color = RGB(240, 245, 255)
+        End If
+        
+        statsRow = statsRow + 1
+        sp = se2 + 1
+    Loop
+    
+    ' Add borders to stats table
+    If statsRow > 8 + ir + 4 Then
+        Dim statRange As Range
+        Set statRange = dWs.Range(dWs.Cells(8 + ir + 3, 1), dWs.Cells(statsRow - 1, 6))
+        statRange.Borders.LineStyle = xlContinuous
+        statRange.Borders.Weight = xlThin
+    End If
+    
+    dWs.Columns("A:F").EntireColumn.AutoFit
+    dWs.Columns("B").ColumnWidth = 40
+    dWs.Activate
+    dWs.Cells(1, 1).Select
+    
+    MsgBox "Summary Dashboard created on sheet: AI_Dashboard", vbInformation
+    Exit Sub
+
+SumErr:
+    MsgBox "Could not build dashboard. AI response:" & vbCrLf & vbCrLf & aiText, vbExclamation
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  MAIN ENTRY POINT
+' ══════════════════════════════════════════════════════════════
 
 Public Sub AskSimpleAI_FromSelection()
     On Error GoTo EH
 
-    Dim sel As Range
-    Dim apiKeyPath As String, apiKey As String
-    Dim instruction As String
-    Dim payload As String
-    Dim url As String
-    Dim http As Object
-    Dim sheetName As String
-    Dim responseText As String
-    Dim aiText As String
-    Dim outWs As Worksheet
-    Dim jsonWs As Worksheet
-    Dim outRow As Long
-    Dim jsonRow As Long
-    Dim sourceAddress As String
-    Dim appFolder As String
-
+    ' Validate selection
     If TypeName(Selection) <> "Range" Then
         MsgBox "Please select a table range first (header row + data rows).", vbExclamation
         Exit Sub
     End If
 
+    Dim sel As Range
     Set sel = Selection
 
     If sel.Rows.Count < 2 Then
@@ -258,83 +2025,494 @@ Public Sub AskSimpleAI_FromSelection()
         Exit Sub
     End If
 
-    instruction = InputBox("What should AI do with this selected range?", "SIMPLE_AI Excel Integration", "Summarize key insights and outliers.")
-    If Len(Trim$(instruction)) = 0 Then Exit Sub
+    ' Chat-style prompt — single input, action inferred automatically
+    Dim action As String
+    Dim instruction As String
+    action = ChatPrompt(instruction, "the selected data")
+    If Len(action) = 0 Then Exit Sub
 
+    ' Get API key
+    Dim appFolder As String
     appFolder = GetConfiguredAppFolder()
     If Len(appFolder) = 0 Then
         MsgBox "SIMPLE_AI app folder not configured.", vbExclamation
         Exit Sub
     End If
 
-    apiKeyPath = appFolder & "\local_api_key.txt"
-    apiKey = Trim$(ReadAllText(apiKeyPath))
+    Dim apiKey As String
+    apiKey = Trim$(ReadAllText(appFolder & "\local_api_key.txt"))
     If Len(apiKey) = 0 Then
-        MsgBox "API key file is empty: " & apiKeyPath, vbCritical
+        MsgBox "API key file is empty.", vbCritical
         Exit Sub
     End If
 
+    Dim sheetName As String
     sheetName = ActiveSheet.Name
 
+    ' Deterministic local execution (bypass AI) when instruction is explicit/parsable.
+    If TryDeterministicAction(sel, action, instruction, sheetName) Then
+        Exit Sub
+    End If
+
+    ' Show status
+    Application.StatusBar = "SIMPLE_AI: Processing " & UCase$(action) & "..."
+    Application.Cursor = xlWait
+
+    ' Call API
+    Dim http As Object
+    Set http = CallAI(apiKey, action, instruction, sel, sheetName)
+
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+
+    If http.Status < 200 Or http.Status >= 300 Then
+        MsgBox "API error " & http.Status & ": " & http.responseText, vbCritical
+        Exit Sub
+    End If
+
+    ' Extract AI text
+    Dim aiText As String
+    aiText = ExtractJsonTextField(http.responseText)
+    If Len(Trim$(aiText)) = 0 Then aiText = http.responseText
+
+    ' Route to action handler
+    Select Case action
+        Case "chart"
+            CreateChartFromAI sel, aiText, sheetName, instruction
+        Case "predict"
+            WritePrediction sel, aiText, sheetName
+        Case "anomalies"
+            HighlightAnomalies sel, aiText, sheetName
+        Case "format"
+            ApplyFormatting sel, aiText, sheetName
+        Case "formula"
+            InsertFormulas sel, aiText, sheetName
+        Case "clean"
+            ApplyDataCleaning sel, aiText, sheetName
+        Case "summary"
+            WriteSummaryDashboard aiText, sheetName
+        Case Else
+            ' Analyze — write as proper table rows
+            WriteAnalysisOutput ActiveWorkbook, aiText, sheetName, _
+                                sel.Address(False, False), instruction, action
+    End Select
+
+    Exit Sub
+
+EH:
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+    MsgBox "Error: " & Err.Description, vbCritical
+End Sub
+
+Public Sub AskSimpleAI_FromWorkbookMultiSheet()
+    On Error GoTo EH
+
+    ' Chat-style prompt — single input, action inferred automatically
+    Dim action As String
+    Dim instruction As String
+    action = ChatPrompt(instruction, "all sheets in this workbook")
+    If Len(action) = 0 Then Exit Sub
+
+    Dim appFolder As String
+    appFolder = GetConfiguredAppFolder()
+    If Len(appFolder) = 0 Then
+        MsgBox "SIMPLE_AI app folder not configured.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim apiKey As String
+    apiKey = Trim$(ReadAllText(appFolder & "\local_api_key.txt"))
+    If Len(apiKey) = 0 Then
+        MsgBox "API key file is empty.", vbCritical
+        Exit Sub
+    End If
+
+    Application.StatusBar = "SIMPLE_AI: Processing workbook (multi-sheet) " & UCase$(action) & "..."
+    Application.Cursor = xlWait
+
+    Dim http As Object
+    Set http = CallAIWorkbook(apiKey, action, instruction, ActiveWorkbook)
+
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+
+    If http.Status < 200 Or http.Status >= 300 Then
+        MsgBox "API error " & http.Status & ": " & http.responseText, vbCritical
+        Exit Sub
+    End If
+
+    Dim aiText As String
+    aiText = ExtractJsonTextField(http.responseText)
+    If Len(Trim$(aiText)) = 0 Then aiText = http.responseText
+
+    ' Workbook-level mode writes consolidated findings table.
+    WriteAnalysisOutput ActiveWorkbook, aiText, ActiveWorkbook.Name, "(All sheets)", instruction, action
+    Exit Sub
+
+EH:
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+    MsgBox "Error: " & Err.Description, vbCritical
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  GPT-STYLE CHAT  —  Conversational AI inside Excel
+' ══════════════════════════════════════════════════════════════
+
+''' Hit the /v1/chat endpoint with free-form text (+ optional conversation context).
+Private Function CallAIChat(apiKey As String, userText As String, _
+                             Optional conversationCtx As String = "", _
+                             Optional dataCtx As String = "") As String
+    Dim prompt As String
+    If Len(conversationCtx) > 0 Then
+        prompt = conversationCtx & vbLf & "User: " & userText
+    Else
+        prompt = userText
+    End If
+
+    If Len(dataCtx) > 0 Then
+        prompt = prompt & vbLf & vbLf & "--- Selected Excel Data ---" & vbLf & dataCtx
+    End If
+
+    Dim payload As String
     payload = "{"
-    payload = payload & """instruction"":""" & JsonEscape(instruction) & """," 
-    payload = payload & """sheet_name"":""" & JsonEscape(sheetName) & """," 
-    payload = payload & """headers"":" & BuildHeadersJson(sel) & ","
-    payload = payload & """rows"":" & BuildRowsJson(sel) & ","
-    payload = payload & """role"":""You are an expert spreadsheet analyst."""
+    payload = payload & """text"":""" & JsonEscape(prompt) & ""","
+    payload = payload & """role"":""You are a helpful AI assistant embedded in Microsoft Excel. " & _
+              "Answer concisely. When the user shares spreadsheet data, analyze it expertly. " & _
+              "Use markdown for formatting."""
     payload = payload & "}"
 
-    url = "http://127.0.0.1:8765/v1/excel-range"
+    Dim url As String
+    url = "http://127.0.0.1:" & API_PORT & "/v1/chat"
 
+    Dim http As Object
     Set http = CreateObject("MSXML2.XMLHTTP")
     http.Open "POST", url, False
     http.setRequestHeader "Content-Type", "application/json"
     http.setRequestHeader "X-API-Key", apiKey
     http.send payload
 
-    responseText = http.responseText
-    sourceAddress = sel.Address(False, False)
-
-    Set outWs = GetOrCreateSheet("AI_Output")
-    EnsureOutputHeaders outWs
-    outRow = outWs.Cells(outWs.Rows.Count, 1).End(xlUp).Row + 1
-
-    Set jsonWs = GetOrCreateSheet("_AI_JSON_LOG")
-    EnsureJsonHeaders jsonWs
-    jsonWs.Visible = xlSheetVeryHidden
-    jsonRow = jsonWs.Cells(jsonWs.Rows.Count, 1).End(xlUp).Row + 1
-
-    jsonWs.Cells(jsonRow, 1).Value = Now
-    jsonWs.Cells(jsonRow, 2).Value = sheetName
-    jsonWs.Cells(jsonRow, 3).Value = sourceAddress
-    jsonWs.Cells(jsonRow, 4).Value = instruction
-    jsonWs.Cells(jsonRow, 5).Value = responseText
-
     If http.Status >= 200 And http.Status < 300 Then
-        aiText = ExtractJsonTextField(responseText)
-        If Len(Trim$(aiText)) = 0 Then aiText = responseText
-
-        outWs.Cells(outRow, 1).Value = Now
-        outWs.Cells(outRow, 2).Value = sheetName
-        outWs.Cells(outRow, 3).Value = sourceAddress
-        outWs.Cells(outRow, 4).Value = instruction
-        outWs.Cells(outRow, 5).Value = aiText
-
-        outWs.Columns("A:E").EntireColumn.AutoFit
-        MsgBox "AI response written to sheet: AI_Output (row " & outRow & ")", vbInformation
+        Dim resp As String
+        resp = ExtractJsonTextField(http.responseText)
+        If Len(Trim$(resp)) > 0 Then
+            CallAIChat = resp
+        Else
+            CallAIChat = http.responseText
+        End If
     Else
-        outWs.Cells(outRow, 1).Value = Now
-        outWs.Cells(outRow, 2).Value = sheetName
-        outWs.Cells(outRow, 3).Value = sourceAddress
-        outWs.Cells(outRow, 4).Value = instruction
-        outWs.Cells(outRow, 5).Value = "API error " & http.Status & ": " & responseText
+        CallAIChat = "[Error " & http.Status & "] " & http.responseText
+    End If
+End Function
 
-        outWs.Columns("A:E").EntireColumn.AutoFit
-        MsgBox "API error " & http.Status & ": " & responseText, vbCritical
+''' Build markdown text from the current Excel selection (if any).
+Private Function SelectionToContext() As String
+    On Error GoTo NoSel
+    If TypeName(Selection) <> "Range" Then
+        SelectionToContext = ""
+        Exit Function
     End If
 
+    Dim sel As Range
+    Set sel = Selection
+    If sel.Rows.Count < 2 Or sel.Columns.Count < 1 Then
+        SelectionToContext = ""
+        Exit Function
+    End If
+
+    Dim out As String
+    out = "Sheet: " & ActiveSheet.Name & "  Range: " & sel.Address(False, False) & vbLf
+
+    ' Headers
+    Dim c As Long
+    For c = 1 To sel.Columns.Count
+        If c > 1 Then out = out & " | "
+        out = out & CStr(sel.Cells(1, c).Value2)
+    Next c
+    out = out & vbLf & String$(40, "-") & vbLf
+
+    ' Data rows (limit to 60)
+    Dim r As Long
+    Dim maxRows As Long
+    maxRows = Application.Min(sel.Rows.Count, 61)
+    For r = 2 To maxRows
+        For c = 1 To sel.Columns.Count
+            If c > 1 Then out = out & " | "
+            Dim cv As Variant
+            cv = sel.Cells(r, c).Value2
+            If IsError(cv) Then
+                out = out & "#ERR"
+            ElseIf IsEmpty(cv) Then
+                out = out & ""
+            Else
+                out = out & CStr(cv)
+            End If
+        Next c
+        out = out & vbLf
+    Next r
+
+    If sel.Rows.Count > 61 Then
+        out = out & "... (" & (sel.Rows.Count - 61) & " more rows)"
+    End If
+
+    SelectionToContext = out
+    Exit Function
+NoSel:
+    SelectionToContext = ""
+End Function
+
+''' Get or create the chat sheet, formatted nicely.
+Private Function EnsureChatSheet() As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(AI_CHAT_SHEET)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = AI_CHAT_SHEET
+    End If
+
+    ' Column layout: A=Role icon, B=Message, C=Timestamp
+    ws.Columns("A").ColumnWidth = 4
+    ws.Columns("B").ColumnWidth = 90
+    ws.Columns("C").ColumnWidth = 16
+
+    ' Title row
+    If Len(Trim$(CStr(ws.Cells(1, 1).Value2))) = 0 Then
+        ws.Range("A1:C1").Merge
+        ws.Cells(1, 1).Value = "SIMPLE_AI Chat"
+        ws.Cells(1, 1).Font.Size = 14
+        ws.Cells(1, 1).Font.Bold = True
+        ws.Cells(1, 1).Font.Color = RGB(255, 255, 255)
+        ws.Range("A1:C1").Interior.Color = RGB(45, 45, 55)
+        ws.Cells(1, 1).HorizontalAlignment = xlCenter
+        ws.Rows(1).RowHeight = 30
+
+        ws.Cells(2, 1).Value = ""
+        ws.Range("A2:C2").Merge
+        ws.Cells(2, 1).Value = "Type your messages below. Select data on another sheet before opening chat to include it as context."
+        ws.Cells(2, 1).Font.Size = 9
+        ws.Cells(2, 1).Font.Italic = True
+        ws.Cells(2, 1).Font.Color = RGB(140, 140, 140)
+        ws.Rows(2).RowHeight = 20
+    End If
+
+    Set EnsureChatSheet = ws
+End Function
+
+''' Append a chat message row to the sheet.
+Private Sub AppendChatRow(ws As Worksheet, role As String, message As String)
+    Dim nextRow As Long
+    nextRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row + 1
+    If nextRow < 3 Then nextRow = 3  ' skip title rows
+
+    ' Role icon
+    If role = "user" Then
+        ws.Cells(nextRow, 1).Value = "You"
+        ws.Cells(nextRow, 1).Font.Size = 10
+        ws.Cells(nextRow, 1).Font.Bold = True
+        ws.Cells(nextRow, 1).Font.Color = RGB(30, 90, 180)
+    Else
+        ws.Cells(nextRow, 1).Value = "AI"
+        ws.Cells(nextRow, 1).Font.Size = 10
+        ws.Cells(nextRow, 1).Font.Bold = True
+        ws.Cells(nextRow, 1).Font.Color = RGB(100, 60, 160)
+    End If
+    ws.Cells(nextRow, 1).HorizontalAlignment = xlCenter
+    ws.Cells(nextRow, 1).VerticalAlignment = xlTop
+
+    ' Message
+    ws.Cells(nextRow, 2).Value = message
+    ws.Cells(nextRow, 2).WrapText = True
+    ws.Cells(nextRow, 2).VerticalAlignment = xlTop
+    ws.Cells(nextRow, 2).Font.Size = 11
+
+    ' Timestamp
+    ws.Cells(nextRow, 3).Value = Format$(Now, "hh:mm:ss")
+    ws.Cells(nextRow, 3).Font.Size = 9
+    ws.Cells(nextRow, 3).Font.Color = RGB(140, 140, 140)
+    ws.Cells(nextRow, 3).HorizontalAlignment = xlRight
+    ws.Cells(nextRow, 3).VerticalAlignment = xlTop
+
+    ' Styling per role
+    If role = "user" Then
+        ws.Range(ws.Cells(nextRow, 1), ws.Cells(nextRow, 3)).Interior.Color = RGB(235, 245, 255)
+        ws.Cells(nextRow, 2).Font.Color = RGB(30, 30, 30)
+    Else
+        ws.Range(ws.Cells(nextRow, 1), ws.Cells(nextRow, 3)).Interior.Color = RGB(245, 245, 250)
+        ws.Cells(nextRow, 2).Font.Color = RGB(50, 50, 60)
+    End If
+
+    ' Border
+    ws.Range(ws.Cells(nextRow, 1), ws.Cells(nextRow, 3)).Borders(xlEdgeBottom).LineStyle = xlContinuous
+    ws.Range(ws.Cells(nextRow, 1), ws.Cells(nextRow, 3)).Borders(xlEdgeBottom).Color = RGB(220, 220, 230)
+    ws.Range(ws.Cells(nextRow, 1), ws.Cells(nextRow, 3)).Borders(xlEdgeBottom).Weight = xlThin
+
+    ' Auto-fit row height
+    ws.Rows(nextRow).EntireRow.AutoFit
+    Dim minH As Double
+    minH = 22
+    If ws.Rows(nextRow).RowHeight < minH Then ws.Rows(nextRow).RowHeight = minH
+
+    ' Scroll to bottom
+    ws.Cells(nextRow, 2).Select
+    ActiveWindow.ScrollRow = Application.Max(1, nextRow - 10)
+End Sub
+
+''' Build conversation context string from message history arrays.
+Private Function BuildConversationContext(userMsgs() As String, aiMsgs() As String, _
+                                           count As Long) As String
+    Dim out As String, i As Long
+    Dim startIdx As Long
+    startIdx = 1
+    If count > CHAT_MAX_HISTORY Then startIdx = count - CHAT_MAX_HISTORY + 1
+
+    out = ""
+    For i = startIdx To count
+        If Len(userMsgs(i)) > 0 Then
+            out = out & "User: " & userMsgs(i) & vbLf
+        End If
+        If Len(aiMsgs(i)) > 0 Then
+            out = out & "Assistant: " & aiMsgs(i) & vbLf
+        End If
+    Next i
+    BuildConversationContext = out
+End Function
+
+' ── Public entry points ─────────────────────────────────────
+
+Public Sub OpenAIChatWindow()
+    On Error GoTo ChatEH
+
+    ' Get API key
+    Dim appFolder As String
+    appFolder = GetConfiguredAppFolder()
+    If Len(appFolder) = 0 Then
+        MsgBox "SIMPLE_AI app folder not configured.", vbExclamation
+        Exit Sub
+    End If
+    Dim apiKey As String
+    apiKey = Trim$(ReadAllText(appFolder & "\local_api_key.txt"))
+    If Len(apiKey) = 0 Then
+        MsgBox "API key file is empty.", vbCritical
+        Exit Sub
+    End If
+
+    ' Setup chat sheet
+    Dim chatWs As Worksheet
+    Set chatWs = EnsureChatSheet()
+    chatWs.Activate
+
+    ' Conversation memory (in-session)
+    Dim userMsgs(1 To 200) As String
+    Dim aiMsgs(1 To 200) As String
+    Dim msgCount As Long
+    msgCount = 0
+
+    ' If user has data selected on another sheet, capture it now
+    Dim dataCtx As String
+    dataCtx = ""
+
+    ' Welcome message (only on fresh sheet)
+    If chatWs.Cells(3, 2).Value2 = "" Or IsEmpty(chatWs.Cells(3, 2).Value2) Then
+        AppendChatRow chatWs, "assistant", _
+            "Hi! I'm your AI assistant." & vbLf & vbLf & _
+            "You can ask me anything — analyze data, create charts, write formulas, and more." & vbLf & vbLf & _
+            "TIP: Select a data range on another sheet before opening chat to include it as context." & vbLf & _
+            "Commands: 'clear' = reset chat  |  'quit' = close  |  Cancel = close"
+    End If
+
+    ' ── Chat loop ──
+    Do
+        Dim userInput As String
+        userInput = InputBox( _
+            "Type your message:" & vbCrLf & _
+            IIf(Len(dataCtx) > 0, "[Data context attached]", "[No data — select a range on another sheet first if needed]"), _
+            "SIMPLE_AI Chat", "")
+
+        ' Cancel = close
+        If StrPtr(userInput) = 0 Then Exit Do
+        userInput = Trim$(userInput)
+        If Len(userInput) = 0 Then GoTo NextMsg
+        If LCase$(userInput) = "quit" Or LCase$(userInput) = "exit" Or LCase$(userInput) = "close" Then Exit Do
+
+        ' Special: clear history
+        If LCase$(userInput) = "clear" Then
+            chatWs.Rows("3:" & chatWs.Rows.Count).Delete
+            msgCount = 0
+            Erase userMsgs
+            Erase aiMsgs
+            dataCtx = ""
+            AppendChatRow chatWs, "assistant", "Chat cleared. Send a new message to start."
+            GoTo NextMsg
+        End If
+
+        ' Special: re-attach data
+        If LCase$(userInput) = "attach" Or LCase$(userInput) = "data" Then
+            MsgBox "Switch to your data sheet, select a range, then come back and type your question." & vbCrLf & _
+                   "The selected data will be included automatically.", vbInformation
+            GoTo NextMsg
+        End If
+
+        ' Capture data context if user has a range selected on another sheet
+        Dim freshCtx As String
+        freshCtx = SelectionToContext()
+        If Len(freshCtx) > 0 Then dataCtx = freshCtx
+
+        ' Append user message to sheet
+        AppendChatRow chatWs, "user", userInput
+        DoEvents
+
+        ' Track history
+        msgCount = msgCount + 1
+        If msgCount > 200 Then msgCount = 200
+        userMsgs(msgCount) = userInput
+
+        ' Build conversation context
+        Dim convCtx As String
+        convCtx = BuildConversationContext(userMsgs, aiMsgs, msgCount)
+
+        ' Show status
+        Application.StatusBar = "SIMPLE_AI: Thinking..."
+        Application.Cursor = xlWait
+        DoEvents
+
+        ' Call AI
+        Dim aiReply As String
+        aiReply = CallAIChat(apiKey, userInput, convCtx, dataCtx)
+
+        Application.StatusBar = False
+        Application.Cursor = xlDefault
+
+        ' Track AI reply
+        aiMsgs(msgCount) = aiReply
+
+        ' Append AI reply to sheet
+        AppendChatRow chatWs, "assistant", aiReply
+        DoEvents
+
+NextMsg:
+    Loop
+
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
     Exit Sub
 
-EH:
-    MsgBox "Error: " & Err.Description, vbCritical
+ChatEH:
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+    MsgBox "Chat error: " & Err.Description, vbCritical
+End Sub
+
+Public Sub ClearAIChat()
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(AI_CHAT_SHEET)
+    If Not ws Is Nothing Then
+        ws.Rows("3:" & ws.Rows.Count).Delete
+    End If
+    On Error GoTo 0
+    MsgBox "Chat history cleared.", vbInformation
 End Sub

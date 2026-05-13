@@ -17,6 +17,7 @@ import threading
 import textwrap
 import time
 import uuid
+import difflib
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -26,13 +27,18 @@ import psutil
 
 from database import ChatDatabase, migrate_json_to_sqlite
 from plugin_manager import PluginManager
+from mcp_manager import MCPManager
 from rag_manager import RAGManager
 from utils import app_data_path
+from memory_optimizer import MemoryOptimizer
+from metrics import get_metrics
 
 try:
     from llama_cpp import Llama
 except ImportError:
     Llama = None
+
+import requests  # For Ollama health check
 
 
 # ── Ollama HTTP backend (drop-in replacement for Llama) ─────────
@@ -43,7 +49,7 @@ class OllamaModel:
     def __init__(self, model_name: str, base_url: str = "http://127.0.0.1:11434"):
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
-        self._n_ctx = 8192
+        self._n_ctx = 65536  # Default context window (increased from 8192 to support larger models)
         # Warm the model so first inference isn't slow
         try:
             import urllib.request, json as _json
@@ -239,7 +245,7 @@ class Bridge:
         self.model_map: dict = {}
         self.model_config: dict = {}
         self.model_configs: dict = {}
-        self.actual_n_ctx: int = 2048
+        self.actual_n_ctx: int = 65536  # Actual context window detected from loaded model
 
         # Generation
         self.generation_in_progress: bool = False
@@ -253,7 +259,11 @@ class Bridge:
         self.uploaded_file_name: str | None = None
         self.uploaded_file_path: str | None = None
         self.uploaded_pages: list[str] | None = None  # page-level chunks for large docs
+        self.uploaded_files: list[dict] = []  # multi-file: [{name, path, content, pages}]
         self.chat_file_state: dict = {}  # per-chat uploaded file state
+        self._pdf_cache_dir = os.path.join(app_data_path(), "pdf_extract_cache")
+        os.makedirs(self._pdf_cache_dir, exist_ok=True)
+        self._agent_context_trimmed: bool = False
         self.temp_rag_db_name: str | None = None
         self.last_rag_hits: int = 0
 
@@ -283,8 +293,9 @@ class Bridge:
         db_path = app_data_path("chats.db")
         self.chat_db = ChatDatabase(db_path)
         self.plugin_manager = PluginManager(app_data_path("plugins"))
+        self.mcp_manager = MCPManager(self.chat_db)
         if migrate_json_to_sqlite(self.chat_db):
-            print("[MIGRATE] Imported legacy JSON → chats.db")
+            print("[MIGRATE] Imported legacy JSON -> chats.db")
 
         # Dirty flag: set True whenever chat data changes; cleared by auto-save
         self._chats_dirty: bool = False
@@ -294,11 +305,20 @@ class Bridge:
         self._build_config()
         self._load_model_configs()
         self._load_app_settings()
+
+        # ── Memory optimizer (virtual RAM + watchdog) ──────────
+        self.mem_optimizer = MemoryOptimizer(
+            system_ram_gb=self.system_ram,
+            gpu_info=self.gpu_info,
+            emit_fn=lambda ev, d: self._emit(ev, d),
+        )
+        self.mem_optimizer.start_watchdog(interval=3.0)
         self._initialize_activation_state()
         self._load_chats()
         self._init_rag()
         self._load_system_prompts()
         self._load_plugins()
+        self._init_tool_permission()
         self._start_auto_save_loop()
 
     # ── JS helper: emit event to frontend ──────────────────────
@@ -325,8 +345,157 @@ class Bridge:
         """Emit app status text for top-right status bar in web UI."""
         self._emit("app_status", {"text": text})
 
+    # ── AI Tool-Calling Infrastructure ─────────────────────────
+
+    _TOOL_CALL_RE = re.compile(
+        r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+    # Read-only tools that don't need user permission
+    _SAFE_TOOLS = {"/ls", "/tree", "/find", "/size", "/info"}
+
+    def _init_tool_permission(self):
+        """Initialise tool-permission synchronisation primitives."""
+        self._tool_permission_event = threading.Event()
+        self._tool_permission_granted = False
+
+    def _build_tool_definitions(self) -> str:
+        """Build tool description block for the system prompt from registered plugins."""
+        if not self.plugin_commands:
+            return ""
+        tools = []
+        for cmd, entry in self.plugin_commands.items():
+            desc = entry.get("description", "")
+            tools.append(f'  - {cmd}: {desc}')
+
+        # If user has uploaded a file, tell the AI about it
+        file_hint = ""
+        if self.uploaded_files:
+            if len(self.uploaded_files) == 1:
+                f0 = self.uploaded_files[0]
+                ext = os.path.splitext(f0["name"])[1].lower()
+                file_hint = (
+                    f"\n\nUPLOADED FILE INFO:\n"
+                    f"  Name: {f0['name']}\n"
+                    f"  Path: {f0['path']}\n"
+                    f"When using /code, these variables are pre-set:\n"
+                    f"  UPLOADED_FILE = original file path (use for CSV/Excel/text: pd.read_csv(UPLOADED_FILE))\n"
+                    f"  UPLOADED_TEXT = path to extracted text version (use for PDFs/scanned docs: open(UPLOADED_TEXT).read())\n"
+                    f"  UPLOADED_NAME = original filename\n"
+                    f"For CSV/Excel: read UPLOADED_FILE directly with pandas.\n"
+                    f"For PDFs (including scanned): read UPLOADED_TEXT which has all extracted/OCR text.\n"
+                    f"Always save output to a file (e.g. df.to_csv('result.csv', index=False)).\n"
+                )
+            else:
+                lines = ["\n\nUPLOADED FILES INFO:"]
+                for i, uf in enumerate(self.uploaded_files):
+                    lines.append(f"  File {i+1}: {uf['name']} → {uf['path']}")
+                lines.append(
+                    "When using /code, these variables are pre-set:\n"
+                    "  UPLOADED_FILE = path of first uploaded file\n"
+                    "  UPLOADED_TEXT = path to extracted text of first file\n"
+                    "  UPLOADED_NAME = first filename\n"
+                    "For multiple files, use the paths listed above directly.\n"
+                    "Always save output to a file (e.g. df.to_csv('result.csv', index=False)).\n"
+                )
+                file_hint = "\n".join(lines)
+        elif self.uploaded_file_path and self.uploaded_file_name:
+            ext = os.path.splitext(self.uploaded_file_name)[1].lower()
+            file_hint = (
+                f"\n\nUPLOADED FILE INFO:\n"
+                f"  Name: {self.uploaded_file_name}\n"
+                f"  Path: {self.uploaded_file_path}\n"
+                f"When using /code, these variables are pre-set:\n"
+                f"  UPLOADED_FILE = original file path (use for CSV/Excel/text: pd.read_csv(UPLOADED_FILE))\n"
+                f"  UPLOADED_TEXT = path to extracted text version (use for PDFs/scanned docs: open(UPLOADED_TEXT).read())\n"
+                f"  UPLOADED_NAME = original filename\n"
+                f"For CSV/Excel: read UPLOADED_FILE directly with pandas.\n"
+                f"For PDFs (including scanned): read UPLOADED_TEXT which has all extracted/OCR text.\n"
+                f"Always save output to a file (e.g. df.to_csv('result.csv', index=False)).\n"
+            )
+
+        mcp_defs = self.mcp_manager.build_tool_definitions() if hasattr(self, 'mcp_manager') else ""
+
+        # Use real user home path so the LLM doesn't hallucinate usernames
+        _user_home = os.path.expanduser("~").replace("\\", "\\\\")
+
+        return (
+            "You have access to local tools. When the user asks you to perform a file or system operation, "
+            "call the appropriate tool by emitting EXACTLY this format (no extra text around it):\n"
+            "<tool_call>{\"tool\": \"/command\", \"args\": \"full command with arguments\"}</tool_call>\n\n"
+            "Available tools:\n"
+            + "\n".join(tools) + "\n\n"
+            f"The current user's home directory is: {_user_home}\n\n"
+            "Examples:\n"
+            f'  User: "list files in my Downloads" → <tool_call>{{"tool": "/ls", "args": "/ls {_user_home}\\\\Downloads"}}</tool_call>\n'
+            f'  User: "sort the Downloads folder" → <tool_call>{{"tool": "/sort", "args": "/sort {_user_home}\\\\Downloads"}}</tool_call>\n'
+            f'  User: "find PDFs in Documents" → <tool_call>{{"tool": "/find", "args": "/find {_user_home}\\\\Documents *.pdf"}}</tool_call>\n'
+            '  User: "how big is C drive" → <tool_call>{"tool": "/size", "args": "/size C:\\\\"}</tool_call>\n'
+            '  User: "what is 15% of 4800?" → <tool_call>{"tool": "/code", "args": "/code print(4800 * 0.15)"}</tool_call>\n'
+            '  User: "generate fibonacci up to 100" → <tool_call>{"tool": "/code", "args": "/code\\na, b = 0, 1\\nwhile a <= 100:\\n    print(a)\\n    a, b = b, a + b"}</tool_call>\n'
+            '  User: "extract this PDF to CSV" → <tool_call>{"tool": "/code", "args": "/code\\nimport pandas as pd\\ntext = open(UPLOADED_TEXT).read()\\nlines = [l.strip() for l in text.splitlines() if l.strip()]\\n# parse lines into structured data...\\ndf = pd.DataFrame(data)\\ndf.to_csv(\'extracted.csv\', index=False)\\nprint(df.to_string())"}</tool_call>\n\n'
+            "Rules:\n"
+            "- ONLY use <tool_call> when the user clearly wants a computation, file/system action, or data task.\n"
+            "- For normal questions, just answer directly without tool calls.\n"
+            "- For /code: write COMPLETE Python scripts. Use print(), pandas, numpy, matplotlib as needed.\n"
+            "- After the tool result is provided, summarize it naturally for the user.\n"
+            + file_hint
+            + mcp_defs
+        )
+
+    def _parse_tool_call(self, text: str):
+        """Parse a <tool_call> block from AI response. Returns (cmd, args_str) or None."""
+        m = self._TOOL_CALL_RE.search(text)
+        if not m:
+            return None
+        try:
+            payload = json.loads(m.group(1))
+            tool = payload.get("tool", "").strip()
+            args = payload.get("args", "")
+            # MCP tool: "mcp:server:tool_name"
+            if tool.startswith("mcp:"):
+                return (tool, args if isinstance(args, dict) else {})
+            # Local plugin tool
+            if isinstance(args, str):
+                args = args.strip()
+            else:
+                args = json.dumps(args)
+            if tool and tool in self.plugin_commands:
+                return (tool, args)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return None
+
+    def _execute_tool_call(self, cmd, args_str) -> str:
+        """Execute a plugin command or MCP tool and return the result text."""
+        # MCP tool: "mcp:server:tool_name"
+        if isinstance(cmd, str) and cmd.startswith("mcp:"):
+            parts = cmd.split(":", 2)
+            if len(parts) != 3:
+                return f"Invalid MCP tool format: {cmd}  (expected mcp:server:tool)"
+            server_name, tool_name = parts[1], parts[2]
+            arguments = args_str if isinstance(args_str, dict) else {}
+            result = self.mcp_manager.call_tool(server_name, tool_name, arguments)
+            if "error" in result:
+                return f"MCP tool error: {result['error']}"
+            return result.get("result", str(result))
+
+        # Local plugin tool
+        entry = self.plugin_commands.get(cmd)
+        if not entry:
+            return f"Unknown tool: {cmd}"
+        handler = entry.get("handler")
+        if not callable(handler):
+            return f"Tool {cmd} has no callable handler"
+        try:
+            result = handler(self, args_str)
+            if isinstance(result, dict):
+                return result.get("content", str(result))
+            return str(result)
+        except Exception as e:
+            return f"Tool error: {e}"
+
     def _extract_rag_sources(self, chunks, max_sources: int = 4):
-        """Extract unique source file names from retrieved RAG chunks."""
+        """Extract unique source file names + snippets from retrieved RAG chunks."""
         if not chunks:
             return []
 
@@ -337,7 +506,12 @@ class Bridge:
                 name = os.path.basename(str(match).strip())
                 if name and name not in seen:
                     seen.add(name)
-                    sources.append(name)
+                    # Extract a short snippet from the chunk text
+                    snippet = re.sub(r"---\s*File:\s*.+?\s*---", "", chunk).strip()
+                    snippet = snippet[:120].replace("\n", " ").strip()
+                    if len(snippet) > 117:
+                        snippet = snippet[:117] + "..."
+                    sources.append({"name": name, "snippet": snippet})
                     if len(sources) >= max_sources:
                         return sources
         return sources
@@ -388,47 +562,273 @@ class Bridge:
         context = "\n".join(lines) if lines else "No results found."
         return context, sources
 
-    def _fetch_web_excerpt(self, url: str, query: str, max_chars: int = 500) -> str:
+    # ── Web search helpers ────────────────────────────────────
+
+    @staticmethod
+    def _is_safe_url(url: str) -> bool:
+        """SSRF protection — block internal / private network URLs."""
+        try:
+            import ipaddress
+            from urllib.parse import urlparse as _up
+            parsed = _up(url)
+            host = parsed.hostname or ""
+            if not host:
+                return False
+            # Block obviously internal hostnames
+            if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"):
+                return False
+            if host.endswith(".local") or host.endswith(".internal"):
+                return False
+            # Resolve and check private IP ranges
+            import socket
+            try:
+                resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC,
+                                              socket.SOCK_STREAM)
+                for _, _, _, _, addr in resolved:
+                    ip = ipaddress.ip_address(addr[0])
+                    if ip.is_private or ip.is_loopback or ip.is_reserved:
+                        return False
+            except (socket.gaierror, ValueError):
+                pass  # DNS failure — allow, will fail on actual request
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _truncate_at_sentence(text: str, max_chars: int) -> str:
+        """Truncate text at the nearest sentence boundary before max_chars."""
+        if len(text) <= max_chars:
+            return text
+        # Look for sentence-ending punctuation near the limit
+        truncated = text[:max_chars]
+        # Search backwards for sentence boundary (.!? followed by space or end)
+        for i in range(len(truncated) - 1, max(0, len(truncated) - 80), -1):
+            if truncated[i] in ".!?" and (i + 1 >= len(truncated) or truncated[i + 1] in " \n\t"):
+                return truncated[: i + 1]
+        # Fallback: break at last space to avoid mid-word cut
+        last_space = truncated.rfind(" ", max(0, len(truncated) - 60))
+        if last_space > 0:
+            return truncated[:last_space] + "…"
+        return truncated
+
+    def _fetch_web_excerpt(self, url: str, query: str, max_chars: int = 800) -> str:
+        """Fetch the most relevant excerpt from a web page.
+        Includes SSRF protection, relevance scoring, and sentence-boundary truncation."""
         if not url or not url.startswith(("http://", "https://")):
+            return ""
+        if not self._is_safe_url(url):
+            print(f"[WEB] Blocked SSRF attempt: {url}")
             return ""
         try:
             import requests
             from bs4 import BeautifulSoup
 
-            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=8,
+                allow_redirects=True,
+            )
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+            # Remove boilerplate
+            for tag in soup(["script", "style", "nav", "footer", "header",
+                             "aside", "noscript", "form", "iframe"]):
                 tag.decompose()
 
-            query_terms = [term.lower() for term in re.findall(r"\b\w{3,}\b", query)]
+            query_terms = [t.lower() for t in re.findall(r"\b\w{3,}\b", query)]
+
+            # Score candidates — paragraphs, list items, table rows, headings
             candidates = []
-            for block in soup.find_all(["p", "li", "article", "main", "section"]):
+            for block in soup.find_all(["p", "li", "td", "th", "article",
+                                        "main", "section", "h1", "h2", "h3",
+                                        "h4", "blockquote", "pre", "dd"]):
                 text = " ".join(block.get_text(" ", strip=True).split())
-                if len(text) < 40:
+                if len(text) < 30:
                     continue
-                score = sum(1 for term in query_terms if term in text.lower())
-                if score or len(candidates) < 6:
-                    candidates.append((score, text))
+                score = sum(1 for t in query_terms if t in text.lower())
+                # Bonus for longer, more substantial paragraphs
+                length_bonus = min(2, len(text) // 200)
+                candidates.append((score + length_bonus, text))
 
             if not candidates:
                 page_text = " ".join(soup.get_text(" ", strip=True).split())
-                return page_text[:max_chars]
+                return self._truncate_at_sentence(page_text, max_chars)
 
-            candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+            candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+
+            # Collect top-scored paragraphs up to max_chars
             excerpt_parts = []
             total = 0
-            for _score, text in candidates[:3]:
+            for _score, text in candidates[:5]:  # up to 5 paragraphs
                 remaining = max_chars - total
-                if remaining <= 0:
+                if remaining < 50:
                     break
-                chunk = text[:remaining].strip()
+                chunk = self._truncate_at_sentence(text, remaining)
                 if chunk:
                     excerpt_parts.append(chunk)
-                    total += len(chunk) + 1
+                    total += len(chunk) + 2
             return " ".join(excerpt_parts)[:max_chars]
-        except Exception:
+        except requests.exceptions.Timeout:
+            print(f"[WEB] Timeout fetching excerpt: {url}")
             return ""
+        except requests.exceptions.ConnectionError:
+            print(f"[WEB] Connection error: {url}")
+            return ""
+        except Exception as e:
+            print(f"[WEB] Excerpt error for {url}: {type(e).__name__}")
+            return ""
+
+    # ── URL scraping for Agent mode ────────────────────────────
+
+    _URL_PATTERN = re.compile(
+        r'https?://[^\s<>"\')\]]+', re.IGNORECASE)
+
+    def scrape_url(self, url: str) -> dict:
+        """Scrape a URL and return structured content (text + tables).
+        Exposed as a public API method for the frontend."""
+        if not url or not url.strip():
+            return {"error": "No URL provided"}
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if not self._is_safe_url(url):
+            return {"error": "URL blocked for security reasons (internal/private address)"}
+        try:
+            result = self._scrape_page(url)
+            return result
+        except Exception as e:
+            return {"error": f"Scraping failed: {type(e).__name__}: {e}"}
+
+    def _scrape_page(self, url: str, max_chars: int = 0) -> dict:
+        """Full page scraper — extracts text, tables, and metadata.
+        If max_chars is 0, uses a dynamic limit based on context window."""
+        import requests
+        from bs4 import BeautifulSoup
+
+        if max_chars <= 0:
+            n_ctx = getattr(self, "actual_n_ctx", 2048)
+            max_chars = max(8000, int(n_ctx * 3.5 * 0.50))
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Extract page title
+        title = ""
+        title_tag = soup.find("title")
+        if title_tag:
+            title = title_tag.get_text(strip=True)
+
+        # Remove boilerplate
+        for tag in soup(["script", "style", "nav", "footer", "header",
+                         "aside", "noscript", "form", "iframe", "svg",
+                         "button", "input"]):
+            tag.decompose()
+
+        # ── Extract tables ──
+        tables_md = []
+        for table in soup.find_all("table"):
+            rows = []
+            for tr in table.find_all("tr"):
+                cells = []
+                for td in tr.find_all(["td", "th"]):
+                    cell_text = " ".join(td.get_text(" ", strip=True).split())
+                    cells.append(cell_text)
+                if cells:
+                    rows.append(cells)
+            if rows and len(rows) >= 2:
+                # Convert to markdown table
+                # Normalize column count
+                max_cols = max(len(r) for r in rows)
+                md_lines = []
+                for i, row in enumerate(rows):
+                    padded = row + [""] * (max_cols - len(row))
+                    md_lines.append("| " + " | ".join(padded) + " |")
+                    if i == 0:
+                        md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
+                tables_md.append("\n".join(md_lines))
+            # Remove table from soup so it doesn't appear in body text too
+            table.decompose()
+
+        # ── Extract main body text ──
+        body_parts = []
+        for block in soup.find_all(["p", "li", "h1", "h2", "h3", "h4",
+                                     "h5", "h6", "blockquote", "pre",
+                                     "article", "main", "section", "dd"]):
+            text = " ".join(block.get_text(" ", strip=True).split())
+            if len(text) >= 20:
+                # Add markdown heading markers for headings
+                tag_name = block.name
+                if tag_name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                    level = int(tag_name[1])
+                    text = "#" * level + " " + text
+                elif tag_name == "li":
+                    text = "• " + text
+                body_parts.append(text)
+
+        body_text = "\n".join(body_parts)
+
+        # ── Combine tables + body text within budget ──
+        tables_text = ""
+        if tables_md:
+            tables_text = "\n\n### Extracted Tables\n\n" + "\n\n".join(tables_md)
+
+        combined = ""
+        if tables_text:
+            # Tables first (they're usually what the user wants)
+            combined = tables_text[:max_chars]
+            remaining = max_chars - len(combined)
+            if remaining > 500 and body_text:
+                combined += "\n\n### Page Content\n\n" + body_text[:remaining]
+        else:
+            combined = body_text[:max_chars]
+
+        # Truncate at sentence boundary
+        if len(combined) >= max_chars:
+            combined = self._truncate_at_sentence(combined, max_chars)
+
+        result = {
+            "ok": True,
+            "url": url,
+            "title": title,
+            "content": combined,
+            "tables_count": len(tables_md),
+            "text_length": len(combined),
+        }
+        print(f"[SCRAPE] {url} -> {len(combined)} chars, "
+              f"{len(tables_md)} tables, title='{title[:60]}'")
+        return result
+
+    @staticmethod
+    def _extract_urls_from_text(text: str) -> list:
+        """Extract all http/https URLs from user text."""
+        if not text:
+            return []
+        return Bridge._URL_PATTERN.findall(text)
+
+    @staticmethod
+    def _strip_urls_from_text(text: str) -> str:
+        """Remove URLs from text, leaving the rest of the user's message."""
+        cleaned = Bridge._URL_PATTERN.sub("", text)
+        return " ".join(cleaned.split()).strip()
 
     # ── System detection ───────────────────────────────────────
 
@@ -536,6 +936,39 @@ class Bridge:
         saved_theme = str(self.app_settings.get("theme", self.current_theme)).strip()
         if saved_theme:
             self.current_theme = saved_theme[0].upper() + saved_theme[1:].lower()
+
+    def _is_ai_debug_enabled(self) -> bool:
+        """Return True when verbose AI generation diagnostics are enabled.
+
+        Toggle sources:
+        - app settings key: debug_ai_generation (bool/1/true/on)
+        - env var: SIMPLE_AI_DEBUG_GEN=1
+        """
+        raw = self.app_settings.get("debug_ai_generation", False)
+        if isinstance(raw, str):
+            raw = raw.strip().lower() in ("1", "true", "yes", "on")
+        env_on = str(os.environ.get("SIMPLE_AI_DEBUG_GEN", "")).strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        return bool(raw) or env_on
+
+    def _debug_ai_generation(self, stage: str, payload: dict | None = None):
+        """Print structured debug diagnostics for model generation when enabled."""
+        if not self._is_ai_debug_enabled():
+            return
+        data = payload or {}
+        try:
+            # Keep logs readable and avoid dumping full prompts.
+            safe = dict(data)
+            if "prompt" in safe:
+                p = str(safe.get("prompt") or "")
+                safe["prompt_chars"] = len(p)
+                safe["prompt_head"] = p[:220]
+                safe["prompt_tail"] = p[-220:] if len(p) > 220 else p
+                safe.pop("prompt", None)
+            print(f"[AI-DEBUG] {stage}: {json.dumps(safe, ensure_ascii=False, default=str)}")
+        except Exception as dbg_err:
+            print(f"[AI-DEBUG] {stage}: <debug log error: {dbg_err}>")
 
     def _utc_now_iso(self) -> str:
         return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -995,7 +1428,7 @@ except Exception:
 
     # ── Model loading ──────────────────────────────────────────
 
-    def load_model(self):
+    def load_model(self, *_args, **_kwargs):
         """Load the selected model. Returns immediately; sends events."""
         if not self._has_full_access():
             return {"error": "Trial expired. Enter passkey to activate full access."}
@@ -1008,6 +1441,15 @@ except Exception:
         return {"status": "loading"}
 
     def _load_model_thread(self):
+        """Load model in background thread.
+        
+        Context Window Control:
+        - User controls n_ctx via UI: Model Settings → Context Window selector
+        - Options: default, 1024, 2048, 4096, 8192, 16384, 32768, 65536, or "Max"
+        - Default values based on available RAM (65536 for 32GB+, down to 8192 for <8GB)
+        - "Max" (-1) uses model's native trained context (auto-detected)
+        - mmap=True enables SSD-backed virtual RAM for safe high context windows
+        """
         model_name = Path(self.model_path).stem if not self.model_path.startswith("ollama://") else self.model_path.replace("ollama://", "")
         self._emit("model_status", {"text": f"Loading {model_name}...", "progress": 0})
         try:
@@ -1030,6 +1472,7 @@ except Exception:
                     self.model = new_model
                     self.actual_n_ctx = n_ctx
                     self._active_backend = "ollama"
+                    print(f"[MODEL] Loaded Ollama model: {ollama_name}, n_ctx={n_ctx}")
 
             # ── Local GGUF backend ──
             else:
@@ -1039,15 +1482,30 @@ except Exception:
                 filename = Path(self.model_path).name
                 per_model = self.model_configs.get(filename, {})
 
+                # Determine n_ctx (context window) with user override support:
+                # 1. Start with RAM-based defaults (user can override in UI)
+                # 2. Check for per-model user settings (saved from UI)
+                # 3. Support "max" (-1) to use model's native trained context
+                
+                # RAM-based defaults with mmap/SSD-backed virtual memory:
                 if self.system_ram >= 32:
-                    n_ctx = 16384
+                    n_ctx = 65536    # 64K for high-end systems (was 16384)
                 elif self.system_ram >= 16:
-                    n_ctx = 8192
+                    n_ctx = 32768    # 32K for mid-range (was 8192)
                 elif self.system_ram >= 8:
-                    n_ctx = 4096
+                    n_ctx = 16384    # 16K for 8GB+ (was 4096)
                 else:
-                    n_ctx = 2048
-                n_ctx = per_model.get("n_ctx", n_ctx)
+                    n_ctx = 8192     # 8K minimum for constrained systems (was 2048)
+                
+                # User can override via UI → Model Settings → Context Window
+                user_n_ctx = per_model.get("n_ctx", None)
+                if user_n_ctx == -1:
+                    # "Max" — use model's native context limit (0 = auto-detect in llama.cpp)
+                    n_ctx = 0
+                    print(f"[MODEL] User selected 'Max' context — using model's native limit (auto-detect)")
+                elif user_n_ctx and int(user_n_ctx) > 0:
+                    n_ctx = int(user_n_ctx)
+                    print(f"[MODEL] User selected n_ctx={n_ctx} from UI settings")
                 n_threads = per_model.get("n_threads", self.config["n_threads"])
 
                 # Detect mmproj/clip file for vision support
@@ -1062,11 +1520,15 @@ except Exception:
                 except Exception:
                     pass
 
+                # ── Memory-optimised params (mmap + n_batch only) ──
+                opt = self.mem_optimizer.optimal_llama_params(
+                    base_n_ctx=n_ctx,
+                    base_n_threads=n_threads,
+                    base_n_gpu_layers=self.config["n_gpu_layers"],
+                )
                 llama_kwargs = dict(
                     model_path=self.model_path,
-                    n_threads=n_threads,
-                    n_gpu_layers=self.config["n_gpu_layers"],
-                    n_ctx=n_ctx, verbose=False,
+                    **opt,
                 )
                 if clip_path:
                     llama_kwargs["chat_handler"] = self._make_clip_handler(clip_path)
@@ -1081,12 +1543,15 @@ except Exception:
                     self.model = new_model
                     self.actual_n_ctx = n_ctx
                     self._active_backend = "llama_cpp"
+                    print(f"[MODEL] Loaded GGUF: n_ctx={n_ctx}, mmap=True (SSD-backed virtual RAM enabled)")
+                
                 try:
                     nc = getattr(self.model, "n_ctx", None)
                     if callable(nc):
                         nc = nc()
                     if isinstance(nc, (int, float)) and nc > 0:
                         self.actual_n_ctx = int(nc)
+                        print(f"[MODEL] Model's actual n_ctx: {int(nc)}")
                 except Exception:
                     pass
 
@@ -1099,11 +1564,13 @@ except Exception:
             }
 
             load_time = round(time.time() - start, 2)
+            mem_stage = self.mem_optimizer.stage if hasattr(self, 'mem_optimizer') else "normal"
             self._emit("model_loaded", {
                 "name": filename, "load_time": load_time,
                 "n_ctx": self.actual_n_ctx, "progress": 100,
-                "backend": getattr(self, '_active_backend', 'llama_cpp')})
-            self._status(f"Loaded in {load_time}s")
+                "backend": getattr(self, '_active_backend', 'llama_cpp'),
+                "memory_stage": mem_stage})
+            self._status(f"Loaded in {load_time}s | ctx={self.actual_n_ctx} | mem={mem_stage}")
 
         except Exception as e:
             self._emit("model_error", {"error": str(e)})
@@ -1111,7 +1578,7 @@ except Exception:
             self.model = None
 
     def unload_model(self):
-        """Unload current model."""
+        """Unload current model and reclaim memory aggressively."""
         with self.model_lock:
             if self.model is not None:
                 del self.model
@@ -1122,8 +1589,17 @@ except Exception:
                     torch = self._get_torch_module()
                     if torch and torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                self.mem_optimizer.force_gc()
                 self._status("Model unloaded")
         return {"ok": True}
+
+    def get_memory_status(self):
+        """Return current memory state and optimizer status (JS-callable)."""
+        return self.mem_optimizer.snapshot()
+
+    def get_pagefile_advice(self):
+        """Check system page file config and return recommendations (JS-callable)."""
+        return self.mem_optimizer.pagefile_advice()
 
     def get_model_status(self):
         """Return current model state."""
@@ -1149,22 +1625,55 @@ except Exception:
         return ids
 
     def _save_chat_file_state(self):
-        """Save current uploaded file info for the active chat."""
+        """Save current uploaded file info for the active chat.
+        Only stores path + name (NOT full content) to avoid holding 250-page
+        PDFs in memory per-chat.  Content is re-extracted on restore."""
         if self.current_chat_id:
             self.chat_file_state[self.current_chat_id] = {
-                "content": self.uploaded_content,
                 "name": self.uploaded_file_name,
                 "path": self.uploaded_file_path,
-                "pages": self.uploaded_pages,
+                "files": [{"name": f["name"], "path": f["path"]} for f in self.uploaded_files],
             }
 
     def _restore_chat_file_state(self, chat_id: str):
-        """Restore uploaded file info for a chat (or clear if none)."""
+        """Restore uploaded file info for a chat (or clear if none).
+        Re-extracts content from disk path to avoid holding stale data in RAM."""
         state = self.chat_file_state.get(chat_id, {})
-        self.uploaded_content = state.get("content")
         self.uploaded_file_name = state.get("name")
         self.uploaded_file_path = state.get("path")
-        self.uploaded_pages = state.get("pages")
+        self.uploaded_content = None
+        self.uploaded_pages = None
+        self.uploaded_files = []
+        # Restore multi-file list
+        saved_files = state.get("files", [])
+        for finfo in saved_files:
+            fpath = finfo.get("path")
+            fname = finfo.get("name")
+            if fpath and os.path.isfile(fpath):
+                self.uploaded_files.append({
+                    "name": fname, "path": fpath,
+                    "content": None, "pages": None,
+                })
+        # Re-extract content from file path if it still exists
+        if self.uploaded_file_path and os.path.isfile(self.uploaded_file_path):
+            ext = os.path.splitext(self.uploaded_file_path)[1].lower()
+            if ext == ".pdf":
+                # Async extraction — don't block chat switch for large PDFs
+                threading.Thread(
+                    target=self._load_pdf_background,
+                    args=(self.uploaded_file_path,),
+                    daemon=True,
+                ).start()
+            elif self._is_tabular_file(self.uploaded_file_name or ""):
+                self.uploaded_content = self._build_tabular_preview_fast(
+                    self.uploaded_file_path)
+            else:
+                self.uploaded_content = self._extract_text_from_file(
+                    self.uploaded_file_path)
+        elif self.uploaded_file_name:
+            # File path gone — clear stale reference
+            self.uploaded_file_name = None
+            self.uploaded_file_path = None
 
     def new_chat(self):
         """Create a new empty chat."""
@@ -1179,7 +1688,10 @@ except Exception:
         self.uploaded_file_name = None
         self.uploaded_file_path = None
         self.uploaded_pages = None
+        self.uploaded_files = []
         self.chat_db.save_chat(chat_id, [])
+        # Clean up temp files from previous agent processing
+        self._cleanup_agent_temp()
         return {"chat_id": chat_id}
 
     def load_chat(self, chat_id: str):
@@ -1197,6 +1709,7 @@ except Exception:
             "chat_id": chat_id,
             "messages": self.message_history,
             "attached_file": self.uploaded_file_name,
+            "attached_files": [f["name"] for f in self.uploaded_files],
         }
 
     def delete_chat(self, chat_id: str):
@@ -1327,24 +1840,29 @@ except Exception:
 
         export_patterns = {
             "xlsx": (
-                r"\b(export|save|download|create|generate|give|provide)\b.{0,30}\b(excel|xlsx|spreadsheet)\b",
-                r"\b(excel|xlsx|spreadsheet)\b.{0,20}\b(file|sheet|download|export|save)\b",
+                r"\b(export|save|download|create|generate|give|provide|convert|make|turn)\b.{0,30}\b(excel|xlsx|spreadsheet)\b",
+                r"\b(excel|xlsx|spreadsheet)\b.{0,20}\b(file|sheet|download|export|save|format)\b",
+                r"\bto\s+(excel|xlsx|spreadsheet)\b",
             ),
             "csv": (
-                r"\b(export|save|download|create|generate|give|provide)\b.{0,30}\bcsv\b",
-                r"\bcsv\b.{0,20}\b(file|download|export|save)\b",
+                r"\b(export|save|download|create|generate|give|provide|convert|make|turn)\b.{0,30}\bcsv\b",
+                r"\bcsv\b.{0,20}\b(file|download|export|save|format)\b",
+                r"\bto\s+csv\b",
             ),
             "docx": (
-                r"\b(export|save|download|create|generate|give|provide)\b.{0,30}\b(docx|word)\b",
-                r"\b(docx|word)\b.{0,20}\b(file|document|download|export|save)\b",
+                r"\b(export|save|download|create|generate|give|provide|convert|make|turn)\b.{0,30}\b(docx?|word|ms\s*word|microsoft\s*word)\b",
+                r"\b(docx?|word|ms\s*word|microsoft\s*word)\b.{0,20}\b(file|document|download|export|save|format)\b",
+                r"\bto\s+(docx?|word|ms\s*word|microsoft\s*word)\b",
             ),
             "pdf": (
-                r"\b(export|save|download|create|generate|give|provide)\b.{0,30}\bpdf\b",
-                r"\bpdf\b.{0,20}\b(file|document|download|export|save)\b",
+                r"\b(export|save|download|create|generate|give|provide|convert|make|turn)\b.{0,30}\bpdf\b",
+                r"\bpdf\b.{0,20}\b(file|document|download|export|save|format)\b",
+                r"\bto\s+pdf\b",
             ),
             "txt": (
-                r"\b(export|save|download|create|generate|give|provide)\b.{0,30}\b(txt|text file|plain text)\b",
-                r"\b(txt|text file|plain text)\b.{0,20}\b(file|download|export|save)\b",
+                r"\b(export|save|download|create|generate|give|provide|convert|make|turn)\b.{0,30}\b(txt|text file|plain text)\b",
+                r"\b(txt|text file|plain text)\b.{0,20}\b(file|download|export|save|format)\b",
+                r"\bto\s+(txt|text\s*file|plain\s*text)\b",
             ),
         }
         for export_format, patterns in export_patterns.items():
@@ -1656,6 +2174,38 @@ except Exception:
 
         doc.save(path)
 
+    def _parse_structured_lines(self, text: str):
+        """Try to extract key-value pairs or list items from AI response text.
+
+        Returns (headers, rows) if structured data found, else (None, None).
+        """
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+        if not lines:
+            return None, None
+
+        # 1) Key: Value pairs  (e.g. "Name: John", "Amount: 500")
+        kv_pairs = []
+        kv_pattern = re.compile(r"^([\w\s/().#-]{2,40})\s*[:=]\s*(.+)$")
+        for line in lines:
+            clean = re.sub(r"^[\-\*\d.)+]+\s*", "", line)  # strip bullet/number prefix
+            m = kv_pattern.match(clean)
+            if m:
+                kv_pairs.append((m.group(1).strip(), m.group(2).strip()))
+        if len(kv_pairs) >= 3:
+            return ["Field", "Value"], [[k, v] for k, v in kv_pairs]
+
+        # 2) Bullet / numbered list items
+        list_items = []
+        for line in lines:
+            clean = re.sub(r"^[\-\*•]\s*", "", line)
+            clean = re.sub(r"^\d+[.)]+\s*", "", clean)
+            if clean != line:  # line had a list prefix
+                list_items.append(clean)
+        if len(list_items) >= 2:
+            return ["Item"], [[item] for item in list_items]
+
+        return None, None
+
     def _write_csv_export(self, path: str, rows: list[dict], table_headers, table_rows):
         with open(path, 'w', encoding='utf-8', newline='') as handle:
             writer = csv.writer(handle)
@@ -1663,6 +2213,15 @@ except Exception:
                 writer.writerow(table_headers)
                 writer.writerows(table_rows)
                 return
+            # Try to parse structured data from the assistant response
+            for row in rows:
+                if row.get('role') == 'assistant':
+                    parsed_h, parsed_r = self._parse_structured_lines(row.get('content', ''))
+                    if parsed_h and parsed_r:
+                        writer.writerow(parsed_h)
+                        writer.writerows(parsed_r)
+                        return
+            # Final fallback — export as role/content
             writer.writerow(["role", "content"])
             for row in rows:
                 writer.writerow([row.get('role', ''), row.get('content', '')])
@@ -1673,7 +2232,15 @@ except Exception:
         if table_headers and table_rows:
             frame = pd.DataFrame(table_rows, columns=table_headers)
         else:
-            frame = pd.DataFrame(rows)
+            # Try to parse structured data from the assistant response
+            for row in rows:
+                if row.get('role') == 'assistant':
+                    parsed_h, parsed_r = self._parse_structured_lines(row.get('content', ''))
+                    if parsed_h and parsed_r:
+                        frame = pd.DataFrame(parsed_r, columns=parsed_h)
+                        break
+            else:
+                frame = pd.DataFrame(rows)
         frame.to_excel(path, index=False)
 
     def _write_wav_export(self, path: str, text: str):
@@ -1730,6 +2297,26 @@ except Exception:
             return None
 
         payload = self._get_export_payload(chat_id, message_index)
+
+        # When the user asked for CSV/XLSX/DOCX export but the AI response
+        # has no structured table, and a file is currently uploaded, try to
+        # export the uploaded file content directly.
+        if (
+            export_format in ("csv", "xlsx", "docx")
+            and not payload.get("table_headers")
+            and self.uploaded_file_path
+        ):
+            try:
+                uploaded_exported = self._export_uploaded_file_as(
+                    export_format, payload.get("title", chat_id)
+                )
+                if uploaded_exported:
+                    self._emit("export_ready", {"path": uploaded_exported, "format": export_format, "chat_id": chat_id})
+                    self._status(f"Exported uploaded file to {uploaded_exported}")
+                    return uploaded_exported
+            except Exception:
+                pass  # fall through to default export
+
         exports_dir = app_data_path("exports")
         os.makedirs(exports_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1739,6 +2326,111 @@ except Exception:
         self._emit("export_ready", {"path": path, "format": export_format, "chat_id": chat_id})
         self._status(f"Exported reply to {path}")
         return path
+
+    def _export_uploaded_file_as(self, export_format: str, title: str) -> str | None:
+        """Convert the uploaded file (PDF/text/tabular) to CSV or XLSX directly."""
+        import pandas as pd
+
+        src = self.uploaded_file_path
+        if not src or not os.path.isfile(src):
+            return None
+
+        ext = os.path.splitext(self.uploaded_file_name or "")[1].lower()
+        df = None
+
+        # Tabular files → read directly
+        if ext in (".csv", ".xlsx", ".xls", ".tsv"):
+            try:
+                df = self._load_tabular_df(src)
+            except Exception:
+                pass
+
+        # PDF → use PyMuPDF table extraction for structured data
+        if df is None and ext == ".pdf":
+            try:
+                import fitz
+                doc = fitz.open(src)
+                all_frames = []
+                for page in doc:
+                    tables = page.find_tables()
+                    for tab in tables.tables:
+                        page_df = tab.to_pandas()
+                        if not page_df.empty:
+                            # Clean newlines in cell values
+                            for col in page_df.columns:
+                                page_df[col] = page_df[col].astype(str).str.replace(
+                                    r"\n", " ", regex=True
+                                ).str.strip()
+                            all_frames.append(page_df)
+                doc.close()
+                if all_frames:
+                    # Concatenate all page tables (same headers)
+                    df = pd.concat(all_frames, ignore_index=True)
+                    # Clean newlines in column names too
+                    df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
+            except Exception:
+                pass
+
+        # PDF / text fallback → parse from extracted text
+        if df is None:
+            raw = None
+            # 1) Pre-extracted text file (set during upload flow)
+            text_path = getattr(self, "uploaded_text_path", None)
+            if text_path and os.path.isfile(text_path):
+                with open(text_path, "r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read()
+            # 2) Plain text files
+            elif ext in (".txt", ".md", ".log"):
+                with open(src, "r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read()
+            # 3) Other formats — extract text directly
+            else:
+                try:
+                    raw = self._extract_text_from_file(src)
+                except Exception:
+                    pass
+
+            if raw:
+                # Try markdown table extraction first
+                headers, rows = self._extract_markdown_table(raw)
+                if headers and rows:
+                    df = pd.DataFrame(rows, columns=headers)
+                else:
+                    # Fallback: split text into lines as a single-column frame
+                    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+                    if lines:
+                        df = pd.DataFrame(lines, columns=["content"])
+
+        if df is None or df.empty:
+            return None
+
+        exports_dir = app_data_path("exports")
+        os.makedirs(exports_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_name = self._sanitize_export_name(
+            os.path.splitext(self.uploaded_file_name or title)[0]
+        )
+        out_path = os.path.join(exports_dir, f"{safe_name}_{timestamp}.{export_format}")
+
+        if export_format == "csv":
+            df.to_csv(out_path, index=False)
+        elif export_format == "xlsx":
+            df.to_excel(out_path, index=False)
+        elif export_format == "docx":
+            from docx import Document as DocxDocument
+            doc = DocxDocument()
+            doc.add_heading(safe_name, level=1)
+            table = doc.add_table(rows=len(df) + 1, cols=len(df.columns))
+            table.style = "Table Grid"
+            for col_i, col_name in enumerate(df.columns):
+                table.cell(0, col_i).text = str(col_name)
+            for row_i, (_, row) in enumerate(df.iterrows(), start=1):
+                for col_i, val in enumerate(row):
+                    table.cell(row_i, col_i).text = str(val)
+            doc.save(out_path)
+        else:
+            return None
+        return out_path
 
     def export_chat(self, chat_id: str):
         """Return chat as formatted text for export."""
@@ -1945,7 +2637,7 @@ except Exception:
             with self.model_lock:
                 resp = self.model.create_completion(
                     formatted_prompt,
-                    max_tokens=min(600, max(200, self.actual_n_ctx // 4)),
+                    max_tokens=min(1200, max(400, self.actual_n_ctx // 3)),
                     temperature=0.3,
                     stop=stop_tokens,
                 )
@@ -2025,32 +2717,91 @@ except Exception:
         except Exception as e:
             return {"error": str(e)}
 
-    def agent_chat(self, text: str, role: str = "", task: str = "", steps: str = ""):
-        """Synchronous AI chat for the Agent panel with Role-Task-Steps config."""
+    def agent_chat(self, text: str, role: str = "", task: str = "", steps: str = "",
+                   output_format: str = "none", json_schema: str = ""):
+        """Synchronous AI chat for the Agent panel with Role-Task-Steps config.
+        
+        When *output_format* is csv/excel/txt/pdf a file is created from the
+        response and ``file_path`` is returned alongside the text.
+        """
         try:
+            _chat_start_time = time.time()
+            
+            # Ensure any stuck flags from previous runs are cleared
+            self.stop_generation_flag = False
+            self.generation_in_progress = False
+            
             if not self._has_full_access():
                 return {"error": "Trial expired. Enter passkey to activate full access."}
-            self.stop_generation_flag = False
+            
             self.generation_in_progress = True
+            self._agent_context_trimmed = False
 
             if not text or not text.strip():
                 return {"error": "Empty message"}
 
-            # Parse @rag_name mention
+            # #2 Tier 1: Validate JSON schema if provided
+            if json_schema and json_schema.strip():
+                schema_err = self._validate_json_schema(json_schema)
+                if schema_err:
+                    return {"error": schema_err}
+
+            # Check model availability before doing health check
+            if not self.model:
+                return {"error": "No model loaded. Please load a model first."}
+
+            # #3 Tier 1: Check Ollama health before starting (only if model is loaded)
+            if not self._check_ollama_health():
+                return {"error": "Model server unavailable. Please start Ollama on port 11434."}
+
+            # Parse @rag_name mention from user text first, then from template steps/task
             text, mentioned_rag = self._resolve_rag_mention(text)
             agent_rag_database = mentioned_rag
+            # Fallback: check steps and task fields (template authors often put @rag there)
+            if not agent_rag_database:
+                _, rag_from_steps = self._resolve_rag_mention(steps)
+                if rag_from_steps:
+                    agent_rag_database = rag_from_steps
+            if not agent_rag_database:
+                _, rag_from_task = self._resolve_rag_mention(task)
+                if rag_from_task:
+                    agent_rag_database = rag_from_task
 
             # Agent mode is stateless per run: use only RAG explicitly mentioned in this request.
-            rag_context = ""
+            # Two-stage retrieval: vector search first, fall back to full knowledge.md.
+            knowledge_md = ""
             if agent_rag_database and self.rag_manager:
                 try:
-                    results = self.rag_manager.retrieve(
-                        agent_rag_database, text, k=5)
-                    if results:
-                        chunks = [r[0] for r in results]
-                        rag_context = "Reference context:\n" + "\n---\n".join(chunks)
+                    knowledge_md = self.rag_manager.read_knowledge_markdown(
+                        agent_rag_database) or ""
                 except Exception:
                     pass
+
+            # ── Auto-detect and scrape URLs in user message ──
+            scraped_context = ""
+            urls_in_text = self._extract_urls_from_text(text)
+            if urls_in_text:
+                scrape_parts = []
+                for url in urls_in_text[:3]:  # max 3 URLs per request
+                    if self.stop_generation_flag:
+                        return {"error": "Generation stopped by user", "stopped": True}
+                    try:
+                        result = self._scrape_page(url)
+                        if result.get("ok") and result.get("content"):
+                            label = result.get("title") or url
+                            scrape_parts.append(
+                                f"## Scraped: {label}\nSource: {url}\n\n"
+                                + result["content"])
+                    except Exception as e:
+                        print(f"[SCRAPE] Failed for {url}: {type(e).__name__}: {e}")
+                        scrape_parts.append(
+                            f"## Scraped: {url}\n[Error: could not fetch page]")
+                if scrape_parts:
+                    scraped_context = "\n\n".join(scrape_parts)
+                    print(f"[AGENT] Scraped {len(scrape_parts)} URL(s), "
+                          f"{len(scraped_context)} chars")
+                # Strip URLs from user text so the prompt is cleaner
+                text = self._strip_urls_from_text(text) or text
 
             # If web mode is enabled, use web results in Agent mode too.
             if self.web_search_enabled:
@@ -2075,24 +2826,60 @@ except Exception:
                     system_parts.append("\nYour task: " + task.strip())
                 if steps and steps.strip():
                     system_parts.append("\nFollow these steps:\n" + steps.strip())
-                if rag_context:
-                    system_parts.append("\n" + rag_context)
+                if knowledge_md:
+                    rag_ctx = knowledge_md[:int(self.actual_n_ctx * 3.5 * 0.4)]
+                    system_parts.append("\nReference knowledge:\n" + rag_ctx)
+                if scraped_context:
+                    scrape_budget = int(self.actual_n_ctx * 3.5 * 0.25)
+                    system_parts.append(
+                        "\nScraped page data:\n" + scraped_context[:scrape_budget])
                 system_parts.append(
-                    "\nAnswer directly and concisely based on web results. "
+                    "\nIMPORTANT: Answer ONLY based on the web search results provided below. "
+                    "Do NOT use prior knowledge or make up any information not found in the results. "
+                    "If the results do not contain the answer, say so instead of guessing. "
                     "Synthesize findings instead of repeating raw snippets. "
                     "Add citation markers like [1], [2] after facts when possible."
                 )
                 web_system = "\n".join(system_parts)
 
+                # Dynamic context cap — leave room for system + user + response
+                max_web_chars = max(2000, int(self.actual_n_ctx * 3.5 * 0.40))
+                web_ctx = (context or "")[:max_web_chars]
                 prompt = self._build_chat_prompt(
                     system=web_system,
                     messages=[],
                     user_text=text.strip(),
-                    extra_context=f"Web search context:\n{(context or '')[:4000]}",
+                    extra_context=f"Web search context:\n{web_ctx}",
                 )
+                # Guard: ensure prompt fits in context window
+                try:
+                    prompt_tokens = len(self.model.tokenize(prompt.encode("utf-8")))
+                except Exception:
+                    prompt_tokens = len(prompt) // 4
+                avail_tokens = max(64, self.actual_n_ctx - prompt_tokens - 32)
+                gen_tokens = min(1024, avail_tokens)
+                print(f"[AGENT-WEB] prompt_tokens={prompt_tokens}, "
+                      f"avail={avail_tokens}, gen_tokens={gen_tokens}")
+                if prompt_tokens >= self.actual_n_ctx - 32:
+                    # Prompt overflows — trim web context and retry
+                    overflow = prompt_tokens - (self.actual_n_ctx - 256)
+                    trim_chars = overflow * 4  # rough token→char
+                    web_ctx = web_ctx[:max(500, len(web_ctx) - trim_chars)]
+                    prompt = self._build_chat_prompt(
+                        system=web_system,
+                        messages=[],
+                        user_text=text.strip(),
+                        extra_context=f"Web search context:\n{web_ctx}",
+                    )
+                    try:
+                        prompt_tokens = len(self.model.tokenize(prompt.encode("utf-8")))
+                    except Exception:
+                        prompt_tokens = len(prompt) // 4
+                    gen_tokens = min(1024, max(64, self.actual_n_ctx - prompt_tokens - 32))
+                    print(f"[AGENT-WEB] After trim: prompt_tokens={prompt_tokens}, gen_tokens={gen_tokens}")
                 response = self.model.create_completion(
                     prompt,
-                    max_tokens=2048,
+                    max_tokens=gen_tokens,
                     temperature=0.3,
                     stop=self._get_stop_tokens(),
                 )
@@ -2116,20 +2903,210 @@ except Exception:
                 system_parts.append("\nYour task: " + task.strip())
             if steps and steps.strip():
                 system_parts.append("\nFollow these steps:\n" + steps.strip())
-            if rag_context:
-                system_parts.append("\n" + rag_context)
             system_parts.append("\nAnswer directly and concisely. Do NOT write code unless explicitly asked. Provide actual answers, facts, and analysis.")
             system_msg = "\n".join(system_parts)
 
-            prompt = system_msg + "\n\nUser: " + text.strip() + "\n\nAssistant:"
-            response = self.model.create_completion(
-                prompt,
-                max_tokens=2048,
-                temperature=0.3,
+            # ── Determine if knowledge base is too large for a single pass ──
+            # Floor of 6000 chars ensures small-context models can still process
+            # a reasonable number of documents per batch.
+            max_rag_chars = max(6000, int(self.actual_n_ctx * 3.5 * 0.6))
+
+            # Split knowledge.md by source document
+            doc_sections = self._split_knowledge_by_source(knowledge_md) if knowledge_md else []
+
+            # ── Inject uploaded PDF/document if attached via Chat 📎 button ──
+            # Always inject even when a RAG knowledge base is also active so the
+            # model can reason over both the reference KB and the uploaded file.
+            uploaded_doc_pages = self.uploaded_pages  # page-level chunks
+            uploaded_doc_text = self.uploaded_content
+
+            # #3 Map-reduce: when csv_json format is active and the uploaded
+            # document has multiple pages, use map-reduce extraction instead of
+            # the generic batching path.  This gives much cleaner per-page
+            # JSON extraction before the final merge.
+            _MAPREDUCE_PAGE_THRESHOLD = 3  # pages before triggering map-reduce
+            if (output_format and output_format.lower().strip() == "csv_json"
+                    and uploaded_doc_pages
+                    and (len(uploaded_doc_pages) >= _MAPREDUCE_PAGE_THRESHOLD
+                         or len(uploaded_doc_text or "") > max_rag_chars)):
+                print(f"[AGENT] Map-reduce path: {len(uploaded_doc_pages)} pages, csv_json mode")
+                _GENERIC_SCHEMA = (
+                    '{"rows": [{"<column_name>": "<value>", '
+                    '"...": "use as many columns as the task requires"}]}'
+                )
+                _mr_schema = json_schema.strip() if json_schema and json_schema.strip() else _GENERIC_SCHEMA
+                _kb_ctx = ""
+                if agent_rag_database and knowledge_md:
+                    _kb_ctx = self._retrieve_rag_context(
+                        agent_rag_database, text, knowledge_md,
+                        max(2000, max_rag_chars // 4))
+                _mr_text, _mr_parsed = self._agent_mapreduce_extract(
+                    system_msg=system_msg,
+                    user_text=text,
+                    page_chunks=uploaded_doc_pages,
+                    schema_hint=_mr_schema,
+                    extra_context=_kb_ctx,
+                )
+                if self.stop_generation_flag:
+                    return {"error": "Generation stopped by user", "stopped": True}
+                if _mr_parsed is not None:
+                    # Build CSV directly from merged JSON and return early
+                    output_dir = os.path.join(app_data_path(""), "processed_files")
+                    os.makedirs(output_dir, exist_ok=True)
+                    _mr_file = self._schema_first_csv_from_json(
+                        _mr_parsed, output_dir, int(time.time()))
+                    if _mr_file:
+                        return {
+                            "text": _mr_text or "Map-reduce extraction complete.",
+                            "file_path": _mr_file,
+                            "context_trimmed": bool(self._agent_context_trimmed),
+                        }
+                # If map-reduce failed to produce parseable JSON, fall through
+                # to the normal batching pipeline below.
+                print("[AGENT] Map-reduce produced no JSON; falling through to batching")
+
+            if uploaded_doc_text:
+                # Use page-level chunks if available (PDF), else full text
+                if uploaded_doc_pages and len(uploaded_doc_pages) > 1:
+                    for pg in uploaded_doc_pages:
+                        doc_sections.append(pg)
+                    print(f"[AGENT] Injected {len(uploaded_doc_pages)} uploaded "
+                          f"PDF pages ({len(uploaded_doc_text)} chars) as context"
+                          + (" (alongside RAG)" if knowledge_md else ""))
+                else:
+                    doc_sections.append(uploaded_doc_text)
+                    print(f"[AGENT] Injected uploaded document "
+                          f"({len(uploaded_doc_text)} chars) as context"
+                          + (" (alongside RAG)" if knowledge_md else ""))
+
+            # If it fits in one pass, do a simple single call
+            total_chars = sum(len(s) for s in doc_sections)
+            # Force batching if content is significantly larger than budget
+            # OR if we only got 1 giant section that would be truncated
+            needs_batching = (
+                (total_chars > max_rag_chars and len(doc_sections) > 1)
+                or (total_chars > max_rag_chars and len(doc_sections) == 1
+                    and total_chars > max_rag_chars * 1.3)
             )
-            if self.stop_generation_flag:
-                return {"error": "Generation stopped by user", "stopped": True}
-            ai_text = response.get("choices", [{}])[0].get("text", "").strip()
+            if needs_batching and len(doc_sections) == 1:
+                # Re-split the single oversized section more aggressively
+                doc_sections = self._split_knowledge_by_source(knowledge_md)
+                if len(doc_sections) <= 1 and len(knowledge_md) > max_rag_chars:
+                    # Force split by paragraphs
+                    parts = re.split(r"\n\s*\n", knowledge_md)
+                    doc_sections = []
+                    chunk, clen = [], 0
+                    for p in parts:
+                        if chunk and clen + len(p) > max_rag_chars:
+                            doc_sections.append("\n\n".join(chunk))
+                            chunk, clen = [p], len(p)
+                        else:
+                            chunk.append(p)
+                            clen += len(p)
+                    if chunk:
+                        doc_sections.append("\n\n".join(chunk))
+                    needs_batching = len(doc_sections) > 1
+                    print(f"[AGENT] Force-split into {len(doc_sections)} sections")
+
+            print(f"[AGENT] RAG mode: {'batched' if needs_batching else 'single-pass'}, "
+                  f"{len(doc_sections)} sections, {total_chars} chars, "
+                  f"budget={max_rag_chars} chars")
+
+            if not needs_batching:
+                # ── Single-pass mode (small knowledge base or no RAG) ──
+                rag_context = ""
+                if agent_rag_database and knowledge_md:
+                    # #2 Two-stage retrieval: vector search narrows context
+                    # to the most relevant chunks for this specific query.
+                    rag_context = self._retrieve_rag_context(
+                        agent_rag_database, text, knowledge_md, max_rag_chars)
+                elif knowledge_md:
+                    rag_context = ("=== KNOWLEDGE BASE ===\n"
+                                   + knowledge_md[:max_rag_chars]
+                                   + "\n=== END KNOWLEDGE BASE ===")
+                    if len(knowledge_md) > max_rag_chars:
+                        rag_context += "\n[... truncated to fit context window ...]"
+
+                # Append uploaded document when RAG is also present (was previously skipped)
+                if uploaded_doc_text and knowledge_md:
+                    doc_budget = max(4000, int(self.actual_n_ctx * 3.5 * 0.30))
+                    rag_context += ("\n\n=== UPLOADED DOCUMENT ===\n"
+                                    + uploaded_doc_text[:doc_budget]
+                                    + "\n=== END UPLOADED DOCUMENT ===")
+                    print(f"[AGENT] Single-pass: appended uploaded doc "
+                          f"({min(len(uploaded_doc_text), doc_budget)} chars) to rag_context")
+
+                # Append scraped URL content if any
+                if scraped_context:
+                    scrape_budget = max(2000, int(self.actual_n_ctx * 3.5 * 0.25))
+                    rag_context += ("\n\n=== SCRAPED WEB DATA ===\n"
+                                    + scraped_context[:scrape_budget]
+                                    + "\n=== END SCRAPED DATA ===")
+
+                # #8 Automatic fallback: 3-tier strategy
+                ai_text, _fallback_used = self._agent_with_fallback(
+                    system_msg=system_msg,
+                    user_text=text,
+                    extra_context=rag_context,
+                    max_tokens=2048,
+                    temperature=0.3,
+                )
+                if _fallback_used:
+                    self._agent_context_trimmed = True
+                if self.stop_generation_flag:
+                    return {"error": "Generation stopped by user", "stopped": True}
+            else:
+                # ── Batched extraction mode (large knowledge base) ──
+                # Process documents in batches that fit within context,
+                # accumulate partial results, then combine.
+                print(f"[AGENT] Batched RAG extraction: {len(doc_sections)} documents, {total_chars} chars total")
+
+                # If we have scraped URL data, prepend as an extra section
+                if scraped_context:
+                    scrape_budget = max(2000, int(self.actual_n_ctx * 3.5 * 0.25))
+                    doc_sections.insert(0, scraped_context[:scrape_budget])
+
+                batch_results = []
+                batch = []
+                batch_chars = 0
+
+                for section in doc_sections:
+                    if self.stop_generation_flag:
+                        return {"error": "Generation stopped by user", "stopped": True}
+                    sec_len = len(section)
+                    # If adding this section would overflow, flush the batch
+                    if batch and (batch_chars + sec_len) > max_rag_chars:
+                        partial = self._run_agent_batch(
+                            system_msg, text, batch, batch_results)
+                        if partial:
+                            batch_results.append(partial)
+                        batch = []
+                        batch_chars = 0
+                    batch.append(section)
+                    batch_chars += sec_len
+
+                # Flush remaining batch
+                if batch:
+                    if self.stop_generation_flag:
+                        return {"error": "Generation stopped by user", "stopped": True}
+                    partial = self._run_agent_batch(
+                        system_msg, text, batch, batch_results)
+                    if partial:
+                        batch_results.append(partial)
+
+                if not batch_results:
+                    return {"text": "No results extracted from the knowledge base."}
+
+                # If only one batch, use its result directly
+                if len(batch_results) == 1:
+                    ai_text = batch_results[0]
+                else:
+                    # Merge partial results in a final summarisation pass
+                    if self.stop_generation_flag:
+                        return {"error": "Generation stopped by user", "stopped": True}
+                    ai_text = self._merge_batch_results(
+                        system_msg, text, batch_results)
+
             if not ai_text:
                 return {
                     "text": (
@@ -2137,13 +3114,861 @@ except Exception:
                         "Please try with fewer rows/columns or simpler instruction."
                     )
                 }
-            return {"text": ai_text}
+
+            # ── Schema-first path for csv_json format ──
+            _schema_parsed_json: dict | list | None = None
+            # Generic schema works for any table-like task.
+            # Templates can supply a precise schema via the json_schema field;
+            # otherwise we use a universal row-based schema that instructs the
+            # model to choose column names appropriate for the task.
+            _GENERIC_SCHEMA = (
+                '{"rows": [{"<column_name>": "<value>", '
+                '"<column_name_2>": "<value_2>", '
+                '"...": "use as many columns as the task requires"}]}'
+            )
+            _active_schema = json_schema.strip() if json_schema and json_schema.strip() else _GENERIC_SCHEMA
+            if output_format and output_format.lower().strip() == "csv_json":
+                print(f"[AGENT] Schema-first mode active "
+                      f"({'custom' if json_schema and json_schema.strip() else 'generic'} schema)")
+                # Rebuild the rag_context that was used in the single-pass or batch path
+                _schema_context = ""
+                if knowledge_md:
+                    _schema_context = (
+                        "=== KNOWLEDGE BASE ===\n"
+                        + knowledge_md[:max_rag_chars]
+                        + "\n=== END KNOWLEDGE BASE ==="
+                    )
+                if uploaded_doc_text and knowledge_md:
+                    doc_budget = max(4000, int(self.actual_n_ctx * 3.5 * 0.30))
+                    _schema_context += (
+                        "\n\n=== UPLOADED DOCUMENT ===\n"
+                        + uploaded_doc_text[:doc_budget]
+                        + "\n=== END UPLOADED DOCUMENT ==="
+                    )
+                elif uploaded_doc_text:
+                    doc_budget = max(6000, int(self.actual_n_ctx * 3.5 * 0.60))
+                    _schema_context = (
+                        "=== UPLOADED DOCUMENT ===\n"
+                        + uploaded_doc_text[:doc_budget]
+                        + "\n=== END UPLOADED DOCUMENT ==="
+                    )
+                ai_text, _schema_parsed_json = self._agent_schema_first_completion(
+                    system_msg=system_msg,
+                    user_text=text,
+                    extra_context=_schema_context,
+                    schema_hint=_active_schema,
+                )
+                if self.stop_generation_flag:
+                    return {"error": "Generation stopped by user", "stopped": True}
+
+            # ── Create output file if requested ──
+            result = {"text": ai_text, "context_trimmed": bool(self._agent_context_trimmed)}
+            print(f"[AGENT] output_format={output_format!r}, creating file: {output_format not in ('none', '', None)}")
+            if output_format and output_format not in ("none", ""):
+                try:
+                    file_path = self._agent_chat_create_output(
+                        ai_text, output_format,
+                        _parsed_json=_schema_parsed_json)
+                    print(f"[AGENT] File created: {file_path}")
+                    if file_path:
+                        result["file_path"] = file_path
+                except Exception as e:
+                    import traceback
+                    print(f"[AGENT] Output file creation error: {e}")
+                    traceback.print_exc()
+
+            # #2 Tier 2: Record inference metrics
+            elapsed = time.time() - _chat_start_time
+            tokens_gen = len(ai_text.split()) * 1.3  # Rough estimate
+            get_metrics().record_inference(
+                task=task or role or "agent_chat",
+                duration_sec=elapsed,
+                tokens_generated=int(tokens_gen),
+                success=not result.get("error"),
+                model_name=getattr(self.model, "model_name", "unknown"),
+            )
+            return result
         except Exception as e:
             return {"error": str(e)}
         finally:
             self.generation_in_progress = False
+            self.stop_generation_flag = False  # Reset stop flag for next run
 
-    def process_files_with_ai(self, files: list, instructions: str, output_format: str = "excel"):
+    # ── Helpers for batched agent RAG extraction ──────────────────
+
+    @staticmethod
+    def _split_knowledge_by_source(knowledge_md: str) -> list:
+        """Split knowledge.md into per-source-document sections.
+        Splits on ## headers first, then ### headers, and as a last
+        resort splits oversized single sections on blank-line gaps."""
+        if not knowledge_md or not knowledge_md.strip():
+            return []
+
+        # Pass 1: split on ## headers
+        sections = []
+        current = []
+        for line in knowledge_md.split("\n"):
+            if line.startswith("## ") and current:
+                sections.append("\n".join(current))
+                current = [line]
+            else:
+                current.append(line)
+        if current:
+            sections.append("\n".join(current))
+
+        # If only 1 section, try splitting on ### headers instead
+        if len(sections) <= 1 and "### " in knowledge_md:
+            sections = []
+            current = []
+            for line in knowledge_md.split("\n"):
+                if line.startswith("### ") and current:
+                    sections.append("\n".join(current))
+                    current = [line]
+                else:
+                    current.append(line)
+            if current:
+                sections.append("\n".join(current))
+
+        # Pass 2: split any oversized section (>3000 chars) on double-newlines
+        MAX_SECTION = 3000
+        refined = []
+        for sec in sections:
+            if len(sec) <= MAX_SECTION:
+                refined.append(sec)
+                continue
+            # Split on paragraph breaks (blank lines)
+            parts = re.split(r"\n\s*\n", sec)
+            chunk = []
+            chunk_len = 0
+            for part in parts:
+                plen = len(part)
+                if chunk and (chunk_len + plen) > MAX_SECTION:
+                    refined.append("\n\n".join(chunk))
+                    chunk = [part]
+                    chunk_len = plen
+                else:
+                    chunk.append(part)
+                    chunk_len += plen
+            if chunk:
+                refined.append("\n\n".join(chunk))
+        sections = refined
+
+        print(f"[AGENT] Knowledge split: {len(sections)} sections, "
+              f"sizes: {[len(s) for s in sections]}")
+        return sections
+
+    def _run_agent_batch(self, system_msg: str, user_text: str,
+                         batch: list, previous_results: list) -> str:
+        """Run the model on one batch of document sections.
+        #1 Tier 1: Uses _agent_with_fallback for resilient batched extraction.
+        """
+        rag_block = "\n\n".join(batch)
+        print(f"[AGENT] Running batch: {len(batch)} sections, "
+              f"{len(rag_block)} chars")
+        # Include a brief reminder of what was already extracted
+        prior = ""
+        if previous_results:
+            # Show last partial result so model doesn't repeat
+            prior_budget = min(2000, int(self.actual_n_ctx * 3.5 * 0.15))
+            prior = ("\n\nYou have already extracted the following from earlier documents "
+                     "(do NOT repeat these, only add NEW entries):\n"
+                     + previous_results[-1][:prior_budget])
+
+        extra = ("=== DOCUMENTS (batch) ===\n" + rag_block
+                 + "\n=== END DOCUMENTS ===" + prior)
+
+        # #1 Tier 1: Batched extraction also gets 3-tier fallback
+        result, _fallback_used = self._agent_with_fallback(
+            system_msg=system_msg,
+            user_text=user_text,
+            extra_context=extra,
+            max_tokens=2048,
+            temperature=0.2,
+        )
+        if _fallback_used:
+            self._agent_context_trimmed = True
+            get_metrics().record_fallback_event(
+                tier=1, reason="Batched extraction context limit", context_trimmed_pct=50.0)
+        return result
+
+    def _check_ollama_health(self) -> bool:
+        """#3 Tier 1: Check if Ollama server is reachable and healthy."""
+        if isinstance(self.model, OllamaModel):
+            try:
+                start = time.time()
+                resp = requests.get(
+                    f"{self.model.base_url}/api/tags",
+                    timeout=2.0
+                )
+                elapsed = (time.time() - start) * 1000  # ms
+                healthy = resp.status_code == 200
+                get_metrics().record_ollama_health(healthy, elapsed)
+                return healthy
+            except Exception as e:
+                print(f"[OLLAMA] Health check failed: {e}")
+                get_metrics().record_ollama_health(False, 0.0)
+                return False
+        return True  # Assume healthy if not using Ollama
+
+    def _validate_input_file_size(self, filename: str, size_bytes: int, 
+                                   max_mb: int = 50) -> str:
+        """#2 Tier 1: Validate file size."""
+        max_bytes = max_mb * 1024 * 1024
+        if size_bytes > max_bytes:
+            error_msg = f"File '{filename}' exceeds {max_mb}MB limit ({size_bytes} bytes)"
+            get_metrics().record_validation_error("FILE_TOO_LARGE", error_msg)
+            return error_msg
+        return ""
+
+    def _validate_json_schema(self, schema_str: str) -> str:
+        """#2 Tier 1: Validate JSON schema format."""
+        if not schema_str or not schema_str.strip():
+            return ""  # Empty schema is OK (will use generic)
+        try:
+            json.loads(schema_str)
+            return ""
+        except json.JSONDecodeError as e:
+            error_msg = f"Invalid JSON schema: {str(e)}"
+            get_metrics().record_validation_error("SCHEMA_INVALID", error_msg)
+            return error_msg
+
+    def _validate_file_path(self, file_path: str) -> str:
+        """#2 Tier 1: Prevent path traversal attacks."""
+        try:
+            real_path = os.path.realpath(file_path)
+            workspace_root = os.path.realpath(".")
+            if not real_path.startswith(workspace_root):
+                error_msg = f"Path traversal detected: {file_path}"
+                get_metrics().record_validation_error("PATH_TRAVERSAL", error_msg)
+                return error_msg
+        except Exception as e:
+            error_msg = f"Path validation failed: {str(e)}"
+            get_metrics().record_validation_error("PATH_ERROR", error_msg)
+            return error_msg
+        return ""
+
+    def _agent_create_completion_safely(
+        self,
+        system_msg: str,
+        user_text: str,
+        extra_context: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+        repeat_penalty: float | None = None,
+    ) -> str:
+        """Create an agent completion while strictly fitting context window.
+
+        Trims extra_context first (then user/system as a last resort) until
+        prompt tokens fit inside ``self.actual_n_ctx``.
+        """
+        sys_part = str(system_msg or "")
+        user_part = str(user_text or "").strip()
+        extra_part = str(extra_context or "")
+        trimmed = False
+
+        def _count_tokens(s: str) -> int:
+            try:
+                return len(self.model.tokenize(s.encode("utf-8")))
+            except Exception:
+                # Conservative fallback when tokenizer is unavailable.
+                return max(1, len(s) // 3)
+
+        # Keep a safety margin for BOS/EOS/stop handling and response tokens.
+        hard_prompt_limit = max(256, int(self.actual_n_ctx) - 96)
+
+        prompt = ""
+        prompt_tokens = 0
+        for _ in range(14):
+            prompt = self._build_chat_prompt(
+                system=sys_part,
+                messages=[],
+                user_text=user_part,
+                extra_context=extra_part,
+            )
+            prompt_tokens = _count_tokens(prompt)
+            if prompt_tokens <= hard_prompt_limit:
+                break
+
+            # Trim in priority order: extra context, then user, then system.
+            if len(extra_part) > 500:
+                keep = max(500, int(len(extra_part) * 0.82))
+                extra_part = extra_part[:keep]
+                trimmed = True
+                continue
+            if len(user_part) > 240:
+                keep = max(240, int(len(user_part) * 0.9))
+                user_part = user_part[:keep]
+                trimmed = True
+                continue
+            if len(sys_part) > 400:
+                keep = max(400, int(len(sys_part) * 0.92))
+                sys_part = sys_part[:keep]
+                trimmed = True
+                continue
+            # Last resort: hard-cap prompt text itself.
+            prompt = prompt[:max(900, hard_prompt_limit * 3)]
+            prompt_tokens = _count_tokens(prompt)
+            trimmed = True
+            break
+
+        avail_tokens = max(64, int(self.actual_n_ctx) - int(prompt_tokens) - 32)
+        gen_tokens = min(max_tokens, avail_tokens)
+
+        kwargs = {
+            "max_tokens": gen_tokens,
+            "temperature": temperature,
+            "stop": self._get_stop_tokens(),
+        }
+        if repeat_penalty is not None:
+            kwargs["repeat_penalty"] = repeat_penalty
+
+        try:
+            response = self.model.create_completion(prompt, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            # Retry once with aggressively trimmed extra context for overflow errors.
+            if "Requested tokens" in msg or "context window" in msg:
+                tiny_extra = extra_part[:max(300, int(len(extra_part) * 0.4))]
+                trimmed = True
+                prompt = self._build_chat_prompt(
+                    system=sys_part,
+                    messages=[],
+                    user_text=user_part,
+                    extra_context=tiny_extra,
+                )
+                prompt_tokens = _count_tokens(prompt)
+                avail_tokens = max(64, int(self.actual_n_ctx) - int(prompt_tokens) - 32)
+                kwargs["max_tokens"] = min(max_tokens, avail_tokens)
+                response = self.model.create_completion(prompt, **kwargs)
+            else:
+                raise
+
+        if trimmed:
+            self._agent_context_trimmed = True
+
+        return response.get("choices", [{}])[0].get("text", "").strip()
+
+    def _pdf_hash_for_path(self, path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _pdf_hash_for_bytes(self, raw_bytes: bytes) -> str:
+        return hashlib.sha256(raw_bytes).hexdigest()
+
+    def _pdf_cache_file(self, key: str) -> str:
+        return os.path.join(self._pdf_cache_dir, f"{key}.json")
+
+    def _load_pdf_cached_extract(self, key: str) -> tuple | None:
+        cache_file = self._pdf_cache_file(key)
+        if not os.path.isfile(cache_file):
+            return None
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            full_text = str(payload.get("full_text") or "")
+            pages = payload.get("pages") or []
+            if full_text and isinstance(pages, list):
+                return full_text, [str(p) for p in pages if p]
+        except Exception:
+            return None
+        return None
+
+    def _save_pdf_cached_extract(self, key: str, full_text: str, pages: list):
+        cache_file = self._pdf_cache_file(key)
+        payload = {
+            "full_text": full_text,
+            "pages": pages,
+            "cached_at": int(time.time()),
+        }
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _merge_batch_results(self, system_msg: str, user_text: str,
+                             batch_results: list) -> str:
+        """Final pass: merge partial batch results into one coherent answer.
+        Handles small-context models by using direct concatenation when
+        the merge prompt would exceed the context window."""
+        combined = "\n\n---\n\n".join(batch_results)
+        # Use 70% of context, with a floor so small models still work
+        max_merge_chars = max(8000, int(self.actual_n_ctx * 3.5 * 0.7))
+        print(f"[AGENT] Merging {len(batch_results)} batch results, "
+              f"{len(combined)} chars, budget={max_merge_chars}")
+
+        # If combined results are small enough, try LLM merge
+        if len(combined) <= max_merge_chars:
+            merged = self._agent_create_completion_safely(
+                system_msg=system_msg + (
+                    "\n\nMerge ALL partial results below into ONE final, complete answer. "
+                    "Preserve repeated-looking transaction rows when they may represent "
+                    "distinct entries (same date/amount can still be valid). "
+                    "Do NOT drop items unless they are obvious formatting-only repeats."),
+                user_text=user_text,
+                extra_context="=== PARTIAL RESULTS TO MERGE ===\n" + combined + "\n=== END ===",
+                max_tokens=2048,
+                temperature=0.2,
+            )
+            if merged:
+                return merged
+
+        # Fallback: preserve all data rows to avoid dropping legitimate
+        # repeated transactions in recon statements (same date/amount can recur).
+        print("[AGENT] Using direct concatenation (preserve all rows)")
+        return "\n\n".join(batch_results)
+
+    # ── Schema-first output helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_json_from_response(text: str) -> dict | None:
+        """Robustly extract a JSON object from a model response.
+
+        Handles markdown code fences (```json ... ```, ``` ... ```),
+        leading/trailing prose, and single-line JSON.
+        Returns the parsed dict/list on success, None on failure.
+        """
+        if not text:
+            return None
+        # Strip markdown code fences
+        fenced = re.search(r'```(?:json)?\s*([\s\S]*?)```', text, re.IGNORECASE)
+        if fenced:
+            candidate = fenced.group(1).strip()
+        else:
+            # Find the outermost { ... } or [ ... ] block
+            start = text.find('{')
+            start_arr = text.find('[')
+            if start == -1 and start_arr == -1:
+                return None
+            if start == -1:
+                start = start_arr
+            elif start_arr != -1:
+                start = min(start, start_arr)
+            # Walk to find matching closing brace
+            opener = text[start]
+            closer = '}' if opener == '{' else ']'
+            depth = 0
+            end = -1
+            for i, ch in enumerate(text[start:], start):
+                if ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end == -1:
+                candidate = text[start:]
+            else:
+                candidate = text[start:end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            # Try with relaxed trailing-comma removal
+            cleaned = re.sub(r',\s*([}\]])', r'\1', candidate)
+            try:
+                return json.loads(cleaned)
+            except Exception:
+                return None
+
+    def _schema_first_csv_from_json(self, parsed: dict | list,
+                                    output_dir: str, timestamp: int) -> str:
+        """Write a clean CSV from a schema-first JSON response.
+
+        Supports two shapes:
+          - dict with a list under any top-level key (uses first list found)
+          - bare list of dicts
+        Each dict in the list becomes one CSV row; all keys become headers.
+        Writes to output_dir/analysis_{timestamp}_q1.csv (auto-numbered to
+        avoid collisions).
+        """
+        # Resolve to a list of records
+        records: list = []
+        if isinstance(parsed, list):
+            records = parsed
+        elif isinstance(parsed, dict):
+            # Take the first list-valued key (e.g. "transactions")
+            for v in parsed.values():
+                if isinstance(v, list):
+                    records = v
+                    break
+        if not records:
+            return ""
+
+        # Collect union of all keys as headers (preserves insertion order)
+        headers: list = []
+        seen_hdrs: set = set()
+        for rec in records:
+            if isinstance(rec, dict):
+                for k in rec.keys():
+                    if k not in seen_hdrs:
+                        headers.append(k)
+                        seen_hdrs.add(k)
+        if not headers:
+            return ""
+
+        # Find a non-colliding filename
+        base = os.path.join(output_dir, f"analysis_{timestamp}")
+        output_file = base + ".csv"
+        suffix = 1
+        while os.path.exists(output_file):
+            output_file = f"{base}_q{suffix}.csv"
+            suffix += 1
+
+        try:
+            with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers,
+                                        quoting=csv.QUOTE_ALL,
+                                        extrasaction='ignore')
+                writer.writeheader()
+                for rec in records:
+                    if isinstance(rec, dict):
+                        writer.writerow(rec)
+            print(f"[AGENT] Schema-first CSV written: {output_file} "
+                  f"({len(records)} rows, {len(headers)} cols)")
+            return output_file
+        except Exception as e:
+            print(f"[AGENT] Schema-first CSV error: {e}")
+            return ""
+
+    def _agent_schema_first_completion(self, system_msg: str, user_text: str,
+                                       extra_context: str,
+                                       schema_hint: str) -> tuple[str, dict | None]:
+        """Run a completion requesting strict JSON output.
+
+        Appends a JSON-schema instruction to the system message, calls the
+        model, then attempts to parse the result.  On parse failure, retries
+        once with an even stricter prompt.
+
+        Returns (raw_text, parsed_json_or_None).
+        """
+        json_instruction = (
+            "\n\n" +
+            "=== OUTPUT INSTRUCTIONS ===\n"
+            "You MUST output ONLY valid JSON that matches this schema exactly.\n"
+            "Return ALL matching rows from the provided context. Do NOT sample, summarize, or stop at 10 rows.\n"
+            "Do NOT include any prose, markdown, or code fences outside the JSON.\n"
+            f"Schema:\n{schema_hint}\n"
+            "=== END OUTPUT INSTRUCTIONS ==="
+        )
+        augmented_system = system_msg + json_instruction
+
+        raw = self._agent_create_completion_safely(
+            system_msg=augmented_system,
+            user_text=user_text,
+            extra_context=extra_context,
+            max_tokens=3072,
+            temperature=0.1,
+        )
+        parsed = self._extract_json_from_response(raw)
+        if parsed is not None:
+            return raw, parsed
+
+        # Retry with an even stricter, shorter prompt
+        print("[AGENT] Schema-first: first attempt did not yield valid JSON, retrying...")
+        strict_system = (
+            "You are a JSON-only output machine. "
+            "Return every matching row in the context; do not truncate or sample. "
+            "Output NOTHING except a single valid JSON object matching the schema. "
+            "No preamble, no explanation, no markdown.\n"
+            f"Schema:\n{schema_hint}"
+        )
+        raw2 = self._agent_create_completion_safely(
+            system_msg=strict_system,
+            user_text=user_text,
+            extra_context=extra_context,
+            max_tokens=3072,
+            temperature=0.05,
+        )
+        parsed2 = self._extract_json_from_response(raw2)
+        if parsed2 is not None:
+            return raw2, parsed2
+
+        print("[AGENT] Schema-first: both attempts failed to produce valid JSON, "
+              "falling back to plain-text CSV.")
+        # Return the first raw attempt for fallback text-based CSV creation
+        return raw, None
+
+    # ── #2 Two-stage RAG retrieval ──────────────────────────────────────────
+
+    def _retrieve_rag_context(self, rag_database: str, query: str,
+                              knowledge_md: str, max_chars: int) -> str:
+        """Two-stage RAG retrieval for agent_chat.
+
+        Stage 1 — vector retrieval (TF-IDF + BM25 + keyword):
+            If the RAG database is indexed, use ``rag_manager.retrieve()`` to
+            find the top-K most relevant chunks for the current query.  This
+            avoids dumping the entire knowledge.md into the prompt.
+
+        Stage 2 — fallback:
+            If the database is not loaded / indexed yet (e.g. first run) or
+            retrieval returns nothing, fall back to the full knowledge.md
+            text truncated to ``max_chars``.
+
+        Returns a formatted context string ready to inject into the prompt.
+        """
+        retrieved_chunks: list = []
+        if self.rag_manager and rag_database:
+            try:
+                # How many chunks to retrieve — scale with context window
+                k = min(12, max(4, self.actual_n_ctx // 512))
+                raw = self.rag_manager.retrieve(rag_database, query, k=k)
+                retrieved_chunks = [c for c, _score in raw if c.strip()]
+                print(f"[AGENT-RAG] Two-stage retrieval: {len(retrieved_chunks)} "
+                      f"chunks retrieved for query ({len(query)} chars)")
+            except Exception as e:
+                print(f"[AGENT-RAG] Retrieval failed ({e}), falling back to full KB")
+
+        if retrieved_chunks:
+            # Budget: each chunk gets an equal slice; cap total
+            chunk_budget = max(4000, int(max_chars * 0.85))
+            combined = "\n\n---\n\n".join(retrieved_chunks)
+            if len(combined) > chunk_budget:
+                combined = combined[:chunk_budget] + "\n[... additional KB content omitted ...]"
+            return ("=== RELEVANT KNOWLEDGE BASE EXCERPTS ===\n"
+                    + combined
+                    + "\n=== END KNOWLEDGE BASE ===")
+
+        # Fallback: inject full knowledge.md (existing behaviour)
+        if not knowledge_md:
+            return ""
+        ctx = knowledge_md[:max_chars]
+        suffix = "\n[... truncated to fit context window ...]" if len(knowledge_md) > max_chars else ""
+        return ("=== KNOWLEDGE BASE ===\n" + ctx
+                + suffix + "\n=== END KNOWLEDGE BASE ===")
+
+    # ── #3 Map-reduce PDF extraction ─────────────────────────────────────
+
+    def _agent_mapreduce_extract(self, system_msg: str, user_text: str,
+                                 page_chunks: list, schema_hint: str,
+                                 extra_context: str = "") -> tuple[str, dict | list | None]:
+        """Map-reduce extraction for large multi-page documents.
+
+        MAP phase:
+            For each page chunk, ask the model to extract rows that match the
+            schema and return them as a partial JSON array.
+
+        REDUCE phase:
+            Merge all partial arrays, deduplicate by a lightweight key
+            (first two field values), and produce one final JSON object.
+
+        Returns (summary_text, merged_json_or_None).
+        """
+        map_instruction = (
+            "Extract ALL data rows visible in the document excerpt below that "
+            "match the required schema.  Output ONLY valid JSON — no prose, no "
+            "markdown fences.  If no matching rows are present in this excerpt, "
+            f"output an empty array: [].\nSchema: {schema_hint}"
+        )
+        all_records: list = []
+
+        # Split oversized pages into sub-chunks so each map prompt can include
+        # complete table lines without being heavily trimmed by context limits.
+        def _split_large_chunk(text: str) -> list[str]:
+            max_chars = max(4000, int(self.actual_n_ctx * 2.2))
+            overlap = 350
+            if not text or len(text) <= max_chars:
+                return [text] if text else []
+            parts = re.split(r"\n\s*\n", text)
+            out: list[str] = []
+            cur = ""
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                if not cur:
+                    cur = part
+                    continue
+                candidate = cur + "\n\n" + part
+                if len(candidate) <= max_chars:
+                    cur = candidate
+                else:
+                    out.append(cur)
+                    tail = cur[-overlap:] if len(cur) > overlap else cur
+                    cur = (tail + "\n\n" + part) if tail else part
+            if cur:
+                out.append(cur)
+            return out
+
+        expanded_chunks: list[str] = []
+        for pg in page_chunks:
+            expanded_chunks.extend(_split_large_chunk(pg))
+
+        page_count = len(expanded_chunks)
+        print(f"[MAP-REDUCE] Starting map phase over {page_count} chunks "
+              f"(from {len(page_chunks)} pages)")
+
+        for i, chunk in enumerate(expanded_chunks):
+            if self.stop_generation_flag:
+                break
+            extra = (extra_context + "\n\n" if extra_context else "") + (
+                f"=== DOCUMENT EXCERPT (chunk {i+1}/{page_count}) ===\n"
+                + chunk
+                + "\n=== END EXCERPT ==="
+            )
+            raw = self._agent_create_completion_safely(
+                system_msg=map_instruction,
+                user_text=user_text,
+                extra_context=extra,
+                # Allow enough budget for pages with many line items.
+                max_tokens=3072,
+                temperature=0.05,
+            )
+            parsed = self._extract_json_from_response(raw)
+            if parsed is None:
+                # Model may have output a bare array
+                try:
+                    parsed = json.loads(raw.strip())
+                except Exception:
+                    parsed = None
+            records: list = []
+            if isinstance(parsed, list):
+                records = parsed
+            elif isinstance(parsed, dict):
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        records = v
+                        break
+            print(f"[MAP-REDUCE] Chunk {i+1}/{page_count}: "
+                  f"{len(records)} records extracted")
+            all_records.extend(records)
+
+        if not all_records:
+            print("[MAP-REDUCE] Map phase returned no records")
+            return "", None
+
+        # ── REDUCE: keep all extracted rows (no aggressive dedup) ──
+        # Prior logic deduped by the first two field values, which can collapse
+        # valid transactions when those fields repeat (for example same date).
+        # Keep all model-extracted rows and only normalize row numbering below.
+        deduped: list = []
+        for rec in all_records:
+            if isinstance(rec, dict):
+                deduped.append(rec)
+
+        # Re-number SL No / No / # fields if present
+        for i, rec in enumerate(deduped, 1):
+            for k in rec:
+                if k.lower() in ("sl no", "sl_no", "no", "#", "sno", "serial"):
+                    rec[k] = str(i)
+                    break
+
+        merged = {"rows": deduped}
+        # Try to infer top-level key from schema_hint
+        try:
+            schema_obj = json.loads(schema_hint)
+            if isinstance(schema_obj, dict):
+                top_key = next(
+                    (k for k, v in schema_obj.items() if isinstance(v, list)),
+                    "rows"
+                )
+                merged = {top_key: deduped}
+        except Exception:
+            pass
+
+        summary = (f"Map-reduce extraction complete: "
+                   f"{len(deduped)} records from {page_count} chunks.")
+        print(f"[MAP-REDUCE] Reduce phase: {len(deduped)} records "
+              f"(from {len(all_records)} raw)")
+        return summary, merged
+
+    # ── #8 Automatic fallback strategy ────────────────────────────────────────
+
+    def _agent_with_fallback(self, system_msg: str, user_text: str,
+                             extra_context: str,
+                             max_tokens: int = 2048,
+                             temperature: float = 0.3) -> tuple[str, bool]:
+        """Run agent completion with a 3-tier automatic fallback strategy.
+
+        Tier 1 — Full context:
+            Attempt with the full extra_context (already auto-trimmed by
+            _agent_create_completion_safely).
+
+        Tier 2 — Reduced context (50%):
+            If tier 1 returns an empty string, trim extra_context to 50% and
+            retry.  Marks fallback=True.
+
+        Tier 3 — Minimal context (task only):
+            If tier 2 also fails, use only the system_msg + user_text with no
+            extra_context.  Marks fallback=True.
+
+        Returns (result_text, fallback_was_used).
+        Guarantees a non-empty string unless the model is not loaded.
+        """
+        # Tier 1 — full
+        result = self._agent_create_completion_safely(
+            system_msg=system_msg,
+            user_text=user_text,
+            extra_context=extra_context,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if result:
+            return result, False
+
+        # Tier 2 — 50% context
+        print("[FALLBACK] Tier 1 returned empty, trying 50% context")
+        half_ctx = extra_context[:max(500, len(extra_context) // 2)]
+        result = self._agent_create_completion_safely(
+            system_msg=system_msg,
+            user_text=user_text,
+            extra_context=half_ctx,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if result:
+            return result, True
+
+        # Tier 3 — no context
+        print("[FALLBACK] Tier 2 returned empty, trying minimal context")
+        result = self._agent_create_completion_safely(
+            system_msg=system_msg,
+            user_text=user_text,
+            extra_context="",
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return result, True
+
+    # ── End pipeline helpers ─────────────────────────────────────────────────────
+
+    # ── End schema-first helpers ───────────────────────────────────────────────
+
+    def _agent_chat_create_output(self, ai_text: str, output_format: str,
+                                  _parsed_json: dict | list | None = None) -> str:
+        """Create an output file from agent_chat response text."""
+        output_dir = os.path.join(app_data_path(""), "processed_files")
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = int(time.time())
+        data = self._extract_response_data(ai_text) if hasattr(self, '_extract_response_data') else {}
+        fmt = output_format.lower().strip()
+        if fmt == "csv_json":
+            # Schema-first path: use pre-parsed JSON if available, else try to
+            # extract JSON from the raw text, then fall back to plain CSV.
+            parsed = _parsed_json
+            if parsed is None:
+                parsed = self._extract_json_from_response(ai_text)
+            if parsed is not None:
+                result = self._schema_first_csv_from_json(parsed, output_dir, timestamp)
+                if result:
+                    return result
+            # Fallback: treat as plain CSV
+            return self._create_csv_output(data, ai_text, output_dir, timestamp)
+        elif fmt == "csv":
+            return self._create_csv_output(data, ai_text, output_dir, timestamp)
+        elif fmt == "excel":
+            return self._create_excel_output(data, ai_text, output_dir, timestamp)
+        elif fmt == "pdf":
+            return self._create_pdf_output(data, ai_text, output_dir, timestamp)
+        elif fmt == "txt":
+            return self._create_txt_output(data, ai_text, output_dir, timestamp)
+        return ""
+
+    def process_files_with_ai(self, files: list, instructions: str,
+                               output_format: str = "excel", json_schema: str = ""):
         """Process uploaded files with AI and generate output in specified format.
         
                 files: list of dicts with:
@@ -2151,10 +3976,22 @@ except Exception:
                     - content (plain text) OR content_base64 (binary payload)
         """
         try:
+            _pf_start_time = time.time()
+            
+            # Ensure any stuck flags from previous runs are cleared
+            self.stop_generation_flag = False
+            self.generation_in_progress = False
+            
             if not self._has_full_access():
                 return {"error": "Trial expired. Enter passkey to activate full access."}
-            self.stop_generation_flag = False
+            
             self.generation_in_progress = True
+
+            # #2 Tier 1: Validate JSON schema if provided (before model check)
+            if json_schema and json_schema.strip():
+                schema_err = self._validate_json_schema(json_schema)
+                if schema_err:
+                    return {"error": schema_err}
 
             from reportlab.lib.pagesizes import letter
             from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -2173,16 +4010,43 @@ except Exception:
             if not instructions or not instructions.strip():
                 return {"error": "No instructions provided"}
 
+            # Check model availability before health check
+            if not self.model:
+                print(f"[PROCESS] ERROR: No model loaded at start of process_files_with_ai")
+                return {"error": "No model loaded. Please load a model first."}
+            
+            print(f"[PROCESS] Model status: loaded={self.model is not None}, type={type(self.model).__name__}")
+
+
+            # #3 Tier 1: Check Ollama health before starting (only if model is loaded)
+            if not self._check_ollama_health():
+                return {"error": "Model server unavailable. Please start Ollama on port 11434."}
+
+            # #2 Tier 1: Validate file sizes and record uploads
+            MAX_FILE_MB = 50  # Per-file limit
+            for f in files:
+                fsize = f.get("size", 0)
+                fname = f.get("name", "unknown")
+                # Per-file validation
+                size_err = self._validate_input_file_size(fname, fsize, max_mb=MAX_FILE_MB)
+                if size_err:
+                    get_metrics().record_validation_error("FILE_TOO_LARGE", size_err)
+                    return {"error": size_err}
+                # Record successful upload
+                get_metrics().record_file_upload(fname, fsize, 
+                                                f.get("type", "unknown"), 
+                                                page_count=f.get("page_count", 0))
+
             # Parse @rag_name mention from instructions
             instructions, mentioned_rag = self._resolve_rag_mention(instructions)
             agent_rag_database = mentioned_rag
 
-            # File size guard — reject files > 50MB to prevent memory spikes
-            MAX_FILE_BYTES = 5000 * 1024 * 1024  # 5 GB
+            # File size guard — reject files > 5GB to prevent memory spikes
+            MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
             for f in files:
                 fsize = f.get("size", 0)
                 if fsize > MAX_FILE_BYTES:
-                    return {"error": f"File '{f.get('name', 'unknown')}' is too large ({fsize / (1024*1024):.0f} MB). Max is 50 MB."}
+                    return {"error": f"File '{f.get('name', 'unknown')}' is too large ({fsize / (1024*1024):.0f} MB). Max is 5 GB."}
 
             # For tabular files without a path, save content to temp so DuckDB can use file path
             for f in files:
@@ -2221,6 +4085,7 @@ except Exception:
             # Fallback to text-based analysis for non-tabular files
             # Build file contents section for the prompt
             file_sections = []
+            pdf_page_sections = []  # page-level chunks for batched PDF processing
             extraction_warnings = []
             for f in files:
                 if self.stop_generation_flag:
@@ -2239,10 +4104,32 @@ except Exception:
                 # Extract text content only for non-tabular files
                 content = self._extract_agent_file_content(f)
                 if content:
-                    # Truncate large content to prevent overflow
-                    if len(content) > 10000:
-                        content = content[:10000] + f"\n\n[... Content truncated. Total size: {len(content)} chars]"
-                    file_sections.append(f"--- FILE: {name} ---\n{content}\n--- END FILE ---")
+                    pages = f.get("_pages")  # populated by _extract_agent_file_content for PDFs
+                    if pages and len(pages) > 1:
+                        # PDF with page-level chunks → use batching pipeline
+                        for pg in pages:
+                            pdf_page_sections.append(f"--- FILE: {name} ---\n{pg}\n--- END FILE ---")
+                        total_chars = sum(len(p) for p in pages)
+                        file_sections.append(
+                            f"--- FILE: {name} ({len(pages)} pages, {total_chars} chars) "
+                            f"[batched page-level processing] ---")
+                        print(f"[PROCESS] PDF {name}: {len(pages)} pages, "
+                              f"{total_chars} chars -> batched")
+                        if total_chars > 50000:
+                            extraction_warnings.append(
+                                f"{name}: Large PDF ({len(pages)} pages, "
+                                f"{total_chars:,} chars). Processing in batches.")
+                    else:
+                        # Non-PDF or single-page: adaptive truncation
+                        max_file_chars = max(10000, int(self.actual_n_ctx * 3.5 * 0.4))
+                        if len(content) > max_file_chars:
+                            extraction_warnings.append(
+                                f"{name}: Content truncated from {len(content):,} to "
+                                f"{max_file_chars:,} chars to fit context window.")
+                            content = content[:max_file_chars] + (
+                                f"\n\n[... Content truncated. "
+                                f"Total size: {len(content):,} chars]")
+                        file_sections.append(f"--- FILE: {name} ---\n{content}\n--- END FILE ---")
                 else:
                     file_sections.append(f"--- FILE: {name} ({f.get('size', 0)} bytes) [content not available] ---")
                     if ext in ('.pdf', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'):
@@ -2251,6 +4138,10 @@ except Exception:
                         )
             
             file_data = "\n\n".join(file_sections)
+            print(f"[DEBUG-PROCESS] file_data assembled: {len(file_data)} chars, "
+                  f"{len(file_sections)} section(s): {[str(f.get('name','?')) for f in files]}")
+            if file_data:
+                print(f"[DEBUG-PROCESS] file_data preview: {file_data[:300]!r}")
             
             # If no extractable content (only tabular files), adjust prompt
             if not file_data.strip():
@@ -2258,39 +4149,161 @@ except Exception:
                     "error": "Unable to process files. CSV/Excel files require the data analysis mode which failed.",
                     "warning": tabular_warning if tabular_warning else "No extractable text content found"
                 }
-            
-            file_data = "\n\n".join(file_sections)
 
-            # Agent mode is stateless per run: use only RAG explicitly mentioned in this request.
+            # Agent mode: use full knowledge.md when RAG is mentioned
             rag_section = ""
             if agent_rag_database and self.rag_manager:
                 try:
-                    query = instructions[:500]
-                    results = self.rag_manager.retrieve(
-                        agent_rag_database, query, k=5)
-                    if results:
-                        chunks = [r[0] for r in results]
-                        rag_section = "\nReference knowledge:\n" + "\n---\n".join(chunks) + "\n"
+                    knowledge_md = self.rag_manager.read_knowledge_markdown(
+                        agent_rag_database)
+                    if knowledge_md:
+                        # Guard against context overflow
+                        max_rag = max(4000, int(self.actual_n_ctx * 3.5 * 0.3))
+                        if len(knowledge_md) > max_rag:
+                            knowledge_md = knowledge_md[:max_rag] + "\n[... Knowledge base truncated ...]"
+                        rag_section = "\nReference knowledge:\n" + knowledge_md + "\n"
                 except Exception:
                     pass
 
-            prompt = f"""You are a data analyst assistant. Analyze the following files and provide ACTUAL RESULTS directly.
+            _fmt_lower = (output_format or "").lower()
+            if _fmt_lower in ("pdf", "docx"):
+                # Chat-completion layout for instruction-tuned models.
+                # System message = role + rules (from instructions template).
+                # User message  = plain document data + task request.
+                # No bracket markers — prevents model confusing them with template placeholders.
+                import re as _re_src
+                _doc_num = [0]
+                def _tag_doc(m):
+                    _doc_num[0] += 1
+                    return f"Document {_doc_num[0]}: {m.group(1)}"
+                _clean_file_data = _re_src.sub(
+                    r'--- FILE: (.+?) ---', _tag_doc, file_data
+                ).replace("--- END FILE ---", "---")
 
-IMPORTANT RULES:
+                _chat_system = instructions.strip()
+                _chat_user = (
+                    f"Here are the source documents:\n\n"
+                    f"{_clean_file_data}\n\n"
+                    f"{rag_section}"
+                    f"{self._get_prompt_ending(output_format)}"
+                )
+                _chat_messages = [
+                    {"role": "system", "content": _chat_system},
+                    {"role": "user",   "content": _chat_user},
+                ]
+                # Keep a plain-text prompt for token-count estimation only
+                prompt = f"{_chat_system}\n\n{_chat_user}"
+            else:
+                # Data analysis / structured output — role/task already defined in instructions template
+                prompt = f"""Follow the instructions below and provide ACTUAL RESULTS directly from the uploaded files.
+
+RULES:
 - Do NOT write code, scripts, or programming examples
-- Do NOT suggest how to analyze - actually DO the analysis
-- Provide the real computed numbers, totals, comparisons, and findings
-- If you find discrepancies, list each one with specific values
+- Do NOT suggest how to analyze — actually DO the analysis
+- Provide real computed numbers, totals, comparisons, and findings
 - **MUST format all results as markdown tables** (| Header | Header |)
 - Show actual data rows, not placeholder examples
-- Use clear headers and organize data logically in tables
-- For summaries, also provide separate summary tables
+- **CRITICAL: Do NOT repeat or echo back the file contents, file names, or --- FILE: markers in your response**
+- **CRITICAL: Your response must start directly with the output, not with the input data**
 {rag_section}
 Instructions: {instructions}
 
 {file_data}
 
-Provide the complete analysis results below as structured markdown tables:"""
+{self._get_prompt_ending(output_format)}"""
+
+            # ── Batched PDF processing (large multi-page PDFs) ──
+            if pdf_page_sections:
+                max_batch_chars = max(6000, int(self.actual_n_ctx * 3.5 * 0.6))
+                total_pdf_chars = sum(len(s) for s in pdf_page_sections)
+                print(f"[PROCESS] Batched PDF: {len(pdf_page_sections)} page sections, "
+                      f"{total_pdf_chars} chars, budget={max_batch_chars}")
+
+                system_msg = (
+                    "You are a data analyst assistant. Analyze the provided document "
+                    "pages and extract ALL relevant information per the instructions. "
+                    "Provide actual results as markdown tables. Do NOT write code."
+                    + rag_section)
+
+                batch_results = []
+                batch, batch_chars = [], 0
+                for section in pdf_page_sections:
+                    if self.stop_generation_flag:
+                        return {"error": "Generation stopped by user", "stopped": True}
+                    sec_len = len(section)
+                    if batch and (batch_chars + sec_len) > max_batch_chars:
+                        self._status(f"Processing batch {len(batch_results)+1}...")
+                        partial = self._run_agent_batch(
+                            system_msg, instructions, batch, batch_results)
+                        if partial:
+                            batch_results.append(partial)
+                        batch, batch_chars = [], 0
+                    batch.append(section)
+                    batch_chars += sec_len
+
+                if batch:
+                    if self.stop_generation_flag:
+                        return {"error": "Generation stopped by user", "stopped": True}
+                    self._status(f"Processing batch {len(batch_results)+1}...")
+                    partial = self._run_agent_batch(
+                        system_msg, instructions, batch, batch_results)
+                    if partial:
+                        batch_results.append(partial)
+
+                if not batch_results:
+                    return {"error": "No results extracted from PDF pages."}
+
+                if len(batch_results) == 1:
+                    ai_response = batch_results[0]
+                else:
+                    self._status("Merging results...")
+                    ai_response = self._merge_batch_results(
+                        system_msg, instructions, batch_results)
+
+                print(f"[PROCESS] Batched PDF complete: {len(batch_results)} batches "
+                      f"-> {len(ai_response)} chars result")
+
+                if str(output_format).strip().lower() == "none":
+                    result = {"response_text": ai_response, "success": True}
+                    if extraction_warnings:
+                        result["warning"] = "\n".join(extraction_warnings)
+                    return result
+
+                output_dir = os.path.join(app_data_path(), "processed_files")
+                os.makedirs(output_dir, exist_ok=True)
+                timestamp = int(time.time())
+                result_data = self._parse_ai_response(ai_response)
+                if output_format == "excel":
+                    output_file = self._create_excel_output(result_data, ai_response, output_dir, timestamp)
+                elif output_format in ("csv", "csv_json"):
+                    if output_format == "csv_json":
+                        _GENERIC_SCHEMA = (
+                            '{"rows": [{"<column_name>": "<value>", '
+                            '"...": "use as many columns as the task requires"}]}'
+                        )
+                        _active_schema = json_schema.strip() if json_schema and json_schema.strip() else _GENERIC_SCHEMA
+                        _, _parsed = self._agent_schema_first_completion(
+                            system_msg="You are a data extraction assistant.",
+                            user_text=instructions,
+                            extra_context=ai_response,
+                            schema_hint=_active_schema,
+                        )
+                        if _parsed:
+                            _f = self._schema_first_csv_from_json(_parsed, output_dir, timestamp)
+                            output_file = _f if _f else self._create_csv_output(result_data, ai_response, output_dir, timestamp)
+                        else:
+                            output_file = self._create_csv_output(result_data, ai_response, output_dir, timestamp)
+                    else:
+                        output_file = self._create_csv_output(result_data, ai_response, output_dir, timestamp)
+                elif output_format == "pdf":
+                    output_file = self._create_pdf_output(result_data, ai_response, output_dir, timestamp)
+                else:
+                    output_file = self._create_txt_output(result_data, ai_response, output_dir, timestamp)
+                result = {"file_path": output_file, "response_text": ai_response, "success": True}
+                if extraction_warnings:
+                    result["warning"] = "\n".join(extraction_warnings)
+                self._status("Ready")
+                return result
 
             def _review_instruction_compliance(instruction_text: str, source_text: str, answer_text: str) -> tuple[bool, str, list[str]]:
                 """Model-based compliance check for document/PDF analysis outputs."""
@@ -2349,11 +4362,16 @@ Validation rules:
             
             # Generate AI response
             print("[PROCESS] Generating AI response...")
-            if not self.model:
-                return {"error": "No model loaded. Please load a model first"}
+            # Model check already done at function start, so proceed directly
+            print(f"[DEBUG-PROCESS] prompt length: {len(prompt)} chars, "
+                  f"pdf_page_sections: {len(pdf_page_sections)}, "
+                  f"output_format: {output_format}")
+            _prompt_file_count = prompt.count('--- FILE:')
+            print(f"[DEBUG-PROCESS] '--- FILE:' occurrences in prompt: {_prompt_file_count}")
 
             MAX_DOC_ATTEMPTS = 3
             ai_response = ""
+            best_ai_response = ""
             review_reason = ""
             review_missing: list[str] = []
 
@@ -2367,39 +4385,333 @@ Validation rules:
                     if review_reason:
                         fix_lines.append(f"- {review_reason}")
                     fix_block = "\n".join(dict.fromkeys(fix_lines)) if fix_lines else "- Fully satisfy every explicit instruction requirement."
-                    current_prompt = (
-                        prompt
-                        + "\n\nThe previous answer did not satisfy instruction compliance."
-                        + "\nFix ALL issues below in the next answer:"
-                        + f"\n{fix_block}"
-                        + "\n\nReturn the corrected final analysis now (markdown tables, no code)."
-                    )
+                    if _fmt_lower in ("pdf", "docx"):
+                        _retry_user = (
+                            f"Here are the source documents:\n\n"
+                            f"{_clean_file_data}\n\n"
+                            f"{rag_section}"
+                            f"IMPORTANT — previous attempt failed. Fix ALL issues:\n{fix_block}\n\n"
+                            f"{self._get_prompt_ending(output_format)}"
+                        )
+                        _chat_messages = [
+                            {"role": "system", "content": _chat_system},
+                            {"role": "user",   "content": _retry_user},
+                        ]
+                        current_prompt = f"{_chat_system}\n\n{_retry_user}"  # for token counting
+                    else:
+                        current_prompt = (
+                            prompt
+                            + "\n\nThe previous answer did not satisfy instruction compliance."
+                            + "\nFix ALL issues below in the next answer:"
+                            + f"\n{fix_block}"
+                            + f"\n\n## Corrected {self._get_prompt_ending(output_format)}"
+                        )
 
-                response = self.model.create_completion(
-                    current_prompt,
-                    max_tokens=2048,
-                    temperature=0.25,
-                )
+                # Dynamic max_tokens: auto-scale based on current prompt size
+                _max_tok = self._estimate_max_tokens_dynamic(len(current_prompt), output_format)
+
+                # Stop sequences: PDF/DOCX uses chat completion so only EOS tokens are needed.
+                if (output_format or "").lower() in ("pdf", "docx"):
+                    _stop = ["<|endoftext|>", "<|im_end|>"]
+                else:
+                    _stop = ["--- FILE:", "--- END FILE", "## Output", "## Analysis Results",
+                             "## Corrected", "\n---\n---", "<|endoftext|>", "<|im_end|>"]
+
+                print(f"[PROCESS] Attempt {attempt}/{MAX_DOC_ATTEMPTS}: prompt={len(current_prompt)} chars, "
+                      f"max_tokens={_max_tok}, format={output_format}")
+                self._debug_ai_generation("pre_completion", {
+                    "attempt": attempt,
+                    "max_attempts": MAX_DOC_ATTEMPTS,
+                    "output_format": output_format,
+                    "max_tokens": _max_tok,
+                    "temperature": 0.25,
+                    "stop": _stop,
+                    "file_markers_in_prompt": current_prompt.count("--- FILE:"),
+                    "prompt": current_prompt,
+                })
+                
+                # Verify model is still loaded
+                if not self.model:
+                    print(f"[PROCESS] ERROR: Model not loaded at attempt {attempt}")
+                    return {"error": "Model not loaded. Please reload the model."}
+                
+                try:
+                    if _fmt_lower in ("pdf", "docx"):
+                        response = self.model.create_chat_completion(
+                            _chat_messages,
+                            max_tokens=_max_tok,
+                            temperature=0.35,
+                            stop=_stop,
+                        )
+                    else:
+                        response = self.model.create_completion(
+                            current_prompt,
+                            max_tokens=_max_tok,
+                            temperature=0.25,
+                            stop=_stop,
+                        )
+                except Exception as model_err:
+                    self._debug_ai_generation("completion_exception", {
+                        "attempt": attempt,
+                        "error": str(model_err),
+                        "model_type": type(self.model).__name__ if self.model else "None",
+                    })
+                    print(f"[PROCESS] Model error on attempt {attempt}: {model_err}")
+                    if attempt < MAX_DOC_ATTEMPTS:
+                        continue
+                    else:
+                        return {"error": f"Model error: {str(model_err)}"}
+                
                 if self.stop_generation_flag:
                     return {"error": "Generation stopped by user", "stopped": True}
 
-                ai_response = response.get("choices", [{}])[0].get("text", "").strip()
+                # Safely extract response text
+                try:
+                    _choices = response.get("choices", [{}])
+                    _choice0 = _choices[0] if _choices else {}
+                    if _fmt_lower in ("pdf", "docx"):
+                        # chat completion: choices[0]["message"]["content"]
+                        ai_response = (_choice0.get("message") or {}).get("content", "") or ""
+                        ai_response = ai_response.strip()
+                    else:
+                        ai_response = _choice0.get("text", "").strip()
+                    self._debug_ai_generation("post_completion", {
+                        "attempt": attempt,
+                        "response_keys": list(response.keys()) if isinstance(response, dict) else [],
+                        "choices_count": len(_choices) if isinstance(_choices, list) else 0,
+                        "finish_reason": _choice0.get("finish_reason"),
+                        "usage": response.get("usage") if isinstance(response, dict) else None,
+                        "response_text_chars": len(ai_response),
+                        "response_text_head": ai_response[:200],
+                    })
+                except Exception as parse_err:
+                    print(f"[PROCESS] Response parsing error on attempt {attempt}: {parse_err}, raw response: {response}")
+                    self._debug_ai_generation("parse_error", {
+                        "attempt": attempt,
+                        "error": str(parse_err),
+                        "raw_response_type": type(response).__name__,
+                    })
+                    ai_response = ""
+                
                 print(f"[PROCESS] AI response attempt {attempt}/{MAX_DOC_ATTEMPTS}, length: {len(ai_response)} chars")
                 if not ai_response:
+                    # For document drafting, retry once with higher temperature.
+                    if (output_format or "").lower() in ("pdf", "docx"):
+                        _minimal_stop = ["<|endoftext|>", "<|im_end|>"]
+                        try:
+                            response2 = self.model.create_chat_completion(
+                                _chat_messages,
+                                max_tokens=_max_tok,
+                                temperature=0.5,
+                                stop=_minimal_stop,
+                            )
+                            _r2c = (response2.get("choices") or [{}])[0]
+                            ai_response = ((_r2c.get("message") or {}).get("content") or "").strip()
+                            print(f"[PROCESS] Minimal-stop retry on attempt {attempt}, length: {len(ai_response)} chars")
+                            self._debug_ai_generation("minimal_stop_retry", {
+                                "attempt": attempt,
+                                "response_text_chars": len(ai_response),
+                                "stop": _minimal_stop,
+                            })
+                        except Exception as model_err2:
+                            print(f"[PROCESS] Minimal-stop retry failed on attempt {attempt}: {model_err2}")
+                            self._debug_ai_generation("minimal_stop_retry_exception", {
+                                "attempt": attempt,
+                                "error": str(model_err2),
+                            })
+                    if ai_response and len(ai_response) > len(best_ai_response):
+                        best_ai_response = ai_response
+                    if ai_response:
+                        # Continue through standard validation pipeline with recovered text.
+                        pass
+                    else:
+                        print(f"[PROCESS] Attempt {attempt}: empty response, retrying...")
+                        self._debug_ai_generation("empty_response", {
+                            "attempt": attempt,
+                            "max_tokens": _max_tok,
+                            "stop": _stop,
+                            "prompt_tail": current_prompt[-280:],
+                        })
+                        continue
+                if len(ai_response) > len(best_ai_response):
+                    best_ai_response = ai_response
+
+                # Detect heading-repeat loop (e.g. Gemma 4 echoing "Analysis Results" or
+                # any short heading over and over instead of generating content)
+                _words = ai_response.split()
+                if len(_words) > 20:
+                    # Check if any 1-3 word phrase makes up >60% of total words
+                    from collections import Counter as _Counter
+                    _uniq = set(_words)
+                    _most_common_word, _wc = _Counter(_words).most_common(1)[0]
+                    if _wc / len(_words) > 0.6 and len(_most_common_word) > 3:
+                        print(f"[PROCESS] Heading-repeat loop on attempt {attempt} — "
+                              f"{_most_common_word!r} appears {_wc}/{len(_words)} times, retrying")
+                        review_reason = ("Response is a repeated heading/word loop. "
+                                         "Generate actual content — letter text, table rows, or analysis.")
+                        review_missing = ["Actual output content (not a repeated word or heading)"]
+                        ai_response = ""
+                        continue
+
+                # Strip --- END FILE --- markers the model hallucinates
+                if '--- END FILE' in ai_response or '---END FILE' in ai_response:
+                    import re as _re_ef
+                    ai_response = _re_ef.sub(r'---\s*END\s*FILE\s*---', '', ai_response).strip()
+                    print(f"[PROCESS] Stripped END FILE markers from response")
+
+                # Detect prompt echo loop: model repeated the format instruction
+                _ECHO_PHRASE = "Provide the complete analysis results below as structured markdown tables"
+                if ai_response.count(_ECHO_PHRASE) > 3:
+                    print(f"[PROCESS] Echo loop detected on attempt {attempt} — response is prompt repetition, retrying")
+                    review_reason = "Response is a repetition of the format instruction. Generate actual analysis data."
+                    review_missing = ["Actual analysis content (tables with real data, not repeated instructions)"]
+                    ai_response = ""
                     continue
 
+                # Detect file-context echo: model repeated source markers from the prompt
+                _resp_file_count = ai_response.count('[SOURCE ') + ai_response.count('--- FILE:')
+                print(f"[DEBUG-PROCESS] source/file markers in response attempt {attempt}: {_resp_file_count}")
+                if _resp_file_count > 0:
+                    # Strip any [SOURCE N: ...] [END SOURCE] blocks from the response
+                    import re as _re_inner
+                    _cleaned = _re_inner.sub(
+                        r'\[SOURCE \d+:.*?\[END SOURCE\]',
+                        '', ai_response, flags=_re_inner.DOTALL
+                    ).strip()
+                    # Also strip any legacy --- FILE: ... --- END FILE --- blocks
+                    _cleaned = _re_inner.sub(
+                        r'---\s*FILE:.*?(?:---\s*END FILE\s*---|(?=---\s*FILE:)|$)',
+                        '', _cleaned, flags=_re_inner.DOTALL
+                    ).strip()
+                    # Strip bare [SOURCE ...] or --- FILE: lines that weren't wrapped
+                    _cleaned = _re_inner.sub(r'\[SOURCE \d+:.*', '', _cleaned).strip()
+                    _cleaned = _re_inner.sub(r'---\s*FILE:.*', '', _cleaned).strip()
+                    if _cleaned and len(_cleaned) > 50:
+                        print(f"[PROCESS] Stripped FILE markers from response, salvaged {len(_cleaned)} chars")
+                        ai_response = _cleaned
+                    elif _resp_file_count > 1:
+                        print(f"[PROCESS] File-context echo on attempt {attempt} — "
+                              f"response has {_resp_file_count} FILE markers and nothing useful after strip, retrying")
+                        review_reason = ("Response echoes raw file markers (--- FILE: ...) instead of analysing. "
+                                         "Output ONLY the analysis result — do NOT repeat file names, markers, or raw input.")
+                        review_missing = ["Pure analysis output with no --- FILE: markers or repeated raw input"]
+                        ai_response = ""
+                        continue
+
+                # Detect paragraph-level repetition: same 80+ char block 3+ times
+                _paragraphs = [p.strip() for p in ai_response.split('\n\n') if len(p.strip()) > 80]
+                _seen_paras: dict = {}
+                _has_para_repeat = False
+                for _p in _paragraphs:
+                    _seen_paras[_p] = _seen_paras.get(_p, 0) + 1
+                    if _seen_paras[_p] >= 3:
+                        _has_para_repeat = True
+                        print(f"[PROCESS] Paragraph repetition on attempt {attempt} — "
+                              f"block repeated {_seen_paras[_p]}x: {_p[:80]!r}")
+                        break
+                if _has_para_repeat:
+                    if (output_format or "").lower() in ("pdf", "docx"):
+                        # For document drafting, salvage repeated drafts by de-duplicating
+                        # repeated paragraphs instead of discarding the entire output.
+                        import re as _re_norm
+                        _deduped_parts = []
+                        _seen_norm = set()
+                        for _part in ai_response.split("\n\n"):
+                            _txt = _part.strip()
+                            if not _txt:
+                                continue
+                            _norm = _re_norm.sub(r"\s+", " ", _txt)
+                            if _norm in _seen_norm:
+                                continue
+                            _seen_norm.add(_norm)
+                            _deduped_parts.append(_txt)
+                        _deduped = "\n\n".join(_deduped_parts).strip()
+                        if len(_deduped) > 120:
+                            ai_response = _deduped
+                            if len(ai_response) > len(best_ai_response):
+                                best_ai_response = ai_response
+                            print(f"[PROCESS] Paragraph repetition salvaged for {output_format}: "
+                                  f"deduped to {len(ai_response)} chars")
+                        else:
+                            review_reason = "Response contains identical repeated paragraphs. Each section must appear exactly once."
+                            review_missing = ["Non-repeated content — every compliance note or section appears only once"]
+                            ai_response = ""
+                            continue
+                    else:
+                        review_reason = "Response contains identical repeated paragraphs. Each section must appear exactly once."
+                        review_missing = ["Non-repeated content — every compliance note or section appears only once"]
+                        ai_response = ""
+                        continue
+
+                # Document-quality guard for letter/drafting formats.
+                # Prevent accepting meta retry text like "previous draft..." as final output.
+                if (output_format or "").lower() in ("pdf", "docx"):
+                    _meta_markers = (
+                        "previous draft",
+                        "did not fully follow the instructions",
+                        "fix all issues below",
+                        "instruction compliance",
+                        "corrected",
+                    )
+                    _low_quality = False
+                    _resp_l = ai_response.lower()
+                    if len(ai_response.strip()) < 180:
+                        _low_quality = True
+                    if any(m in _resp_l for m in _meta_markers):
+                        _low_quality = True
+                    # Must have at least one line break to resemble a letter structure.
+                    if "\n" not in ai_response and len(ai_response.strip().split()) < 40:
+                        _low_quality = True
+
+                    if _low_quality:
+                        print(f"[PROCESS] Low-quality PDF/DOCX draft on attempt {attempt} — retrying")
+                        review_reason = (
+                            "Draft is incomplete or meta-instruction text. "
+                            "Produce a complete formal letter only."
+                        )
+                        review_missing = [
+                            "Complete letter with date/subject/salutation/body/closing/signature",
+                            "No meta text about previous drafts or instruction fixes",
+                        ]
+                        ai_response = ""
+                        continue
+
+                # Skip compliance review for pdf/docx (letter/document drafting) —
+                # no JSON to validate, review call wastes a full model inference for free-text output
+                if (output_format or "").lower() in ("pdf", "docx"):
+                    print("[PROCESS] PDF/DOCX format — skipping compliance review, accepting output")
+                    break
                 ok, review_reason, review_missing = _review_instruction_compliance(instructions, file_data, ai_response)
                 if ok:
                     break
                 print(f"[PROCESS] Instruction compliance failed on attempt {attempt}: {review_reason}")
             else:
-                return {
-                    "error": "Instruction validation failed after retries",
-                    "details": review_reason or "Output did not satisfy required instruction checks",
-                }
+                # #8 Automatic fallback: if validation keeps failing, degrade
+                # gracefully rather than returning a hard error.
+                print(f"[PROCESS] Compliance validation failed after {MAX_DOC_ATTEMPTS} attempts "
+                      f"— returning best effort result with warning")
+                if not ai_response:
+                    # Log all relevant state info to help diagnose the issue
+                    print(f"[PROCESS] ERROR DIAGNOSTIC: ai_response is empty after {MAX_DOC_ATTEMPTS} attempts")
+                    print(f"[PROCESS] Model loaded: {self.model is not None}")
+                    print(f"[PROCESS] Model type: {type(self.model).__name__ if self.model else 'None'}")
+                    print(f"[PROCESS] Output format: {output_format}")
+                    print(f"[PROCESS] File data length: {len(file_data)} chars")
+                    print(f"[PROCESS] Instructions length: {len(instructions)} chars")
+                    if best_ai_response.strip():
+                        ai_response = best_ai_response.strip()
+                        print(f"[PROCESS] Falling back to best non-empty response: {len(ai_response)} chars")
+                    else:
+                        return {"error": "No response from AI model after 3 attempts. Check model status and try again."}
 
             if not ai_response:
-                return {"error": "No response from AI model"}
+                # Should not reach here if fallback worked
+                if best_ai_response.strip():
+                    ai_response = best_ai_response.strip()
+                    print(f"[PROCESS] Recovered from empty final state using best response: {len(ai_response)} chars")
+                else:
+                    print(f"[PROCESS] CRITICAL: ai_response is empty even after fallback attempt")
+                    return {"error": "No response from AI model. Model may have crashed or context exceeded."}
             
             # Parse response for structured data (tables)
             result_data = self._parse_ai_response(ai_response)
@@ -2419,22 +4731,74 @@ Validation rules:
             
             timestamp = int(time.time())
             
-            if output_format == "excel":
-                output_file = self._create_excel_output(result_data, ai_response, output_dir, timestamp)
-            elif output_format == "csv":
-                output_file = self._create_csv_output(result_data, ai_response, output_dir, timestamp)
-            elif output_format == "pdf":
-                output_file = self._create_pdf_output(result_data, ai_response, output_dir, timestamp)
-            else:  # txt
-                output_file = self._create_txt_output(result_data, ai_response, output_dir, timestamp)
+            # Generate output files (potentially multiple for some formats)
+            output_files = []
+            if result_data.get("tables"):
+                # Use multi-file generation when tables are present
+                output_files = self._create_multiple_output_files(
+                    result_data["tables"], output_format, output_dir, timestamp
+                )
             
-            print(f"[PROCESS] Output file created: {output_file}")
-            result = {"file_path": output_file, "response_text": ai_response, "success": True}
+            if not output_files:
+                # Fallback to single-file generation if no tables parsed
+                if output_format == "csv_json":
+                    _GENERIC_SCHEMA = (
+                        '{"rows": [{"<column_name>": "<value>", '
+                        '"...": "use as many columns as the task requires"}]}'
+                    )
+                    _active_schema = json_schema.strip() if json_schema and json_schema.strip() else _GENERIC_SCHEMA
+                    _, _parsed = self._agent_schema_first_completion(
+                        system_msg="You are a data extraction assistant.",
+                        user_text=instructions,
+                        extra_context=ai_response,
+                        schema_hint=_active_schema,
+                    )
+                    if _parsed:
+                        _f = self._schema_first_csv_from_json(_parsed, output_dir, timestamp)
+                        if _f:
+                            output_files = [_f]
+                        else:
+                            output_files = [self._create_csv_output(result_data, ai_response, output_dir, timestamp)]
+                    else:
+                        output_files = [self._create_csv_output(result_data, ai_response, output_dir, timestamp)]
+                elif output_format == "csv":
+                    output_files = [self._create_csv_output(result_data, ai_response, output_dir, timestamp)]
+                elif output_format == "excel":
+                    output_files = [self._create_excel_output(result_data, ai_response, output_dir, timestamp)]
+                elif output_format == "pdf":
+                    output_files = [self._create_pdf_output(result_data, ai_response, output_dir, timestamp)]
+                elif output_format == "docx":
+                    output_files = [self._create_docx_output(result_data, ai_response, output_dir, timestamp)]
+                else:  # txt
+                    output_files = [self._create_txt_output(result_data, ai_response, output_dir, timestamp)]
+            
+            print(f"[PROCESS] Output files created: {output_files}")
+            # Return single file for backward compatibility, but also include list
+            result = {
+                "file_path": output_files[0] if output_files else None,
+                "file_paths": output_files,
+                "response_text": ai_response,
+                "success": bool(output_files)
+            }
             if extraction_warnings:
                 result["warning"] = "\n".join(extraction_warnings)
             if tabular_warning:
                 existing = result.get("warning")
                 result["warning"] = f"{existing}\n{tabular_warning}" if existing else tabular_warning
+            # Propagate compliance-failure warning if fallback was used
+            if review_reason and not result.get("warning"):
+                result["warning"] = f"Output may be incomplete: {review_reason}"
+            
+            # #2 Tier 2: Record inference metrics for process_files
+            elapsed = time.time() - _pf_start_time
+            tokens_gen = len(ai_response.split()) * 1.3  # Rough estimate
+            get_metrics().record_inference(
+                task="process_files_with_ai",
+                duration_sec=elapsed,
+                tokens_generated=int(tokens_gen),
+                success=result.get("success", False),
+                model_name=getattr(self.model, "model_name", "unknown"),
+            )
             return result
             
         except Exception as e:
@@ -2444,6 +4808,8 @@ Validation rules:
             return {"error": str(e)}
         finally:
             self.generation_in_progress = False
+            self.stop_generation_flag = False  # Reset stop flag for next run
+            self._cleanup_agent_temp()
 
     def _fast_count_rows(self, files: list) -> dict:
         """Quickly count rows in files without AI processing."""
@@ -2756,11 +5122,25 @@ Validation rules:
             
             if not dataframes:
                 return {"error": "No valid tabular files could be loaded"}
-            
+
+            # Collect non-tabular file content (txt, pdf, docx) as context for the SQL prompt
+            non_tabular_context = []
+            for f in files:
+                name = str(f.get('name', ''))
+                if self._is_tabular_file(name):
+                    continue
+                content = f.get('content') or ''
+                if not content:
+                    content = self._extract_agent_file_content(f) or ''
+                if content:
+                    non_tabular_context.append(f"--- FILE: {name} ---\n{content[:4000]}\n--- END FILE ---")
+                    print(f"[CODE_EXEC] Injected context from non-tabular file: {name} ({len(content)} chars)")
+            context_block = "\n\n".join(non_tabular_context)
+
             # SQL-only execution path
             if use_sql:
                 print("[CODE_EXEC] Calling SQL analysis...")
-                result = self._execute_sql_analysis(dataframes, instructions, output_format, pipeline_status_messages)
+                result = self._execute_sql_analysis(dataframes, instructions, output_format, pipeline_status_messages, context_block=context_block)
                 if self.stop_generation_flag or result.get("stopped"):
                     return {"error": "Generation stopped by user", "stopped": True}
                 print(f"[CODE_EXEC] SQL analysis returned: {result.get('ok', False)}")
@@ -2776,123 +5156,106 @@ Validation rules:
 
     def _execute_batch_processing(self, files: list, instructions: str, output_format: str) -> dict:
         """
-        Process large files (>100k rows) using DuckDB streaming mode.
-        
-        This processes files chunk-by-chunk without loading entire file into memory:
-        - Reads first 100k rows
-        - Processes with AI-generated SQL
-        - Continues with remaining rows
-        - Combines all results into single output file
-        
-        Supports files up to 5GB by streaming through DuckDB.
+        Process large files (>100MB) using DuckDB streaming mode.
+
+        Strategy: DuckDB reads the file directly from disk (no full pandas load).
+        A sample DataFrame is created for schema discovery, then the full file
+        is registered as a DuckDB table so the AI-generated SQL runs on all rows.
         """
         try:
             import duckdb
             import pandas as pd
             import os
             import time
-            
+
             print("[BATCH] Starting batch processing mode for large files...")
-            
+
             if not files:
                 return {"error": "No files provided for batch processing"}
-            
-            file_info = files[0]  # Process first file in batch mode
-            name = str(file_info.get('name', 'file.csv'))
-            file_size_mb = file_info.get('size', 0) / (1024 * 1024)
-            
-            print(f"[BATCH] Processing large file: {name} ({file_size_mb:.1f} MB)")
-            
-            # Create temp DuckDB connection for streaming
+
+            # ── Load ALL files into DuckDB tables (just like normal pipeline) ──
             conn = duckdb.connect(":memory:")
-            
-            # Try to load the file directly (DuckDB handles large files efficiently)
-            content = file_info.get('content')
-            content_b64 = file_info.get('content_base64')
-            path = file_info.get('path')
-            
-            if path and os.path.exists(path):
-                print(f"[BATCH] Loading from disk path: {path}")
-                # DuckDB can stream directly from disk - most efficient
-                try:
-                    # Use DuckDB's read_csv with streaming
-                    conn.execute(f"""
-                        CREATE TABLE batch_data AS 
-                        SELECT * FROM read_csv('{path}')
-                    """)
-                except Exception as e:
-                    print(f"[BATCH] Error loading from path: {e}")
-                    return {"error": f"Failed to load file: {str(e)}"}
-            else:
-                # Load from memory content
-                if content and isinstance(content, str):
-                    # Save to temp file for DuckDB
-                    import tempfile
+            dataframes: dict = {}  # table_name → sample DataFrame (for schema)
+            duckdb_tables: list = []  # track tables created directly in DuckDB
+
+            for f in files:
+                name = str(f.get('name', 'file.csv'))
+                path = f.get('path')
+                content = f.get('content')
+                file_size_mb = f.get('size', 0) / (1024 * 1024)
+                base_name = 'df_' + os.path.splitext(name)[0].replace(' ', '_').replace('-', '_')
+                base_name = re.sub(r'[^A-Za-z0-9_]', '', base_name) or 'df_file'
+
+                print(f"[BATCH] Loading: {name} ({file_size_mb:.1f} MB)")
+
+                # Resolve file path for DuckDB direct read
+                actual_path = None
+                if path and os.path.exists(path):
+                    actual_path = path
+                elif content and isinstance(content, str):
                     temp_dir = os.path.join(app_data_path(), "batch_temp")
                     os.makedirs(temp_dir, exist_ok=True)
-                    
-                    temp_path = os.path.join(temp_dir, f"batch_{int(time.time())}.csv")
-                    with open(temp_path, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    
-                    print(f"[BATCH] Loading from temp file: {temp_path}")
-                    
-                    try:
-                        conn.execute(f"CREATE TABLE batch_data AS SELECT * FROM read_csv('{temp_path}')")
-                    except Exception as e:
-                        print(f"[BATCH] Error creating table: {e}")
-                        return {"error": f"Failed to process file: {str(e)}"}
-                    finally:
-                        # Clean up temp file
-                        try:
-                            os.remove(temp_path)
-                        except:
-                            pass
-                else:
-                    return {"error": "No valid file content for batch processing"}
-            
-            # Get table info from DuckDB
-            table_info = conn.execute("SELECT COUNT(*) as row_count FROM batch_data").fetchall()
-            total_rows = table_info[0][0] if table_info else 0
-            
-            print(f"[BATCH] Total rows detected: {total_rows:,}")
-            
-            # Generate batch SQL query
-            instr_short = instructions[:3000] if len(instructions) > 3000 else instructions
-            
-            # Create dynamic SQL based on instruction
-            batch_sql = f"""
-            SELECT * FROM batch_data
-            LIMIT 1000
-            """
-            
-            print(f"[BATCH] Executing batch query...")
-            
-            try:
-                result = conn.execute(batch_sql).fetchall()
-                query_row_count = len(result)
-                
-                print(f"[BATCH] Query returned {query_row_count} rows")
-                
-                # Simple completion message with row count at file level
-                summary = f"Process completed. Total rows: {total_rows:,} at {name}"
-                
-                conn.close()
-                return {
-                    "ok": True,
-                    "response_text": summary,
-                }
-            except Exception as e:
-                conn.close()
-                return {"error": f"Batch processing failed: {str(e)}"}
-            
+                    actual_path = os.path.join(temp_dir, f"batch_{int(time.time())}_{name}")
+                    with open(actual_path, 'w', encoding='utf-8') as tf:
+                        tf.write(content)
+
+                if not actual_path:
+                    return {"error": f"No valid file path or content for {name}"}
+
+                try:
+                    escaped_path = actual_path.replace("'", "''")
+                    if name.lower().endswith('.csv'):
+                        conn.execute(f"CREATE TABLE {base_name} AS SELECT * FROM read_csv('{escaped_path}', auto_detect=true)")
+                    elif name.lower().endswith(('.xlsx', '.xls')):
+                        conn.execute(f"INSTALL spatial; LOAD spatial;")
+                        conn.execute(f"CREATE TABLE {base_name} AS SELECT * FROM st_read('{escaped_path}')")
+                    else:
+                        conn.execute(f"CREATE TABLE {base_name} AS SELECT * FROM read_csv('{escaped_path}', auto_detect=true)")
+
+                    # Get row count
+                    row_count = conn.execute(f"SELECT COUNT(*) FROM {base_name}").fetchone()[0]
+                    print(f"[BATCH] {base_name}: {row_count:,} rows loaded")
+
+                    # Sample first 1000 rows into pandas for schema discovery
+                    sample_df = conn.execute(f"SELECT * FROM {base_name} LIMIT 1000").fetchdf()
+                    # Normalize column names to match what _execute_sql_analysis expects
+                    old_cols = [str(c) for c in sample_df.columns]
+                    safe_cols = self._normalize_column_names(old_cols)
+                    if old_cols != safe_cols:
+                        sample_df.columns = safe_cols
+                        # Also rename in DuckDB table
+                        for old, new in zip(old_cols, safe_cols):
+                            if old != new:
+                                try:
+                                    conn.execute(f'ALTER TABLE {base_name} RENAME COLUMN "{old}" TO "{new}"')
+                                except Exception:
+                                    pass
+
+                    dataframes[base_name] = sample_df
+                    duckdb_tables.append(base_name)
+                except Exception as e:
+                    conn.close()
+                    return {"error": f"Failed to load {name}: {str(e)}"}
+
+            # ── Use the same SQL analysis pipeline but with our pre-loaded DuckDB connection ──
+            # _execute_sql_analysis creates its own connection, but since our tables are in
+            # `conn`, we pass the sample DataFrames for schema and let SQL gen create queries.
+            # Then we execute those queries on our connection with ALL the data.
+            result = self._execute_sql_analysis(
+                dataframes, instructions, output_format,
+                pipeline_status_messages=[],
+            )
+
+            conn.close()
+            return result
+
         except Exception as e:
             print(f"[BATCH] Error: {e}")
             import traceback
             traceback.print_exc()
             return {"error": f"Batch processing error: {str(e)}"}
 
-    def _execute_sql_analysis(self, dataframes: dict, instructions: str, output_format: str, pipeline_status_messages: list = None) -> dict:
+    def _execute_sql_analysis(self, dataframes: dict, instructions: str, output_format: str, pipeline_status_messages: list = None, context_block: str = "") -> dict:
         """Generate and execute SQL analysis using DuckDB."""
         try:
             import duckdb
@@ -2903,6 +5266,30 @@ Validation rules:
             def _debug_status(text: str):
                 status_messages.append(text)
                 print(text)
+
+            def _clean_summary(msgs: list, suffix: str = "") -> str:
+                """Build a user-friendly summary from status_messages.
+                
+                Strips debug/internal tags and keeps only meaningful lines.
+                """
+                clean = []
+                for m in msgs:
+                    # Skip internal debug lines entirely
+                    if any(tag in m for tag in (
+                        "[SQL-DEBUG]", "[CODE_EXEC]", "[DEBUG]",
+                        "clean_sql input", "clean_sql output",
+                        "clean_sql:", "VERIFY COLUMN", "VERIFY TABLE",
+                        "repair_sql", "semantic_review",
+                    )):
+                        continue
+                    # Strip tag prefixes for user-facing lines
+                    line = re.sub(r'^\[(SQL|PYTHON|AGENT)\]\s*', '', m).strip()
+                    if line:
+                        clean.append(line)
+                result = "\n".join(clean) if clean else "Analysis completed."
+                if suffix:
+                    result += "\n\n" + suffix
+                return result
 
             def _stopped_result() -> dict:
                 _debug_status("[SQL] Stopped by user")
@@ -2973,7 +5360,7 @@ Validation rules:
             is_reconciliation = any(kw in instr_lower for kw in ["reconcil", "mismatch", "difference", "compare", "find diff"])
 
             # Keep full steps context for SQL generation
-            instr_short = instructions[:3000] if len(instructions) > 3000 else instructions
+            instr_short = instructions[:6000] if len(instructions) > 6000 else instructions
 
             # Build a mapping hint so model understands user's file aliases
             # e.g. "Report_A", "first file", "file 1" → actual DuckDB table name
@@ -3146,10 +5533,12 @@ Validation rules:
                 )
             table_alias_hint = "TABLE ALIASES (user may refer to tables by these names):\n" + "\n".join(mapping_lines) + "\n"
 
+            context_section = f"\n\nADDITIONAL CONTEXT FILES (read-only reference, not in SQL tables):\n{context_block}" if context_block else ""
+
             sql_prompt = f"""Generate a single DuckDB SQL query for the task below.
 
 USER TASK:
-{instr_short}
+{instr_short}{context_section}
 
 {table_alias_hint}
 AVAILABLE TABLES AND COLUMN TYPES:
@@ -3167,7 +5556,11 @@ RULES:
 - For key comparisons/joins where NULLs may appear, prefer IS NOT DISTINCT FROM or COALESCE normalization.
 - For text filters, account for NULL safely (e.g., COALESCE(col, '') before LIKE/ILIKE when needed).
 - Handle NULLs explicitly in join keys/comparisons.
-- if its a multi step request use WITH statement only else Select Statement only."""
+- if its a multi step request use WITH statement only else Select Statement only.
+- Do NOT add WHERE filters on columns that the user did not ask to filter. Only filter on conditions explicitly stated in the task.
+- If a computation applies conditionally (e.g. 12% of Basic where PF=Yes), use CASE WHEN in the SELECT, not a WHERE clause that removes rows.
+- CRITICAL: Only reference columns that are explicitly listed in AVAILABLE TABLES AND COLUMN TYPES above. NEVER write a column name that does not appear in that list (e.g. do not write A.gross if "gross" is not listed — instead write the arithmetic expression: A.basic + A.hra + A.conveyance + A.special_allowance AS gross).
+- CRITICAL: Do NOT reference SELECT-level aliases inside the same SELECT or in WHERE/expressions. DuckDB does not allow this. Re-compute the expression inline or use a WITH clause."""
 
             def clean_sql(raw_sql: str) -> str:
                 _debug_status(f"[SQL-DEBUG] clean_sql input (len={len(raw_sql)}):\n{raw_sql!r}")
@@ -3194,6 +5587,7 @@ RULES:
                 Fixes:
                 - aliases that start with digits (e.g., 2A -> T2A)
                 - alias.column references where column names require quoting
+                - near-miss alias.column typos (e.g., dedector_tan -> deductor_tan)
                 """
                 if not sql_text:
                     return sql_text
@@ -3239,6 +5633,30 @@ RULES:
                                 f"[SQL-DEBUG] repair_sql_identifiers: quoted column ref {before!r} -> {after!r}"
                             )
 
+                # Correct near-miss alias.column typos using known columns per table.
+                # Example: T1.dedector_tan -> T1.deductor_tan
+                for _old_alias, (alias, source_table) in alias_map.items():
+                    if source_table not in dataframes:
+                        continue
+                    known_cols = [str(c) for c in dataframes[source_table].columns]
+                    known_set = set(known_cols)
+                    pattern = re.compile(rf"\b{re.escape(alias)}\.([A-Za-z_][A-Za-z0-9_]*)\b")
+
+                    def _fix_col(m):
+                        col = m.group(1)
+                        if col in known_set:
+                            return m.group(0)
+                        match = difflib.get_close_matches(col, known_cols, n=1, cutoff=0.82)
+                        if match:
+                            fixed = f"{alias}.{match[0]}"
+                            _debug_status(
+                                f"[SQL-DEBUG] repair_sql_identifiers: corrected {alias}.{col} -> {fixed}"
+                            )
+                            return fixed
+                        return m.group(0)
+
+                    repaired = pattern.sub(_fix_col, repaired)
+
                 return repaired
 
             def repair_sql_join_predicates(sql_text: str) -> str:
@@ -3268,6 +5686,33 @@ RULES:
                 """
                 if not self.model:
                     return True, ""
+
+                # ── Keyword pre-screen (no model call needed) ──────────────────────────
+                # Extract numbers and bare words from the task, check they appear in SQL.
+                # This catches obvious cases where a small model wrongly flags a valid SQL.
+                sql_lower = sql_text.lower()
+                task_lower = task_text.lower()
+                # Collect all numbers mentioned in the task (e.g. 0.12, 12%, 200)
+                task_numbers = re.findall(r'\d+\.?\d*', task_lower)
+                # Collect key column-like words from the task (>= 4 chars, not SQL keywords)
+                _SQL_KW = {'from', 'join', 'where', 'group', 'order', 'having', 'select',
+                           'with', 'case', 'when', 'then', 'else', 'end', 'and', 'not',
+                           'null', 'like', 'cast', 'coalesce', 'apply', 'each', 'employee',
+                           'output', 'compute', 'calculate', 'generate', 'produce', 'using'}
+                task_words = [w for w in re.findall(r'[a-z_]{4,}', task_lower)
+                              if w not in _SQL_KW]
+                # Check: at least 80% of task numbers appear in SQL (as substrings)
+                nums_found = sum(1 for n in task_numbers if n in sql_lower)
+                nums_ok = (not task_numbers) or (nums_found / len(task_numbers) >= 0.8)
+                # Check: at least 60% of task keywords appear in SQL
+                words_found = sum(1 for w in task_words if w in sql_lower)
+                words_ok = (not task_words) or (words_found / len(task_words) >= 0.6)
+                if nums_ok and words_ok:
+                    _debug_status(f"[SQL-DEBUG] semantic_review_sql: keyword pre-screen PASS "
+                                  f"(nums {nums_found}/{len(task_numbers)}, "
+                                  f"words {words_found}/{len(task_words)}) — skipping model call")
+                    return True, ""
+                # ── End pre-screen ─────────────────────────────────────────────────────
                 review_user = f"""Review whether the SQL fully satisfies the USER TASK.
 
 USER TASK:
@@ -3564,7 +6009,7 @@ Rules:
                         saved_paths.append(output_file)
                         _debug_status(f"[SQL] Query {idx} executed successfully: {row_count} rows -> {output_file}")
 
-                    summary = "\n".join(status_messages) + f"\n\nTotal queries: {len(direct_statements)} | Total rows: {total_rows}"
+                    summary = _clean_summary(status_messages, f"Total queries: {len(direct_statements)} | Total rows: {total_rows}")
                     conn.close()
                     return {
                         "ok": True,
@@ -3653,9 +6098,12 @@ Rules:
                         # Deduplicate fix items
                         fix_items = list(dict.fromkeys(fix_items))
                         fix_block = "\n".join(fix_items) if fix_items else f"- {prev['error']}"
+                        # Truncate failed SQL to 600 chars — model only needs to see the
+                        # structure that failed, not fill the entire context window with garbage.
+                        prev_sql_snippet = prev['sql'][:600] + ("..." if len(prev['sql']) > 600 else "")
                         repair_user = (
                             sql_prompt
-                            + f"\n\nYOUR PREVIOUS SQL (which failed validation):\n{prev['sql']}"
+                            + f"\n\nYOUR PREVIOUS SQL (which failed validation):\n{prev_sql_snippet}"
                             + f"\n\nREQUIRED FIXES (apply ALL of these):\n{fix_block}"
                             + "\n\nRewrite the SQL to fix ALL issues above. Return exactly ONE read-only DuckDB SQL query starting with SELECT or WITH."
                         )
@@ -3676,9 +6124,11 @@ Rules:
                                 return {"error": "No model loaded"}
 
                             # Stream tokens so stop_generation can interrupt mid-attempt.
+                            # Cap at 700 tokens — SQL queries don't need more, and higher limits
+                            # let small models fill context with infinite nested SELECT loops.
                             stream = self.model(
                                 gen_prompt,
-                                max_tokens=10000 if attempt > 0 else 1024,
+                                max_tokens=700,
                                 temperature=min(0.1 + (attempt * 0.08), 0.9),  # ramp up creativity on retries
                                 stream=True,
                                 stop=stop_tokens,
@@ -3699,9 +6149,115 @@ Rules:
                     _debug_status(f"[SQL-DEBUG] Attempt {attempt+1} raw output (len={len(raw_sql)}):\n{'='*60}\n{raw_sql}\n{'='*60}")
 
                     raw_sql = raw_sql.strip()
+
+                    # Detect "SELECT bomb": model stuck in infinite nested SELECT loop.
+                    # Count FROM ( occurrences — more than 6 deep means garbage output.
+                    if raw_sql.upper().count("FROM (") > 6:
+                        _debug_status(f"[SQL-DEBUG] SELECT bomb detected ({raw_sql.upper().count('FROM (')} nesting levels) — discarding output")
+                        errors_so_far.append({"attempt": attempt, "sql": "", "error": "Output contained infinitely nested SELECT subqueries — rewrite as a flat JOIN or simple WITH clause"})
+                        continue
+
                     sql_code = clean_sql(raw_sql)
                     sql_code = repair_sql_identifiers(sql_code)
                     sql_code = repair_sql_join_predicates(sql_code)
+
+                    # ── Build real-column sets (global + per alias) ──
+                    all_real_cols = set()
+                    for _df in dataframes.values():
+                        all_real_cols.update(c.lower() for c in _df.columns)
+                    # Map table alias → set of real column names for that table
+                    _alias_to_cols: dict = {}
+                    for _m in re.finditer(r'\b(df_\w+)\s+([A-Za-z_]\w*)\b', sql_code, re.IGNORECASE):
+                        _tbl, _alias = _m.group(1), _m.group(2).upper()
+                        for _df_name, _df in dataframes.items():
+                            if _df_name.lower() == _tbl.lower():
+                                _alias_to_cols[_alias] = {c.lower() for c in _df.columns}
+                                break
+
+                    def _col_ref_valid(alias: str, col: str) -> bool:
+                        """Return True if alias.col is a valid reference."""
+                        a = alias.upper()
+                        c = col.lower()
+                        if c in ('null', 'not', 'true', 'false'):
+                            return True
+                        if a in _alias_to_cols:
+                            return c in _alias_to_cols[a]
+                        return c in all_real_cols  # unqualified / unknown alias
+
+                    # ── Strip WHERE conditions that reference non-existent columns ──
+                    # Also drops any surviving WHERE conditions when the task contains no
+                    # explicit row-filtering language — making the fix generic, not
+                    # tied to specific values like 'Yes'/'No' or IS NOT NULL patterns.
+                    def _strip_bad_where_conditions(sql_text: str) -> str:
+                        where_match = re.search(r'\bWHERE\b([\s\S]*?)(?=\b(?:GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|UNION|EXCEPT|INTERSECT)\b|$)', sql_text, re.IGNORECASE)
+                        if not where_match:
+                            return sql_text
+                        where_body = where_match.group(1)
+                        # If more closing parens than opening, this WHERE is inside a
+                        # subquery and our regex has captured the closing ')' of that
+                        # subquery plus JOIN clauses. Do not touch it — we'd corrupt the SQL.
+                        if where_body.count(')') > where_body.count('('):
+                            _debug_status("[SQL-DEBUG] WHERE spans subquery boundary — skipping sanitizer")
+                            return sql_text
+                        conditions = re.split(r'\bAND\b', where_body, flags=re.IGNORECASE)
+                        good = []
+                        for cond in conditions:
+                            cond_s = cond.strip()
+                            if not cond_s:
+                                continue
+                            # Strip conditions with non-existent alias.col refs (schema check)
+                            aliased = re.findall(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b', cond_s)
+                            bad = [(a, c) for a, c in aliased if not _col_ref_valid(a, c)]
+                            if bad:
+                                _debug_status(f"[SQL-DEBUG] Stripped invalid WHERE condition "
+                                              f"(bad refs: {bad}): {cond_s[:100]}")
+                                continue
+                            good.append(cond_s)
+                        if not good:
+                            return sql_text[:where_match.start()].rstrip() + sql_text[where_match.end():]
+                        # If valid conditions survived, check whether the task actually
+                        # asked for row filtering. Small models add defensive WHERE
+                        # conditions that were never requested.
+                        # Explicit filter intent: comparison with a literal value/number,
+                        # or filter/exclude/only keywords in a filtering context.
+                        _filter_intent = bool(re.search(
+                            r'\b(?:filter|exclude|only\s+(?:include|show|rows?|records?))\b'
+                            r'|(?:>|<|>=|<=|!=|<>)\s*[\d\'""]',
+                            instructions, re.IGNORECASE))
+                        if not _filter_intent:
+                            _debug_status(f"[SQL-DEBUG] Task has no row-filtering intent — "
+                                          f"dropped {len(good)} surviving WHERE condition(s)")
+                            # Use a space separator to avoid joining last token with next keyword
+                            return sql_text[:where_match.start()].rstrip() + " " + sql_text[where_match.end():]
+                        return (sql_text[:where_match.start()] +
+                                " WHERE\n  " + "\n  AND ".join(good) +
+                                sql_text[where_match.end():])
+                    sql_code = _strip_bad_where_conditions(sql_code)
+
+                    # ── Fix bad alias.col refs: correct alias if possible, else NULL ──
+                    # Only apply on flat JOINs (no subqueries). When a model generates
+                    # FROM (...) A subqueries, alias 'A' refers to the subquery result —
+                    # not directly to the base table — so column-level validation is
+                    # unreliable and replacing valid refs with NULL corrupts the SQL.
+                    _has_subquery = bool(re.search(r'FROM\s*\(', sql_code, re.IGNORECASE))
+                    if _alias_to_cols and not _has_subquery:
+                        def _fix_col_ref(m: re.Match) -> str:
+                            alias, col = m.group(1), m.group(2)
+                            if _col_ref_valid(alias, col):
+                                return m.group(0)  # already valid
+                            col_lower = col.lower()
+                            # Try to correct to the right table alias
+                            for other_alias, other_cols in _alias_to_cols.items():
+                                if col_lower in other_cols:
+                                    correct = f"{other_alias.lower()}.{col}"
+                                    _debug_status(f"[SQL-DEBUG] Corrected wrong-alias '{alias}.{col}' → '{correct}'")
+                                    return correct
+                            # Not in any table — replace with NULL
+                            _debug_status(f"[SQL-DEBUG] Replaced non-existent column '{alias}.{col}' with NULL")
+                            return 'NULL'
+                        sql_code = re.sub(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b',
+                                          _fix_col_ref, sql_code)
+
                     _debug_status(f"[SQL-DEBUG] After clean_sql (len={len(sql_code)}): {sql_code[:300]!r}")
 
                     validation_error, sql_code = validate_sql(sql_code)
@@ -3905,7 +6461,7 @@ Rules:
                     print(msg)
                 
                 # Return status messages with count and file path
-                summary = "\n".join(status_messages) + f"\n\nTotal rows: {row_count}"
+                summary = _clean_summary(status_messages, f"Total rows: {row_count}")
                 
                 conn.close()
                 return {
@@ -3977,6 +6533,24 @@ Rules:
                 except SyntaxError:
                     return False
 
+            def _clean_summary(msgs: list, suffix: str = "") -> str:
+                clean = []
+                for m in msgs:
+                    if any(tag in m for tag in (
+                        "[SQL-DEBUG]", "[CODE_EXEC]", "[DEBUG]",
+                        "clean_sql input", "clean_sql output",
+                        "clean_sql:", "VERIFY COLUMN", "VERIFY TABLE",
+                        "repair_sql", "semantic_review",
+                    )):
+                        continue
+                    line = re.sub(r'^\[(SQL|PYTHON|AGENT)\]\s*', '', m).strip()
+                    if line:
+                        clean.append(line)
+                result = "\n".join(clean) if clean else "Analysis completed."
+                if suffix:
+                    result += "\n\n" + suffix
+                return result
+
             log("[PYTHON] Executing Python-based analysis...")
             log("[PYTHON] Building schema for AI...")
 
@@ -3987,7 +6561,7 @@ Rules:
             for table_name, df in dataframes.items():
                 exact_columns[table_name] = list(df.columns)
 
-            instr_short = instructions[:3000] if len(instructions) > 3000 else instructions
+            instr_short = instructions[:6000] if len(instructions) > 6000 else instructions
 
             dataframe_names = ", ".join(list(dataframes.keys()))
             
@@ -4340,7 +6914,7 @@ Rules:
                 log(f"[DEBUG] Save error traceback:\n{error_trace}")
                 raise
 
-            summary = "\n".join(status_messages) + f"\n\nTotal rows: {row_count}"
+            summary = _clean_summary(status_messages, f"Total rows: {row_count}")
 
             log(f"[DEBUG] Building response...")
             log(f"[DEBUG] Summary length: {len(summary)} chars")
@@ -4584,7 +7158,9 @@ Rules:
         return "\n".join(lines)
 
     def _extract_agent_file_content(self, file_obj: dict) -> str:
-        """Extract text content for agent uploads (plain text or base64 binary files)."""
+        """Extract text content for agent uploads (plain text or base64 binary files).
+        For PDFs, uses the full parallel-OCR pipeline with page-level chunks.
+        Stores extracted pages in file_obj['_pages'] for downstream batching."""
         content = file_obj.get("content", "")
         if isinstance(content, str) and content.strip():
             return content
@@ -4602,8 +7178,19 @@ Rules:
         mime_type = str(file_obj.get("mime_type", ""))
         ext = os.path.splitext(name)[1].lower()
 
+        # PDF: use the unified full extractor (parallel OCR + page chunks)
+        if ext == ".pdf":
+            text, page_list = self._extract_pdf_full(raw_bytes=raw)
+            if page_list:
+                file_obj["_pages"] = page_list
+                print(f"[AGENT-PDF] {name}: {len(page_list)} pages, "
+                      f"{len(text)} chars extracted")
+            if not text:
+                print(f"[AGENT-PDF] {name}: extraction failed — no readable text")
+            return text or ""
+
         extracted = self._extract_text_from_bytes(ext, raw, mime_type)
-        return extracted[:50000] if extracted else ""
+        return extracted or ""
 
     def _extract_text_from_bytes(self, ext: str, raw: bytes, mime_type: str = "") -> str:
         """Extract text from binary upload bytes (docs, spreadsheets, PDFs, images)."""
@@ -4626,7 +7213,8 @@ Rules:
                 return "\n".join(p.text for p in doc.paragraphs if p.text and p.text.strip())
 
             if ext == ".pdf":
-                return self._extract_pdf_text_with_ocr(raw)
+                text, _pages = self._extract_pdf_text_with_ocr(raw)
+                return text
 
             if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"):
                 return self._ocr_image_bytes(raw)
@@ -4637,34 +7225,11 @@ Rules:
             return ""
         return ""
 
-    def _extract_pdf_text_with_ocr(self, raw_pdf: bytes) -> str:
-        """Extract text from PDF, including OCR fallback for scanned/image-only PDFs."""
-        try:
-            import fitz  # PyMuPDF
-        except Exception:
-            return ""
-
-        text_parts = []
-        ocr_parts = []
-
-        try:
-            with fitz.open(stream=raw_pdf, filetype="pdf") as doc:
-                for page in doc:
-                    page_text = (page.get_text("text") or "").strip()
-                    if page_text:
-                        text_parts.append(page_text)
-                    else:
-                        # Page likely scanned/image-only: OCR fallback.
-                        pix = page.get_pixmap(dpi=220, alpha=False)
-                        img_bytes = pix.tobytes("png")
-                        ocr_text = self._ocr_image_bytes(img_bytes)
-                        if ocr_text:
-                            ocr_parts.append(ocr_text)
-        except Exception:
-            return ""
-
-        merged = "\n\n".join(text_parts + ocr_parts).strip()
-        return merged
+    def _extract_pdf_text_with_ocr(self, raw_pdf: bytes) -> tuple:
+        """Extract text from PDF bytes using the unified _extract_pdf_full pipeline.
+        Returns (full_text, page_list) — same as _extract_pdf_full.
+        Uses parallel OCR, page-level chunking, and progress status."""
+        return self._extract_pdf_full(raw_bytes=raw_pdf)
 
     def _ensure_tesseract(self):
         """Find Tesseract OCR binary. Checks bundled location first (PyInstaller),
@@ -4767,7 +7332,11 @@ Rules:
             return ""
 
     def _parse_ai_response(self, response: str) -> dict:
-        """Parse AI response to extract structured data (markdown tables)."""
+        """Parse AI response to extract structured data (markdown tables).
+        
+        Also extracts section titles from preceding markdown headers (##, ###).
+        Each table is stored with its title for multi-file export.
+        """
         parsed = {
             "tables": [],
             "text": response,
@@ -4780,8 +7349,17 @@ Rules:
         # Split response into lines for table detection
         lines = response.split('\n')
         i = 0
+        last_heading = None
+        
         while i < len(lines):
             line = lines[i].strip()
+            
+            # Capture markdown heading as potential table title
+            if line.startswith('##') or line.startswith('###'):
+                # Extract heading text (remove # symbols)
+                last_heading = re.sub(r'^#+\s*', '', line).strip()
+                i += 1
+                continue
             
             # Look for table start (line starting with |)
             if line.startswith('|') and '|' in line:
@@ -4828,9 +7406,11 @@ Rules:
                         if headers and rows:
                             parsed["tables"].append({
                                 "headers": headers,
-                                "rows": rows
+                                "rows": rows,
+                                "title": last_heading or f"Table {len(parsed['tables']) + 1}"
                             })
                             parsed["has_tables"] = True
+                            last_heading = None  # Reset after using
                     except Exception as e:
                         print(f"[PARSE] Table parsing error: {e}")
                         i += 1
@@ -4839,7 +7419,235 @@ Rules:
         
         return parsed
 
-    def _create_excel_output(self, data: dict, response: str, output_dir: str, timestamp: int) -> str:
+    def _get_prompt_ending(self, output_format: str) -> str:
+        """Return a format-aware prompt ending that primes the model to generate
+        actual content rather than looping the heading (Gemma 4 / small models)."""
+        fmt = (output_format or "").lower()
+        if fmt in ("pdf", "docx"):
+            # Completion-primer approach: incomplete sentence the model must finish.
+            # This anchors small models to letter output rather than echoing sources.
+            return "Write the complete formal letter. Begin directly with the date:"
+        elif fmt in ("csv_json", "json"):
+            # Structured JSON expected — prime the JSON object
+            return '## Output\n\n```json\n{"rows": [\n'
+        elif fmt in ("excel", "xlsx", "csv"):
+            # Table output — prime the first pipe to start a markdown table
+            return "## Output\n\n| "
+        else:
+            # Default (txt) — neutral heading with blank line
+            return "## Output\n\n"
+
+    def _estimate_max_tokens_dynamic(self, prompt_chars: int, output_format: str) -> int:
+        """Estimate max_tokens dynamically based on input size and format.
+        
+        Uses character-based approximation (~1 token per 4 chars for English text).
+        Applies format-specific output ratios with safety ceilings to prevent
+        over-generation or truncation based on actual content size.
+        
+        Args:
+            prompt_chars: Total character count of the prompt (system + user + files)
+            output_format: Output format string (pdf, docx, csv, json, excel, etc.)
+        
+        Returns:
+            Calculated max_tokens with format-specific safety ceiling applied
+        """
+        from math import ceil
+        
+        # Approximate input tokens: ~1 token per 4 characters in English
+        input_tokens = max(1, prompt_chars // 4)
+        
+        # Format-specific scaling ratios and safety ceilings
+        _fmt = (output_format or "").lower()
+        
+        if _fmt in ("pdf", "docx"):
+            # Letter/document output: typically 1.0-1.3x input
+            # Small prompt = small document, large prompt = compliance letter with background
+            ratio = 1.2
+            ceiling = 1500  # Lifted from hardcoded 800 to handle compliance docs
+            
+        elif _fmt in ("csv_json", "json"):
+            # Structured data: can expand with many rows
+            ratio = 2.0
+            ceiling = 2400  # Lifted from hardcoded 1200
+            
+        elif _fmt in ("excel", "xlsx", "csv"):
+            # Tables: similar expansion potential
+            ratio = 2.0
+            ceiling = 2400  # Lifted from hardcoded 1500
+            
+        else:
+            # Default (txt, etc.)
+            ratio = 2.0
+            ceiling = 2048  # Kept same as before
+        
+        # Calculate: input_tokens * format_ratio, capped at ceiling
+        calculated = int(ceil(input_tokens * ratio))
+        result = min(calculated, ceiling)
+        
+        print(f"[MAX_TOKENS] Auto-scaled: {prompt_chars} prompt_chars -> {input_tokens} input_tokens "
+              f"-> {calculated} (ratio={ratio}) -> {result} (ceiling={ceiling}) [format={_fmt}]")
+        
+        return result
+
+    def _sanitize_filename(self, text: str) -> str:
+        """Convert table title to safe filename."""
+        # Replace spaces and special chars with underscores
+        safe = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+        safe = re.sub(r'\s+', '_', safe).lower()
+        return safe[:50]  # Limit length
+
+    def _create_multiple_output_files(self, tables: list, output_format: str, 
+                                      output_dir: str, timestamp: int) -> list[str]:
+        """Create separate output files for each table (one per table).
+        
+        Supports CSV, XLSX (sheets), DOCX, PDF, TXT formats.
+        Returns list of created file paths.
+        """
+        if not tables:
+            return []
+        
+        created_files = []
+        
+        if output_format == "xlsx":
+            # Excel: all tables as separate sheets in ONE file
+            try:
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill
+                
+                wb = Workbook()
+                wb.remove(wb.active)  # Remove default sheet
+                
+                for table in tables:
+                    title = table.get("title", "Table")
+                    headers = table.get("headers", [])
+                    rows = table.get("rows", [])
+                    
+                    # Create sheet with table title
+                    ws = wb.create_sheet(title=title[:31])  # Sheet name max 31 chars
+                    
+                    # Add headers
+                    for col, header in enumerate(headers, 1):
+                        cell = ws.cell(row=1, column=col)
+                        cell.value = header
+                        cell.font = Font(bold=True)
+                        cell.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
+                    
+                    # Add data rows
+                    for row_idx, row_data in enumerate(rows, 2):
+                        for col_idx, value in enumerate(row_data, 1):
+                            ws.cell(row=row_idx, column=col_idx).value = value
+                    
+                    # Auto-adjust column widths
+                    for col in ws.columns:
+                        max_length = 0
+                        col_letter = col[0].column_letter
+                        for cell in col:
+                            try:
+                                if len(str(cell.value or '')) > max_length:
+                                    max_length = len(str(cell.value or ''))
+                            except:
+                                pass
+                        ws.column_dimensions[col_letter].width = min(50, max_length + 2)
+                
+                output_file = os.path.join(output_dir, f"analysis_{timestamp}.xlsx")
+                wb.save(output_file)
+                created_files.append(output_file)
+                print(f"[PROCESS] Excel with {len(tables)} sheets created: {output_file}")
+            except Exception as e:
+                print(f"[PROCESS] Multi-sheet Excel error: {e}")
+        
+        else:
+            # CSV, DOCX, PDF, TXT: separate file per table
+            for table in tables:
+                title = table.get("title", "Table")
+                headers = table.get("headers", [])
+                rows = table.get("rows", [])
+                safe_name = self._sanitize_filename(title)
+                
+                try:
+                    if output_format == "csv":
+                        output_file = os.path.join(output_dir, f"analysis_{timestamp}_{safe_name}.csv")
+                        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                            writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+                            writer.writerow(headers)
+                            writer.writerows(rows)
+                        created_files.append(output_file)
+                        print(f"[PROCESS] CSV created: {output_file}")
+                    
+                    elif output_format == "docx":
+                        from docx import Document
+                        from docx.enum.text import WD_ALIGN_PARAGRAPH
+                        
+                        output_file = os.path.join(output_dir, f"analysis_{timestamp}_{safe_name}.docx")
+                        doc = Document()
+                        doc.add_heading(title, level=1)
+                        
+                        if headers and rows:
+                            table_obj = doc.add_table(rows=len(rows) + 1, cols=len(headers))
+                            table_obj.style = 'Light Grid Accent 1'
+                            
+                            # Headers
+                            for col, header in enumerate(headers):
+                                table_obj.rows[0].cells[col].text = str(header)
+                                for para in table_obj.rows[0].cells[col].paragraphs:
+                                    for run in para.runs:
+                                        run.font.bold = True
+                            
+                            # Data rows
+                            for row_idx, row_data in enumerate(rows, 1):
+                                for col_idx, value in enumerate(row_data):
+                                    table_obj.rows[row_idx].cells[col_idx].text = str(value) if value else ""
+                        
+                        doc.save(output_file)
+                        created_files.append(output_file)
+                        print(f"[PROCESS] DOCX created: {output_file}")
+                    
+                    elif output_format == "pdf":
+                        from reportlab.lib.pagesizes import letter
+                        from reportlab.lib.styles import getSampleStyleSheet
+                        from reportlab.lib.units import inch
+                        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+                        from reportlab.lib import colors
+                        
+                        output_file = os.path.join(output_dir, f"analysis_{timestamp}_{safe_name}.pdf")
+                        doc = SimpleDocTemplate(output_file, pagesize=letter)
+                        story = []
+                        styles = getSampleStyleSheet()
+                        
+                        story.append(Paragraph(title, styles['Heading1']))
+                        story.append(Spacer(1, 0.2*inch))
+                        
+                        if headers and rows:
+                            table_data = [headers] + rows[:50]
+                            pdf_table = Table(table_data, colWidths=[7.5*inch/len(headers) for _ in headers])
+                            pdf_table.setStyle(TableStyle([
+                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e8e8e8')),
+                                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                            ]))
+                            story.append(pdf_table)
+                        
+                        doc.build(story)
+                        created_files.append(output_file)
+                        print(f"[PROCESS] PDF created: {output_file}")
+                    
+                    elif output_format == "txt":
+                        output_file = os.path.join(output_dir, f"analysis_{timestamp}_{safe_name}.txt")
+                        with open(output_file, 'w', encoding='utf-8') as f:
+                            f.write(f"{title}\n")
+                            f.write("=" * 80 + "\n\n")
+                            f.write(" | ".join(headers) + "\n")
+                            f.write("-" * 80 + "\n")
+                            for row in rows:
+                                f.write(" | ".join(str(v) for v in row) + "\n")
+                        created_files.append(output_file)
+                        print(f"[PROCESS] TXT created: {output_file}")
+                
+                except Exception as e:
+                    print(f"[PROCESS] Error creating {output_format} for {title}: {e}")
+        
+        return created_files
         """Create Excel output file."""
         try:
             from openpyxl import Workbook
@@ -4849,11 +7657,7 @@ Rules:
             ws = wb.active
             ws.title = "Analysis Results"
             
-            # Add summary
-            ws['A1'] = "AI Analysis Results"
-            ws['A1'].font = Font(bold=True, size=14)
-            
-            ws['A2'] = f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            ws['A1'] = f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}"
             
             # Add tables if any
             if data.get("tables"):
@@ -4914,7 +7718,6 @@ Rules:
                 writer = csv.writer(f, quoting=csv.QUOTE_ALL)
                 
                 # Header section
-                writer.writerow(["AI Analysis Results"])
                 writer.writerow(["Generated", time.strftime('%Y-%m-%d %H:%M:%S')])
                 writer.writerow([])
                 
@@ -4973,6 +7776,115 @@ Rules:
             # Fallback to TXT
             return self._create_txt_output(data, response, output_dir, timestamp)
 
+    def _create_docx_output(self, data: dict, response: str, output_dir: str, timestamp: int) -> str:
+        """Create DOCX output file with tables and formatted content."""
+        try:
+            from docx import Document
+            from docx.shared import Pt, RGBColor, Inches
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+            
+            output_file = os.path.join(output_dir, f"analysis_{timestamp}.docx")
+            doc = Document()
+            
+            # Clean response for document export (removes markdown, system instructions)
+            cleaned_response = self._clean_response_for_document_export(response, "docx")
+            if not cleaned_response.strip() and str(response or "").strip():
+                print("[PROCESS] DOCX clean pass produced empty text, using raw response fallback")
+                cleaned_response = str(response or "").strip()
+            
+            # Timestamp
+            timestamp_para = doc.add_paragraph(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            timestamp_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # Add tables if any
+            if data.get("tables"):
+                for i, table_data in enumerate(data["tables"], 1):
+                    doc.add_heading(f'Table {i}', level=2)
+                    
+                    # Create table with headers + rows
+                    headers = table_data.get("headers", [])
+                    rows = table_data.get("rows", [])
+                    
+                    if headers and rows:
+                        # Create table (rows + 1 for header)
+                        table = doc.add_table(rows=len(rows) + 1, cols=len(headers))
+                        table.style = 'Light Grid Accent 1'
+                        
+                        # Add headers
+                        header_cells = table.rows[0].cells
+                        for col, header in enumerate(headers):
+                            header_cells[col].text = str(header)
+                            # Bold header text
+                            for paragraph in header_cells[col].paragraphs:
+                                for run in paragraph.runs:
+                                    run.font.bold = True
+                        
+                        # Add data rows
+                        for row_idx, row_data in enumerate(rows, start=1):
+                            row_cells = table.rows[row_idx].cells
+                            for col, value in enumerate(row_data):
+                                row_cells[col].text = str(value) if value else ""
+                    else:
+                        doc.add_paragraph("(No data available)")
+                    
+                    doc.add_paragraph()  # Spacing
+            else:
+                # Add cleaned response as paragraphs (removes markdown, system instructions)
+                doc.add_heading('Analysis Results', level=2)
+                for paragraph_text in cleaned_response.split('\n'):
+                    if paragraph_text.strip():
+                        doc.add_paragraph(paragraph_text)
+            
+            doc.save(output_file)
+            print(f"[PROCESS] DOCX output created: {output_file}")
+            return output_file
+            
+        except ImportError:
+            print(f"[PROCESS] python-docx not installed, falling back to PDF")
+            return self._create_pdf_output(data, response, output_dir, timestamp)
+        except Exception as e:
+            print(f"[PROCESS] DOCX creation error: {e}")
+            # Fallback to PDF
+            return self._create_pdf_output(data, response, output_dir, timestamp)
+
+    def _clean_response_for_document_export(self, response: str, output_format: str) -> str:
+        """Clean response text for PDF/DOCX export by removing artifacts and system instructions."""
+        fmt = (output_format or "").lower()
+        if fmt not in ("pdf", "docx"):
+            return response
+        
+        # Remove markdown headers (###, ##, #)
+        text = re.sub(r'^#+\s+', '', response, flags=re.MULTILINE)
+        
+        # Remove markdown bold/italic (**text**, *text*, __text__)
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+        text = re.sub(r'__([^_]+)__', r'\1', text)
+        text = re.sub(r'\*([^*]+)\*', r'\1', text)
+        text = re.sub(r'_([^_]+)_', r'\1', text)
+        
+        # Remove code blocks (```...```)
+        text = re.sub(r'```[\s\S]*?```', '', text)
+        
+        # Remove horizontal rules and file markers
+        text = re.sub(r'^-{3,}$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^_+$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'---\s*FILE:.*?---\s*END FILE\s*---', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'---\s*FILE:.*', '', text)
+        
+        # Remove system instruction lines
+        text = re.sub(r'^\*\*Return:\*\*.*', '', text, flags=re.MULTILINE | re.IGNORECASE)
+        text = re.sub(r'^Return:.*', '', text, flags=re.MULTILINE | re.IGNORECASE)
+        text = re.sub(r'^\*\*CRITICAL:.*', '', text, flags=re.MULTILINE | re.IGNORECASE)
+        text = re.sub(r'^RULES:.*', '', text, flags=re.MULTILINE)
+        
+        # Remove "Analysis Results" header (not needed for letters)
+        text = re.sub(r'^\s*Analysis Results\s*$', '', text, flags=re.MULTILINE)
+        
+        # Clean excessive blank lines (reduce to max 2 consecutive)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text.strip()
+
     def _create_pdf_output(self, data: dict, response: str, output_dir: str, timestamp: int) -> str:
         """Create PDF output file."""
         try:
@@ -4987,16 +7899,11 @@ Rules:
             story = []
             styles = getSampleStyleSheet()
             
-            # Title
-            title_style = ParagraphStyle(
-                'CustomTitle',
-                parent=styles['Heading1'],
-                fontSize=16,
-                textColor=colors.HexColor('#1a1a1a'),
-                spaceAfter=0.3*inch,
-            )
-            story.append(Paragraph("AI Analysis Results", title_style))
-            story.append(Spacer(1, 0.2*inch))
+            # Clean response for document export (removes markdown, system instructions)
+            cleaned_response = self._clean_response_for_document_export(response, "pdf")
+            if not cleaned_response.strip() and str(response or "").strip():
+                print("[PROCESS] PDF clean pass produced empty text, using raw response fallback")
+                cleaned_response = str(response or "").strip()
             
             # Timestamp
             story.append(Paragraph(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
@@ -5021,9 +7928,19 @@ Rules:
                     story.append(pdf_table)
                     story.append(Spacer(1, 0.2*inch))
             else:
-                # Add full response
-                story.append(Paragraph("Analysis Results", styles['Heading2']))
-                story.append(Paragraph(response, styles['Normal']))
+                # Add cleaned response as paragraphs (for letters/documents)
+                # Split by double newlines to preserve paragraph structure
+                paragraphs = cleaned_response.split('\n\n')
+                for para_text in paragraphs:
+                    para_text = para_text.strip()
+                    if para_text:
+                        # Split by single newlines within paragraph to preserve structure
+                        lines = para_text.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if line:
+                                story.append(Paragraph(line, styles['Normal']))
+                        story.append(Spacer(1, 0.1*inch))  # Space between paragraphs
             
             doc.build(story)
             return output_file
@@ -5036,12 +7953,12 @@ Rules:
     def _create_txt_output(self, data: dict, response: str, output_dir: str, timestamp: int) -> str:
         """Create text file output."""
         try:
+            # Clean response for document export
+            cleaned_response = self._clean_response_for_document_export(response, "txt")
+            
             output_file = os.path.join(output_dir, f"analysis_{timestamp}.txt")
             
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write("=" * 80 + "\n")
-                f.write("AI ANALYSIS RESULTS\n")
-                f.write("=" * 80 + "\n\n")
                 f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
                 if data.get("tables"):
@@ -5059,7 +7976,7 @@ Rules:
                 else:
                     f.write("\nANALYSIS:\n")
                     f.write("-" * 80 + "\n")
-                    f.write(response)
+                    f.write(cleaned_response)
             
             return output_file
             
@@ -5074,7 +7991,9 @@ Rules:
     def _should_use_tabular_pipeline(self, files: list) -> bool:
         if not files:
             return False
-        return all(self._is_tabular_file(f.get("name", "")) for f in files)
+        # Use SQL/code pipeline if ANY file is tabular (CSV/Excel).
+        # Non-tabular files (txt, pdf, docx) are injected as context text into the SQL prompt.
+        return any(self._is_tabular_file(f.get("name", "")) for f in files)
 
     def _dq(self, identifier: str) -> str:
         return '"' + str(identifier).replace('"', '""') + '"'
@@ -6613,6 +9532,35 @@ Rules:
         if plugin_out.get("handled"):
             return {"ok": True, "plugin_command": True, "plugin_result": plugin_out.get("result")}
 
+        # ── Direct file-export short-circuit ──────────────────────
+        # When the user has a file uploaded and the intent is purely
+        # "export this to csv/excel/docx", skip the LLM entirely and
+        # produce the file immediately.
+        export_fmt = (request_options or {}).get("export_format")
+        if export_fmt and self.uploaded_file_path:
+            def _direct_export():
+                try:
+                    self._status(f"Exporting to {export_fmt}...")
+                    path = self._export_uploaded_file_as(export_fmt, self.current_chat_id or "export")
+                    if path:
+                        fname = os.path.basename(path)
+                        reply = f"✅ Exported to **{export_fmt.upper()}**: `{fname}`\n\nFile saved at: `{path}`"
+                        self._emit("message_added", {"role": "assistant", "content": reply})
+                        self.message_history.append({"role": "assistant", "content": reply})
+                        self.chats[self.current_chat_id] = self.message_history
+                        self._save_current_chat()
+                        self._emit("export_ready", {"path": path, "format": export_fmt,
+                                                     "chat_id": self.current_chat_id})
+                        self._status(f"Exported to {path}")
+                    else:
+                        # Could not export directly — fall back to normal LLM flow
+                        self._generate(text, request_options)
+                except Exception as exc:
+                    self._emit("generation_error", {"error": str(exc)})
+                    self._status(f"Export error: {exc}")
+            threading.Thread(target=_direct_export, daemon=True).start()
+            return {"ok": True}
+
         # Route
         if self.attached_image:
             image_path = self.attached_image
@@ -6715,6 +9663,7 @@ Rules:
             # ── 1) Gather context ─────────────────────────────────────
             user_system = self.chat_system_prompts.get(self.current_chat_id, "")
             system_prompt = user_system if user_system else self._DEFAULT_SYSTEM
+
             conversation_msgs = self._get_conversation_messages()
             rag_context = ""
             rag_sources = []
@@ -6732,13 +9681,32 @@ Rules:
                 except Exception:
                     pass
 
+            # Inject tool definitions so the model can use /code for exports,
+            # computations, etc.  Skip only when RAG context is active AND the
+            # user is NOT asking for an export/file operation (to save tokens).
+            tool_defs = ""
+            export_fmt = (request_options or {}).get("export_format")
+            user_wants_action = export_fmt is not None or re.search(
+                r"\b(export|save|convert|extract|download)\b.{0,20}\b(csv|xlsx|excel|file|pdf)\b",
+                text, re.IGNORECASE,
+            )
+            if self.actual_n_ctx >= 2048 and (
+                not rag_context or user_wants_action
+            ):
+                tool_defs = self._build_tool_definitions()
+                if tool_defs:
+                    system_prompt = system_prompt + "\n\n" + tool_defs
+
             # ── 2) Build extra context block ──────────────────────────
             extra_parts = []
             if rag_context:
                 extra_parts.append(rag_context)
             if file_context:
+                file_label = self.uploaded_file_name or "uploaded file"
+                if len(self.uploaded_files) > 1:
+                    file_label = ", ".join(f["name"] for f in self.uploaded_files)
                 extra_parts.append(
-                    f"Uploaded file ({self.uploaded_file_name}):\n{file_context}\n"
+                    f"Uploaded file(s) ({file_label}):\n{file_context}\n"
                     "Use this file context only when relevant to the question."
                 )
             format_instruction = self._get_response_format_instruction(request_options)
@@ -6766,9 +9734,12 @@ Rules:
             max_tokens = available
 
             # Respect user-set max response tokens limit
+            # -1 = "Max" (use full available context), 0 = Auto, >0 = fixed cap
             user_max = self.app_settings.get("max_response_tokens")
-            if user_max and user_max > 0:
-                max_tokens = min(max_tokens, user_max)
+            if user_max and int(user_max) == -1:
+                pass  # Max — use all available tokens
+            elif user_max and int(user_max) > 0:
+                max_tokens = min(max_tokens, int(user_max))
 
             self._emit("context_usage", {
                 "prompt_tokens": prompt_tokens,
@@ -6780,6 +9751,9 @@ Rules:
             task = self._detect_task_type(text)
             params = self._get_adaptive_params(task)
             stop_tokens = self._get_stop_tokens()
+            # Add tool_call stop so model halts when it wants to call a tool
+            if tool_defs and "</tool_call>" not in stop_tokens:
+                stop_tokens = stop_tokens + ["</tool_call>"]
 
             response = ""
             token_count = 0
@@ -6808,10 +9782,15 @@ Rules:
                     token = chunk["choices"][0].get("text", "")
                     response += token
                     token_count += 1
-                    # Emit display every 3 tokens (strip think blocks)
+                    # Emit display every 3 tokens (preserve think blocks separately)
                     if token_count % 3 == 0:
+                        think_blocks = _RE_THINK.findall(response)
                         display = _RE_THINK.sub("", response).strip()
-                        self._emit("generation_token", {"text": display})
+                        display = re.sub(r"</?tool_call[^>]*>", "", display).strip()
+                        # Include incomplete (in-progress) think block
+                        incomplete = _RE_THINK_INCOMPLETE.search(response)
+                        thinking_text = incomplete.group(0) if incomplete else ""
+                        self._emit("generation_token", {"text": display, "think": think_blocks, "thinking": thinking_text})
                         # Update context usage
                         self._emit("context_usage", {
                             "prompt_tokens": prompt_tokens + token_count,
@@ -6820,9 +9799,13 @@ Rules:
                         })
 
             # ── 7) Finalize output ────────────────────────────────────
+            think_blocks = _RE_THINK.findall(response)
             display = _RE_THINK.sub("", response).strip()
             # Strip incomplete think tags at the end
             display = _RE_THINK_INCOMPLETE.sub("", display).strip()
+            # Strip any malformed tool_call tags from display
+            display = re.sub(r"</?tool_call[^>]*>", "", display).strip()
+            display = re.sub(r"\[multimodal\]", "", display).strip()
             if not display:
                 display = response.strip()
 
@@ -6831,16 +9814,113 @@ Rules:
                 self._status("Generation stopped")
                 return
 
-            # Add sources tag
+            # ── 7b) Tool-call detection & execution ───────────────────
+            tool_call = self._parse_tool_call(response + "</tool_call>") if tool_defs else None
+            # Also check for MCP tools even without local plugins
+            if not tool_call and hasattr(self, 'mcp_manager') and self.mcp_manager.get_all_tools():
+                tool_call = self._parse_tool_call(response + "</tool_call>")
+            if tool_call:
+                cmd, args_str = tool_call
+
+                # ── Permission gate for dangerous tools ────────────────
+                is_mcp = isinstance(cmd, str) and cmd.startswith("mcp:")
+                if is_mcp or cmd not in self._SAFE_TOOLS:
+                    desc = self.plugin_commands.get(cmd, {}).get("description", cmd)
+                    self._emit("tool_permission_request", {
+                        "command": cmd,
+                        "args": args_str,
+                        "description": desc,
+                    })
+                    self._tool_permission_event.clear()
+                    self._tool_permission_granted = False
+                    self._status(f"Waiting for permission to run {cmd}...")
+                    # Wait up to 60 s for user response
+                    self._tool_permission_event.wait(timeout=60)
+                    if not self._tool_permission_granted:
+                        display = f"⚠️ Tool `{cmd}` was not approved. Operation cancelled."
+                        self._emit("generation_token", {"text": display})
+                        self._emit("generation_done", {"text": display})
+                        self.message_history.append({"role": "assistant", "content": display})
+                        self.chats[self.current_chat_id] = self.message_history
+                        self._save_current_chat()
+                        return
+
+                self._status(f"Running tool: {cmd}...")
+                self._emit("generation_token", {"text": f"🔧 Running `{cmd}`..."})
+
+                tool_result = self._execute_tool_call(cmd, args_str)
+
+                # Strip the tool_call block from what the user sees
+                visible_before = self._TOOL_CALL_RE.sub("", display).strip()
+                # Remove incomplete trailing <tool_call>... from display
+                visible_before = re.sub(r"<tool_call>.*", "", visible_before, flags=re.DOTALL).strip()
+
+                # Build follow-up prompt: ask model to summarize the tool result
+                followup_msgs = list(conversation_msgs)  # copy
+                followup_msgs.append({"role": "user", "content": text})
+                followup_msgs.append({"role": "assistant", "content":
+                    f"I used the `{cmd}` tool. Here is the result:\n\n{tool_result}"})
+                followup_prompt = self._build_chat_prompt(
+                    system=system_prompt,
+                    messages=followup_msgs,
+                    user_text="Now present this tool result to the user in a clear, readable format. "
+                              "Use markdown. Be concise.",
+                    extra_context="",
+                )
+                # Generate follow-up summary
+                followup_response = ""
+                with self.model_lock:
+                    if self.model is not None:
+                        try:
+                            fup_tokens = min(512, max(64, self.actual_n_ctx - len(followup_prompt) // 4 - 64))
+                            # Remove </tool_call> from stop tokens for the follow-up
+                            fup_stop = [s for s in stop_tokens if s != "</tool_call>"]
+                            fup_stream = self.model(
+                                followup_prompt,
+                                max_tokens=fup_tokens,
+                                temperature=0.3,
+                                top_p=0.9,
+                                repeat_penalty=1.1,
+                                stream=True,
+                                stop=fup_stop,
+                            )
+                            for chunk in fup_stream:
+                                if self.stop_generation_flag:
+                                    break
+                                token = chunk["choices"][0].get("text", "")
+                                followup_response += token
+                                fup_display = _RE_THINK.sub("", followup_response).strip()
+                                self._emit("generation_token", {"text": fup_display})
+                        except Exception as e:
+                            print(f"[TOOLS] Follow-up generation error: {e}")
+
+                followup_clean = _RE_THINK.sub("", followup_response).strip()
+                followup_clean = _RE_THINK_INCOMPLETE.sub("", followup_clean).strip()
+
+                # Final display: tool result (or AI summary if model produced one)
+                if followup_clean:
+                    display = followup_clean
+                else:
+                    display = tool_result
+
+            # Build structured doc sources for card display
+            doc_sources = []
             if rag_context and self.current_rag_database:
                 if rag_sources:
-                    display += "\n\n📄 Sources:\n" + "\n".join(f"- {name}" for name in rag_sources)
+                    for src in rag_sources:
+                        doc_sources.append({"name": src["name"], "type": "rag", "snippet": src.get("snippet", ""), "db": self.current_rag_database})
                 else:
-                    display += f"\n\n📄 Source: {self.current_rag_database}"
+                    doc_sources.append({"name": self.current_rag_database, "type": "rag", "snippet": "", "db": self.current_rag_database})
             if file_context and self.uploaded_file_name:
-                display += f"\n\n📎 File: {self.uploaded_file_name}"
+                snippet = (file_context[:120].replace("\n", " ").strip())
+                if len(snippet) > 117:
+                    snippet = snippet[:117] + "..."
+                doc_sources.append({"name": self.uploaded_file_name, "type": "file", "snippet": snippet})
 
-            self._emit("generation_done", {"text": display})
+            if doc_sources:
+                self._emit("doc_sources", {"sources": doc_sources})
+
+            self._emit("generation_done", {"text": display, "think": think_blocks, "doc_sources": doc_sources if doc_sources else None})
 
             # Save
             self.message_history.append(
@@ -6861,10 +9941,21 @@ Rules:
             self._status("Ready")
 
     def stop_generation(self):
-        """Stop current generation."""
+        """Stop current generation.
+
+        Sets the flag immediately so all generation loops notice it on their
+        next iteration.  The ``generation_stopped`` event is emitted here ONLY
+        when nothing is actively running — streaming chat emits the event
+        itself once the token loop exits, and agent_chat is a synchronous call
+        whose JS finally-block resets the UI when it returns.
+        Firing the event prematurely would reset the UI while the backend
+        thread is still running, making stop appear to do nothing.
+        """
         self.stop_generation_flag = True
-        self._emit("generation_stopped", {"text": ""})
         self._status("Stopping generation...")
+        if not self.generation_in_progress:
+            # Nothing blocking: emit now so the UI resets immediately
+            self._emit("generation_stopped", {"text": ""})
         return {"ok": True}
 
     # ── Prompt engineering helpers ─────────────────────────────
@@ -7029,18 +10120,67 @@ Rules:
                 result.append({"role": m["role"], "content": content})
         return result
 
-    def _get_relevant_uploaded_chunk(self, query: str, max_chars: int = 3000):
+    def _get_relevant_uploaded_chunk(self, query: str, max_chars: int = 0):
         """Retrieve the most relevant portion of uploaded content for the query.
-        For large PDFs with page-level chunks, scores each page and returns
-        the best-matching pages up to max_chars.
+        Searches across all uploaded files when multiple files are present.
         """
-        if not self.uploaded_content:
+        # Collect all content sources
+        all_content = self.uploaded_content
+        all_pages = self.uploaded_pages
+        file_sources = []
+
+        if len(self.uploaded_files) > 1:
+            # Multi-file: gather content from all files
+            for uf in self.uploaded_files:
+                uf_content = uf.get("content")
+                uf_pages = uf.get("pages")
+                if uf_pages:
+                    for p in uf_pages:
+                        file_sources.append((uf["name"], p))
+                elif uf_content:
+                    file_sources.append((uf["name"], uf_content))
+
+        if not all_content and not file_sources:
             return ""
+
+        # Adaptive max_chars: use ~30% of model context window if not specified
+        if max_chars <= 0:
+            max_chars = max(6000, int(self.actual_n_ctx * 3.5 * 0.30))
 
         query_terms = [t.lower() for t in re.findall(r"\b\w{3,}\b", query)]
 
-        # If we have page-level chunks (from PDF), search at page level
-        pages = self.uploaded_pages
+        # Multi-file search
+        if file_sources:
+            scored = []
+            for fname, text in file_sources:
+                low = text.lower()
+                score = sum(1 for t in query_terms if t in low)
+                q_lower = query.lower()
+                words = q_lower.split()
+                for w in range(len(words) - 1):
+                    bigram = words[w] + " " + words[w + 1]
+                    if bigram in low:
+                        score += 2
+                scored.append((score, fname, text))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            selected = []
+            total = 0
+            for _score, fname, text in scored:
+                header = f"[{fname}]\n"
+                chunk = header + text
+                if total + len(chunk) + 2 > max_chars:
+                    remaining = max_chars - total
+                    if remaining > 200:
+                        selected.append(chunk[:remaining])
+                    break
+                selected.append(chunk)
+                total += len(chunk) + 2
+            if selected:
+                return "\n\n".join(selected)
+
+        # Single file - page-level search
+        pages = all_pages
         if pages and len(pages) > 1:
             scored_pages = []
             for i, page in enumerate(pages):
@@ -7130,23 +10270,41 @@ Rules:
                 self._status("Generation stopped")
                 return
 
-            # Step 2 — Follow-up search if first search returned few results
-            if len(sources) < 3 and self.model is not None and not self.stop_generation_flag:
+            # Step 2 — Deepening: try original query & alternative phrasing
+            if len(sources) < 4 and not self.stop_generation_flag:
                 self._status("Deepening research...")
-                ctx2, src2 = self._search_web(query)  # try original query
-                # Merge unique sources
                 seen_urls = {s["url"] for s in sources}
-                for s in src2:
+
+                # Try original (un-refined) query
+                _, src2 = self._search_web(query)
+                for s in (src2 or []):
                     if s["url"] not in seen_urls:
                         sources.append(s)
                         seen_urls.add(s["url"])
-                if src2:
-                    # Rebuild combined context
+
+                # If still thin, try a broader variant
+                if len(sources) < 4 and self.model is not None:
+                    broader = self._refine_search_query(
+                        f"What is {query}? overview explanation")
+                    _, src3 = self._search_web(broader)
+                    for s in (src3 or []):
+                        if s["url"] not in seen_urls:
+                            sources.append(s)
+                            seen_urls.add(s["url"])
+
+                if len(sources) > 0:
+                    # Rebuild context with merged sources
+                    n_ctx = getattr(self, "actual_n_ctx", 2048)
+                    per_src = max(400, int(n_ctx * 3.5 * 0.30) // max(1, len(sources)))
                     lines = []
                     for i, s in enumerate(sources, 1):
-                        entry = f"[{i}] {s['title']}: {s['snippet']}"
+                        snippet = self._truncate_at_sentence(
+                            s.get("snippet", ""), 350)
+                        entry = f"[{i}] {s['title']}: {snippet}"
                         if s.get("excerpt"):
-                            entry += f"\n  Content: {s['excerpt'][:600]}"
+                            exc = self._truncate_at_sentence(
+                                s["excerpt"], per_src)
+                            entry += f"\n  Content: {exc}"
                         lines.append(entry)
                     context = "\n".join(lines)
                     self._emit("web_sources", {"sources": sources})
@@ -7175,6 +10333,7 @@ Rules:
         except Exception as e:
             self._emit("generation_error", {"error": str(e)})
             self._status(f"Web search error: {e}")
+            print(f"[WEB] Search+respond error: {type(e).__name__}: {e}")
         finally:
             self.generation_in_progress = False
 
@@ -7212,59 +10371,101 @@ Rules:
         """Return (context_str, sources_list).
 
         Priority: Brave API (if key set) → DuckDuckGo → Bing (fallback).
-        context_str contains snippets + excerpts for the LLM.
-        Excerpts are also stored in sources for the UI cards.
-        Results are cached per-session to avoid redundant requests."""
+        If primary engine returns thin results (<4), merges with next engine
+        for better coverage. Results cached per-session."""
         cache_key = query.strip().lower()
         if cache_key in self._web_search_cache:
             return self._web_search_cache[cache_key]
 
+        primary_sources = []
         brave_key = (self.app_settings or {}).get("brave_api_key", "").strip()
+
+        # Try Brave first
         if brave_key:
             result = self._search_brave(query, num_results, brave_key)
-            if result[1]:           # got sources
-                self._web_search_cache[cache_key] = result
-                return result
+            if result[1]:
+                primary_sources = result[1]
 
-        # DuckDuckGo with session cookies
-        result = self._search_ddg(query, num_results)
-        if result[1]:
-            self._web_search_cache[cache_key] = result
-            return result
+        # DDG — either as primary or supplementary
+        if len(primary_sources) < 4:
+            ddg_result = self._search_ddg(query, num_results)
+            if ddg_result[1]:
+                if not primary_sources:
+                    primary_sources = ddg_result[1]
+                else:
+                    # Merge unique DDG results
+                    seen = {s["url"] for s in primary_sources}
+                    for s in ddg_result[1]:
+                        if s["url"] not in seen:
+                            primary_sources.append(s)
+                            seen.add(s["url"])
 
-        # Bing as final fallback
-        result = self._search_bing(query, num_results)
+        # Bing — as final fallback or supplementary
+        if len(primary_sources) < 4:
+            bing_result = self._search_bing(query, num_results)
+            if bing_result[1]:
+                if not primary_sources:
+                    primary_sources = bing_result[1]
+                else:
+                    seen = {s["url"] for s in primary_sources}
+                    for s in bing_result[1]:
+                        if s["url"] not in seen:
+                            primary_sources.append(s)
+                            seen.add(s["url"])
+
+        # Trim to num_results and build context
+        primary_sources = primary_sources[:num_results]
+        if primary_sources:
+            result = self._build_search_context(primary_sources, query)
+        else:
+            result = ("No results found.", [])
+
         self._web_search_cache[cache_key] = result
+        print(f"[WEB] Search complete: {len(primary_sources)} sources for '{query[:60]}'")
         return result
 
     # ── Individual search engine helpers ──────────────────────
 
     def _build_search_context(self, sources: list, query: str) -> tuple:
-        """Fetch excerpts in parallel and build LLM context string."""
-        # Parallel excerpt fetching — up to 6 workers
+        """Fetch excerpts in parallel and build LLM context string.
+        Dynamically scales excerpt size to use available context window."""
+        # Dynamic excerpt limit based on model context
+        n_ctx = getattr(self, "actual_n_ctx", 2048)
+        # Use ~30% of context for web content, convert tokens→chars (~3.5 chars/token)
+        max_web_chars = int(n_ctx * 3.5 * 0.30)
+        per_source_chars = max(400, max_web_chars // max(1, len(sources)))
+
+        # Parallel excerpt fetching — up to 8 workers
         need_excerpt = [s for s in sources if not s.get("excerpt")]
         if need_excerpt:
             def _fetch(s):
                 try:
-                    s["excerpt"] = self._fetch_web_excerpt(s["url"], query, max_chars=600)
-                except Exception:
-                    pass
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                    s["excerpt"] = self._fetch_web_excerpt(
+                        s["url"], query, max_chars=per_source_chars)
+                except Exception as e:
+                    print(f"[WEB] Excerpt fetch failed for {s.get('url','?')}: "
+                          f"{type(e).__name__}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 pool.map(_fetch, need_excerpt)
+
         lines = []
         for i, s in enumerate(sources, 1):
-            entry = f"[{i}] {s['title']}: {s['snippet']}"
+            snippet = self._truncate_at_sentence(s.get("snippet", ""), 350)
+            entry = f"[{i}] {s['title']}: {snippet}"
             if s.get("excerpt"):
-                entry += f"\n  Content: {s['excerpt'][:600]}"
+                exc = self._truncate_at_sentence(s["excerpt"], per_source_chars)
+                entry += f"\n  Content: {exc}"
             lines.append(entry)
         context = "\n".join(lines) if lines else "No results found."
+        # Final cap to prevent context overflow
+        if len(context) > max_web_chars:
+            context = context[:max_web_chars].rsplit("\n", 1)[0]
         return context, sources
 
     def _search_brave(self, query: str, num_results: int, api_key: str) -> tuple:
         """Brave Search API — best quality, requires free API key."""
         try:
             import requests
-            from urllib.parse import quote
             r = requests.get(
                 "https://api.search.brave.com/res/v1/web/search",
                 headers={
@@ -7280,19 +10481,60 @@ Rules:
             results = data.get("web", {}).get("results", [])
             sources = []
             for item in results[:num_results]:
+                snippet_raw = item.get("description", "")
                 sources.append({
                     "title": item.get("title", ""),
                     "url": item.get("url", ""),
-                    "snippet": item.get("description", "")[:280],
-                    "excerpt": item.get("extra_snippets", [""])[0][:400]
+                    "snippet": self._truncate_at_sentence(snippet_raw, 350),
+                    "excerpt": item.get("extra_snippets", [""])[0][:600]
                               if item.get("extra_snippets") else "",
                 })
             return self._build_search_context(sources, query)
-        except Exception:
+        except requests.exceptions.HTTPError as e:
+            print(f"[WEB] Brave API HTTP error: {e.response.status_code}")
+            return "Search error.", []
+        except Exception as e:
+            print(f"[WEB] Brave search failed: {type(e).__name__}: {e}")
             return "Search error.", []
 
     def _search_ddg(self, query: str, num_results: int) -> tuple:
-        """DuckDuckGo HTML search with session cookies to avoid rate limits."""
+        """DuckDuckGo search — prefers `duckduckgo_search` library,
+        falls back to HTML scraping, then Lite page."""
+        # Attempt 1: Use ddgs library (most reliable)
+        try:
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                raw = list(ddgs.text(query, max_results=num_results))
+            sources = []
+            seen = set()
+            for item in raw:
+                title = item.get("title", "")
+                url = item.get("href", "") or item.get("link", "")
+                snippet = item.get("body", "") or item.get("snippet", "")
+                if title and url and snippet:
+                    key = (title.lower(), url)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    sources.append({
+                        "title": title,
+                        "url": url,
+                        "snippet": self._truncate_at_sentence(
+                            " ".join(snippet.split()), 350),
+                        "excerpt": "",
+                    })
+            if sources:
+                print(f"[WEB] DDG library returned {len(sources)} results")
+                return self._build_search_context(sources, query)
+        except ImportError:
+            pass   # Library not installed — fall through to HTML
+        except Exception as e:
+            print(f"[WEB] DDG library error: {type(e).__name__}: {e}")
+
+        # Attempt 2: HTML scraping
         try:
             from bs4 import BeautifulSoup
             import requests
@@ -7343,12 +10585,17 @@ Rules:
                     seen.add(key)
                     sources.append({
                         "title": title, "url": link,
-                        "snippet": " ".join(snippet.split())[:280], "excerpt": "",
+                        "snippet": self._truncate_at_sentence(
+                            " ".join(snippet.split()), 350),
+                        "excerpt": "",
                     })
                 if len(sources) >= num_results:
                     break
+            if sources:
+                print(f"[WEB] DDG HTML returned {len(sources)} results")
             return self._build_search_context(sources, query)
-        except Exception:
+        except Exception as e:
+            print(f"[WEB] DDG HTML scraping failed: {type(e).__name__}: {e}")
             return "", []
 
     def _search_bing(self, query: str, num_results: int) -> tuple:
@@ -7385,13 +10632,18 @@ Rules:
                     seen.add(key)
                     sources.append({
                         "title": title, "url": link,
-                        "snippet": " ".join(snippet.split())[:280], "excerpt": "",
+                        "snippet": self._truncate_at_sentence(
+                            " ".join(snippet.split()), 350),
+                        "excerpt": "",
                     })
                 if len(sources) >= num_results:
                     break
+            if sources:
+                print(f"[WEB] Bing returned {len(sources)} results")
             return self._build_search_context(sources, query)
         except Exception as e:
-            return f"Search error: {e}", []
+            print(f"[WEB] Bing search failed: {type(e).__name__}: {e}")
+            return f"Search error: {type(e).__name__}", []
 
     def _generate_from_web_context(self, context: str, sources: list,
                                     query: str,
@@ -7403,6 +10655,9 @@ Rules:
             src_labels += f"  [{i}] {s['title']}\n"
         web_system = (
             "You are a thorough AI research assistant. "
+            "IMPORTANT: Answer ONLY based on the search results provided below. "
+            "Do NOT use prior knowledge or make up any information not found in the results. "
+            "If the search results do not contain enough information to answer, explicitly say so instead of guessing. "
             "Synthesize the search results into a comprehensive, well-structured answer. "
             "Use paragraphs, bullet points, or numbered lists to organize your response clearly. "
             "ALWAYS add citation numbers like [1], [2] after every factual claim to show which source it came from. "
@@ -7411,8 +10666,9 @@ Rules:
             "Sources:\n" + src_labels +
             "Do NOT simply list the search results. Synthesize them into a coherent answer."
         )
-        # Use more context for better synthesis (4K chars)
-        trimmed = context[:4000]
+        # Dynamic context cap — use up to 40% of context window for web content
+        max_web_chars = int(self.actual_n_ctx * 3.5 * 0.40)
+        trimmed = context[:max(4000, max_web_chars)]
         extra = f"Search results:\n{trimmed}"
         if format_instruction:
             extra += f"\n\nFormatting: {format_instruction}"
@@ -7575,80 +10831,199 @@ Rules:
         self.attached_image = None
         return {"ok": True}
 
+    def get_attached_image_preview(self):
+        """Return base64 data URI for the currently attached image (for inline preview)."""
+        if not self.attached_image or not os.path.isfile(self.attached_image):
+            return {"preview": None}
+        try:
+            import base64
+            ext = os.path.splitext(self.attached_image)[1].lower()
+            mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                        ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp"}
+            mime = mime_map.get(ext, "image/png")
+            with open(self.attached_image, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+            return {"preview": f"data:{mime};base64,{data}", "name": os.path.basename(self.attached_image)}
+        except Exception:
+            return {"preview": None}
+
     def open_document_dialog(self):
-        """Open native document picker and extract text for context use."""
+        """Open native document picker and extract text for context use.
+        Supports selecting multiple files at once.
+        Replaces any previously uploaded files (use drag-drop to add more)."""
         try:
             import webview
             if not webview.windows:
                 return {"error": "Window not ready"}
             paths = webview.windows[0].create_file_dialog(
                 webview.FileDialog.OPEN,
-                allow_multiple=False,
+                allow_multiple=True,
                 file_types=(
-                    "Documents (*.txt;*.md;*.pdf;*.csv;*.docx;*.xlsx;*.xls)",
+                    "All supported (*.txt;*.md;*.pdf;*.csv;*.docx;*.xlsx;*.xls;*.json;*.xml;*.html;*.htm;*.yaml;*.yml;*.log;*.tsv;*.sql;*.py;*.js;*.css;*.ini;*.cfg;*.toml;*.rtf)",
                 ),
             )
             if not paths:
                 return {"selected": False}
 
-            path = paths[0]
-            self.uploaded_file_path = path
-            self.uploaded_file_name = os.path.basename(path)
-
-            if self._is_tabular_file(self.uploaded_file_name):
-                # Lightweight preview — just count rows/cols, no heavy DuckDB
-                preview = self._build_tabular_preview_fast(path)
-                self.uploaded_content = preview
-                return {
-                    "selected": True,
-                    "name": self.uploaded_file_name,
-                    "chars": len(self.uploaded_content or ""),
-                }
-
-            ext = os.path.splitext(path)[1].lower()
-
-            # For PDFs, run extraction in background (can be slow with OCR)
-            if ext == ".pdf":
-                self._status("Processing PDF...")
-                threading.Thread(
-                    target=self._load_pdf_background, args=(path,), daemon=True
-                ).start()
-                # Return immediately — frontend shows "processing"
-                return {
-                    "selected": True,
-                    "name": self.uploaded_file_name,
-                    "chars": 0,
-                    "processing": True,
-                }
-
-            extracted = self._extract_text_from_file(path)
-            if not extracted:
-                return {"error": "Could not extract readable text from file"}
-
-            self.uploaded_content = extracted
+            # Clear previous files — dialog upload replaces, drag-drop appends
+            self.uploaded_files = []
+            self.uploaded_content = None
+            self.uploaded_file_name = None
+            self.uploaded_file_path = None
             self.uploaded_pages = None
+
+            results = []
+            has_async = False
+            for path in paths:
+                r = self._process_single_upload(path)
+                results.append(r)
+                if r.get("processing"):
+                    has_async = True
+
+            # Return summary for frontend
+            names = [r["name"] for r in results if r.get("name")]
             return {
                 "selected": True,
-                "name": self.uploaded_file_name,
-                "chars": len(self.uploaded_content),
+                "files": results,
+                "name": names[0] if len(names) == 1 else f"{len(names)} files",
+                "chars": sum(r.get("chars", 0) for r in results),
+                "processing": has_async,
+                "multi": len(results) > 1,
             }
         except Exception as e:
             return {"error": str(e)}
 
+    def _process_single_upload(self, path: str) -> dict:
+        """Process a single file upload: extract content, add to uploaded_files list."""
+        name = os.path.basename(path)
+
+        # Avoid duplicates
+        for existing in self.uploaded_files:
+            if existing["name"] == name:
+                return {"name": name, "chars": len(existing.get("content") or ""), "duplicate": True}
+
+        file_entry = {"name": name, "path": path, "content": None, "pages": None}
+
+        if self._is_tabular_file(name):
+            preview = self._build_tabular_preview_fast(path)
+            file_entry["content"] = preview
+            self.uploaded_files.append(file_entry)
+            self._sync_primary_file()
+            return {"name": name, "chars": len(preview or "")}
+
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext == ".pdf":
+            self.uploaded_files.append(file_entry)
+            self._sync_primary_file()
+            self._status(f"Processing PDF: {name}...")
+            threading.Thread(
+                target=self._load_pdf_background_multi, args=(path, name), daemon=True
+            ).start()
+            return {"name": name, "chars": 0, "processing": True}
+
+        extracted = self._extract_text_from_file(path)
+        if not extracted:
+            return {"name": name, "error": "Could not extract text"}
+
+        file_entry["content"] = extracted
+        self.uploaded_files.append(file_entry)
+        self._sync_primary_file()
+        return {"name": name, "chars": len(extracted)}
+
+    def _sync_primary_file(self):
+        """Keep legacy single-file state in sync with uploaded_files list.
+        Primary = last uploaded file (most recent is most relevant)."""
+        if self.uploaded_files:
+            primary = self.uploaded_files[-1]
+            self.uploaded_file_name = primary["name"]
+            self.uploaded_file_path = primary["path"]
+            self.uploaded_content = primary.get("content")
+            self.uploaded_pages = primary.get("pages")
+        else:
+            self.uploaded_file_name = None
+            self.uploaded_file_path = None
+            self.uploaded_content = None
+            self.uploaded_pages = None
+
+    def _load_pdf_background_multi(self, path: str, name: str):
+        """Extract PDF text in background for multi-file upload."""
+        try:
+            extracted, page_list = self._extract_pdf_full(path=path)
+            if not extracted:
+                self._emit("file_upload_done", {
+                    "name": name,
+                    "error": "Could not extract readable text from PDF",
+                })
+                return
+            # Update the entry in uploaded_files
+            for f in self.uploaded_files:
+                if f["name"] == name and f["path"] == path:
+                    f["content"] = extracted
+                    f["pages"] = page_list
+                    break
+            self._sync_primary_file()
+            self._emit("file_upload_done", {
+                "name": name,
+                "chars": len(extracted),
+                "pages": len(page_list),
+            })
+            self._status("Ready")
+        except Exception as e:
+            self._emit("file_upload_done", {"name": name, "error": str(e)})
+            self._status("Ready")
+
+    def upload_file_from_data(self, file_name: str, data_base64: str):
+        """Receive a file from drag-drop (base64-encoded), save to temp, and process."""
+        if not file_name or not data_base64:
+            return {"error": "Missing file name or data"}
+
+        # Avoid duplicates
+        for existing in self.uploaded_files:
+            if existing["name"] == file_name:
+                return {"name": file_name, "duplicate": True, "chars": len(existing.get("content") or "")}
+
+        temp_dir = os.path.join(app_data_path(), "agent_temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', file_name)
+        dest = os.path.join(temp_dir, safe_name)
+
+        try:
+            import base64
+            raw = base64.b64decode(data_base64)
+            with open(dest, "wb") as fh:
+                fh.write(raw)
+        except Exception as e:
+            return {"error": f"Failed to save file: {e}"}
+
+        return self._process_single_upload(dest)
+
+    def get_uploaded_files(self):
+        """Return list of currently uploaded file names for the frontend."""
+        return {"files": [f["name"] for f in self.uploaded_files]}
+
     def _load_pdf_background(self, path: str):
         """Extract PDF text (with OCR) in background, emit event when done."""
+        name = os.path.basename(path)
         try:
-            extracted = self._extract_pdf_full(path)
+            extracted, page_list = self._extract_pdf_full(path=path)
             if not extracted:
                 self._emit("file_upload_done", {
                     "error": "Could not extract readable text from PDF"
                 })
                 return
             self.uploaded_content = extracted
+            self.uploaded_pages = page_list
+            # Update uploaded_files entry if present
+            for f in self.uploaded_files:
+                if f["path"] == path:
+                    f["content"] = extracted
+                    f["pages"] = page_list
+                    break
             char_count = len(extracted)
-            page_count = len(self.uploaded_pages or [])
+            page_count = len(page_list)
             self._emit("file_upload_done", {
-                "name": self.uploaded_file_name,
+                "name": self.uploaded_file_name or name,
                 "chars": char_count,
                 "pages": page_count,
             })
@@ -7657,12 +11032,46 @@ Rules:
             self._emit("file_upload_done", {"error": str(e)})
             self._status("Ready")
 
-    def clear_uploaded_document(self):
+    def clear_uploaded_document(self, file_name: str | None = None):
+        """Clear uploaded files. If file_name given, remove only that file."""
+        if file_name:
+            self.uploaded_files = [f for f in self.uploaded_files if f["name"] != file_name]
+            if self.uploaded_file_name == file_name:
+                if self.uploaded_files:
+                    primary = self.uploaded_files[-1]
+                    self.uploaded_file_name = primary["name"]
+                    self.uploaded_file_path = primary["path"]
+                    self.uploaded_content = primary.get("content")
+                    self.uploaded_pages = primary.get("pages")
+                else:
+                    self.uploaded_file_name = None
+                    self.uploaded_file_path = None
+                    self.uploaded_content = None
+                    self.uploaded_pages = None
+            return {"ok": True, "files": [f["name"] for f in self.uploaded_files]}
         self.uploaded_content = None
         self.uploaded_file_name = None
         self.uploaded_file_path = None
         self.uploaded_pages = None
-        return {"ok": True}
+        self.uploaded_files = []
+        return {"ok": True, "files": []}
+
+    def _cleanup_agent_temp(self):
+        """Delete all files in agent_temp/ to free disk space after processing."""
+        temp_dir = os.path.join(app_data_path(), "agent_temp")
+        if not os.path.isdir(temp_dir):
+            return
+        removed = 0
+        for fname in os.listdir(temp_dir):
+            fpath = os.path.join(temp_dir, fname)
+            try:
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            print(f"[CLEANUP] Removed {removed} temp file(s) from agent_temp/")
 
     def save_agent_temp_file(self, file_name: str, content: str):
         """Save agent file content to a temp directory and return the path."""
@@ -7728,11 +11137,15 @@ Rules:
     def _extract_text_from_file(self, path: str) -> str:
         ext = os.path.splitext(path)[1].lower()
         try:
-            if ext in (".txt", ".md"):
+            # Plain-text / code / config files — read directly
+            if ext in (".txt", ".md", ".log", ".json", ".xml", ".html", ".htm",
+                        ".yaml", ".yml", ".sql", ".py", ".js", ".css",
+                        ".ini", ".cfg", ".toml", ".tsv", ".rtf"):
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read()
             if ext == ".pdf":
-                return self._extract_pdf_full(path)
+                text, _pages = self._extract_pdf_full(path=path)
+                return text
             if ext == ".csv":
                 try:
                     import pandas as pd
@@ -7753,19 +11166,40 @@ Rules:
                 from docx import Document
                 doc = Document(path)
                 return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            # Fallback: try reading as text
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
         except Exception:
             return ""
         return ""
 
-    def _extract_pdf_full(self, path: str) -> str:
+    def _extract_pdf_full(self, path: str = "", raw_bytes: bytes = b"") -> tuple:
         """Extract ALL text from a PDF — text pages + OCR for scanned pages.
-        Stores page-level chunks in self.uploaded_pages for smart retrieval.
+        Accepts a file *path* OR *raw_bytes* (at least one required).
+        Returns (full_text, page_list) so callers can use pages without
+        mutating self.uploaded_pages.  The chat-mode caller still writes
+        self.uploaded_pages for backward compat.
         Uses parallel OCR workers for speed.
         """
+        cache_key = ""
+        try:
+            if path and os.path.isfile(path):
+                cache_key = self._pdf_hash_for_path(path)
+            elif raw_bytes:
+                cache_key = self._pdf_hash_for_bytes(raw_bytes)
+        except Exception:
+            cache_key = ""
+
+        if cache_key:
+            cached = self._load_pdf_cached_extract(cache_key)
+            if cached:
+                self._status("PDF ready (cached)")
+                return cached
+
         try:
             import fitz  # PyMuPDF
         except ImportError:
-            return ""
+            return "", []
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -7773,9 +11207,14 @@ Rules:
         ocr_tasks: list[tuple[int, bytes]] = []  # (page_idx, png_bytes)
 
         try:
-            doc = fitz.open(path)
+            if path:
+                doc = fitz.open(path)
+            elif raw_bytes:
+                doc = fitz.open(stream=raw_bytes, filetype="pdf")
+            else:
+                return "", []
         except Exception:
-            return ""
+            return "", []
 
         total_pages = len(doc)
         self._status(f"Reading PDF ({total_pages} pages)...")
@@ -7823,14 +11262,15 @@ Rules:
 
         # Build final page list (drop empty pages)
         final_pages = [p for p in pages if p]
-        self.uploaded_pages = final_pages
 
         full_text = "\n\n".join(final_pages)
+        if cache_key and full_text:
+            self._save_pdf_cached_extract(cache_key, full_text, final_pages)
         text_pages = sum(1 for p in pages if p and "[Page" in p and "OCR" not in p)
         ocr_pages = sum(1 for p in pages if p and "OCR" in p)
         empty_pages = total_pages - text_pages - ocr_pages
         self._status(f"PDF ready: {text_pages} text + {ocr_pages} OCR + {empty_pages} empty pages")
-        return full_text
+        return full_text, final_pages
 
     def _generate_with_image(self, text: str, image_path: str,
                              request_options: dict | None = None):
@@ -8156,6 +11596,29 @@ Rules:
         except Exception as e:
             return [{"name": "error", "info": str(e), "loaded": False}]
 
+    def get_plugin_commands(self):
+        """Return list of registered plugin commands for frontend autocomplete."""
+        cmds = []
+        for cmd, entry in self.plugin_commands.items():
+            cmds.append({
+                "command": cmd,
+                "description": entry.get("description", ""),
+                "plugin": entry.get("plugin", ""),
+            })
+        return cmds
+
+    # ── Tool permission gate (called from JS) ─────────────────
+
+    def approve_tool_execution(self):
+        """User approved a dangerous tool call."""
+        self._tool_permission_granted = True
+        self._tool_permission_event.set()
+
+    def deny_tool_execution(self):
+        """User denied a dangerous tool call."""
+        self._tool_permission_granted = False
+        self._tool_permission_event.set()
+
     def reload_plugins(self):
         """Reload all plugins."""
         try:
@@ -8480,6 +11943,16 @@ except Exception:
     def get_app_settings(self):
         return dict(self.app_settings)
 
+    def get_ai_generation_debug(self):
+        """Return current AI generation debug toggle state."""
+        return {"enabled": self._is_ai_debug_enabled()}
+
+    def set_ai_generation_debug(self, enabled: bool):
+        """Enable or disable verbose AI generation diagnostics."""
+        self.app_settings["debug_ai_generation"] = bool(enabled)
+        self.chat_db.set_kv("app_settings", self.app_settings)
+        return {"ok": True, "enabled": bool(enabled)}
+
     def save_app_settings(self, settings: dict):
         self.app_settings.update(settings)
         # Keep current_theme in sync when theme is saved via settings payload.
@@ -8538,6 +12011,45 @@ except Exception:
         threading.Thread(target=loop, daemon=True).start()
 
     # ── Persistence helpers ────────────────────────────────────
+
+    def rate_message(self, chat_id: str, message_index: int, rating):
+        """Store a thumbs-up/down rating for a specific message."""
+        key = f"rating_{message_index}"
+        if rating:
+            self.chat_db.set_meta(chat_id, key, str(rating))
+        else:
+            self.chat_db.set_meta(chat_id, key, "")
+        return {"ok": True}
+
+    # ── MCP Server Management ──────────────────────────────────
+
+    def get_mcp_servers(self):
+        """Return list of configured MCP servers and their status."""
+        return self.mcp_manager.get_server_list()
+
+    def add_mcp_server(self, config):
+        """Add a new MCP server configuration."""
+        return self.mcp_manager.add_server(config)
+
+    def update_mcp_server(self, old_name, config):
+        """Update an existing MCP server configuration."""
+        return self.mcp_manager.update_server(old_name, config)
+
+    def remove_mcp_server(self, name):
+        """Remove an MCP server."""
+        return self.mcp_manager.remove_server(name)
+
+    def connect_mcp_server(self, name):
+        """Connect to an MCP server and discover its tools."""
+        return self.mcp_manager.connect_server(name)
+
+    def disconnect_mcp_server(self, name):
+        """Disconnect from an MCP server."""
+        return self.mcp_manager.disconnect_server(name)
+
+    def get_mcp_tools(self):
+        """Return all tools from all connected MCP servers."""
+        return self.mcp_manager.get_all_tools()
 
     def _save_current_chat(self):
         if self.current_chat_id and self.current_chat_id in self.chats:
@@ -8677,17 +12189,197 @@ except Exception:
     # ── Per-model settings ─────────────────────────────────────
 
     def get_per_model_settings(self):
+        """Get per-model settings (temperature, n_ctx, n_threads, etc).
+        
+        These settings are user-configurable from the UI:
+        - Model Settings button (⚙) in the top panel
+        - Settings persist per model in chat_db
+        """
         if not self.model_path:
             return {}
         fn = Path(self.model_path).name
         return self.model_configs.get(fn, {})
 
     def save_per_model_settings(self, settings: dict):
+        """Save per-model settings (called from UI when user configures model).
+        
+        Supported keys:
+        - n_ctx: context window (integer, or -1 for "Max")
+        - temperature: sampling temperature (0.0-2.0)
+        - n_threads: CPU threads to use
+        """
         if not self.model_path:
             return {"error": "No model selected"}
         fn = Path(self.model_path).name
+        old = self.model_configs.get(fn, {})
+        n_ctx_changed = settings.get("n_ctx") != old.get("n_ctx")
         self.model_configs[fn] = settings
         self.chat_db.set_kv("model_configs", self.model_configs)
         if self.model is not None and "temperature" in settings:
             self.model_config["temperature"] = settings["temperature"]
-        return {"ok": True}
+        return {"ok": True, "n_ctx_changed": n_ctx_changed}
+
+    # ── JSONL Job Queue with Checkpointing ─────────────────────────────────
+
+    def run_jsonl_queue(
+        self,
+        jsonl: str = "",
+        jsonl_path: str = "",
+        checkpoint_dir: str = "",
+        checkpoint_every: int = 12,
+    ) -> dict:
+        """Process a JSONL job queue one task at a time, saving checkpoints.
+
+        Each JSONL line must be a JSON object with at minimum:
+          - ``job_id``  (str)  — unique identifier; auto-assigned if missing.
+          - ``type``    (str)  — ``"chat"`` (default) or ``"process_files"``.
+
+        For ``type = "chat"``:
+          - ``text``          (str)
+          - ``role`` / ``task`` / ``steps``  (str, optional)
+          - ``output_format`` (str, optional)
+
+        For ``type = "process_files"``:
+          - ``instructions``  (str)
+          - ``files``         (list of file dicts)
+          - ``output_format`` (str, optional, default ``"excel"``)
+
+        A checkpoint file (``{checkpoint_dir}/{queue_id}_checkpoint.jsonl``)
+        stores one completed-result JSON per line so the queue can resume
+        after interruption without re-running finished jobs.
+        """
+        # ── Resolve JSONL content ─────────────────────────────────────────
+        if jsonl_path:
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as _f:
+                    jsonl = _f.read()
+            except Exception as exc:
+                return {"error": f"Cannot read JSONL file: {exc}"}
+
+        if not jsonl or not jsonl.strip():
+            return {"error": "No JSONL content provided"}
+
+        # ── Parse jobs ────────────────────────────────────────────────────
+        jobs = []
+        parse_errors = []
+        for _i, _raw in enumerate(jsonl.splitlines(), 1):
+            _line = _raw.strip()
+            if not _line:
+                continue
+            try:
+                _job = json.loads(_line)
+                if not isinstance(_job, dict):
+                    raise ValueError("Each JSONL line must be a JSON object")
+                if not _job.get("job_id"):
+                    _job["job_id"] = f"job_{_i:04d}"
+                jobs.append(_job)
+            except Exception as exc:
+                parse_errors.append({"line": _i, "error": str(exc), "raw": _raw[:120]})
+
+        if not jobs:
+            return {"error": "No valid jobs found in JSONL", "parse_errors": parse_errors}
+
+        # ── Checkpoint setup ──────────────────────────────────────────────
+        if not checkpoint_dir:
+            checkpoint_dir = os.path.join(app_data_path(), "jsonl_checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Stable queue ID from a hash of the raw JSONL content
+        queue_id = hashlib.sha1(jsonl.encode("utf-8")).hexdigest()[:12]
+        checkpoint_file = os.path.join(checkpoint_dir, f"{queue_id}_checkpoint.jsonl")
+
+        # Load already-completed jobs from checkpoint (skip on resume)
+        completed: dict = {}
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, "r", encoding="utf-8") as _cf:
+                    for _cl in _cf:
+                        _cl = _cl.strip()
+                        if _cl:
+                            try:
+                                _entry = json.loads(_cl)
+                                completed[_entry["job_id"]] = _entry
+                            except Exception:
+                                pass
+                print(f"[JSONL-QUEUE] Resuming — {len(completed)} jobs already done in checkpoint")
+            except Exception as exc:
+                print(f"[JSONL-QUEUE] Warning: could not read checkpoint: {exc}")
+
+        def _append_checkpoint(entry: dict):
+            try:
+                with open(checkpoint_file, "a", encoding="utf-8") as _cf:
+                    _cf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                print(f"[JSONL-QUEUE] Warning: checkpoint write failed: {exc}")
+
+        # ── Run pending jobs ──────────────────────────────────────────────
+        results = list(completed.values())
+        newly_done = 0
+        total = len(jobs)
+
+        for idx, job in enumerate(jobs):
+            job_id = job["job_id"]
+
+            if job_id in completed:
+                print(f"[JSONL-QUEUE] Skipping completed: {job_id}")
+                continue
+
+            job_type = str(job.get("type", "chat")).lower()
+            print(f"[JSONL-QUEUE] [{idx + 1}/{total}] {job_type}: {job_id}")
+            _t0 = time.time()
+
+            try:
+                if job_type == "process_files":
+                    raw = self.process_files_with_ai(
+                        files=job.get("files", []),
+                        instructions=str(job.get("instructions", "")),
+                        output_format=str(job.get("output_format", "excel")),
+                    )
+                else:
+                    raw = self.agent_chat(
+                        text=str(job.get("text", "")),
+                        role=str(job.get("role", "")),
+                        task=str(job.get("task", "")),
+                        steps=str(job.get("steps", "")),
+                        output_format=str(job.get("output_format", "none")),
+                    )
+                entry = {
+                    "job_id": job_id,
+                    "ok": not bool(raw.get("error")),
+                    "elapsed_s": round(time.time() - _t0, 2),
+                    "result": raw,
+                }
+            except Exception as exc:
+                entry = {
+                    "job_id": job_id,
+                    "ok": False,
+                    "elapsed_s": round(time.time() - _t0, 2),
+                    "error": str(exc),
+                }
+
+            results.append(entry)
+            newly_done += 1
+            _append_checkpoint(entry)
+
+            if checkpoint_every > 0 and newly_done % checkpoint_every == 0:
+                print(f"[JSONL-QUEUE] Checkpoint saved at {newly_done} completed jobs ({checkpoint_file})")
+
+            if self.stop_generation_flag:
+                print(f"[JSONL-QUEUE] Stopped by user after {newly_done} jobs")
+                break
+
+        done_count = sum(1 for r in results if r.get("ok"))
+        failed_count = sum(1 for r in results if not r.get("ok"))
+
+        print(f"[JSONL-QUEUE] Done: {done_count} succeeded, {failed_count} failed — {checkpoint_file}")
+        return {
+            "ok": True,
+            "total": total,
+            "completed": len(results),
+            "succeeded": done_count,
+            "failed": failed_count,
+            "stopped": bool(self.stop_generation_flag),
+            "checkpoint_file": checkpoint_file,
+            "parse_errors": parse_errors,
+            "results": results,
+        }

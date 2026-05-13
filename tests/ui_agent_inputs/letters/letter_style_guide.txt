@@ -1,0 +1,15 @@
+Formatting Rules:
+- Use a formal business-letter structure.
+- Include date, recipient line, subject line, salutation, body, closing, and signature block.
+- Prefer short paragraphs over bullet-heavy prose unless the brief explicitly asks for a list.
+- Do not invent facts, names, dates, or legal language beyond the briefing note.
+- If any critical input is missing, show a square-bracket placeholder.
+
+Tone Rules:
+- Be professional, clear, and concise.
+- For audit letters, maintain a cooperative and courteous tone.
+- For HR letters, be firm but not aggressive.
+
+Signature Rules:
+- End with "Yours faithfully," unless the brief implies another conventional closing.
+- Put the signatory name and designation on separate lines.

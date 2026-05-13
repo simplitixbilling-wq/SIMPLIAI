@@ -1,0 +1,5 @@
+Employee ID,Employee Name,Location,Gross Wage,PF Eligible,ESI Eligible,Gender
+WK001,Ramesh Pawar,Mumbai,18200,Yes,Yes,M
+WK002,Salma Sheikh,Mumbai,23500,Yes,No,F
+WK003,Ajay Yadav,Pune,14800,No,Yes,M
+WK004,Priya Menon,Mumbai,26500,Yes,No,F

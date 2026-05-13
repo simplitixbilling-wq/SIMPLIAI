@@ -10,7 +10,15 @@ echo [1/4] Cleaning previous build...
 if exist "dist\SIMPLE_AI" rmdir /s /q "dist\SIMPLE_AI"
 if exist "build\SIMPLE_AI" rmdir /s /q "build\SIMPLE_AI"
 
-echo [2/4] Building executable...
+echo [2/5] Generating app icon...
+if exist create_logo.py (
+  ".\venv311_3.11\Scripts\python.exe" create_logo.py
+  if errorlevel 1 (
+    echo   [WARN] Logo generation failed, continuing without icon.
+  )
+)
+
+echo [3/5] Building executable...
 ".\venv311_3.11\Scripts\python.exe" -m PyInstaller SIMPLE_AI.spec --clean --noconfirm
 
 if errorlevel 1 (
@@ -20,7 +28,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/4] Copying user-data folders to dist...
+echo [4/5] Copying user-data folders to dist...
 if exist "models" (
     echo   - Copying models\  (this may take a while for large .gguf files)
     xcopy /E /I /Y "models" "dist\SIMPLE_AI\models" >nul
@@ -30,7 +38,7 @@ if exist "rag_databases" (
     xcopy /E /I /Y "rag_databases" "dist\SIMPLE_AI\rag_databases" >nul
 )
 
-echo [4/4] Verifying bundled components...
+echo [5/5] Verifying bundled components...
 if exist "dist\SIMPLE_AI\Tesseract-OCR\tesseract.exe" (
     echo   [OK] Tesseract OCR bundled
 ) else (

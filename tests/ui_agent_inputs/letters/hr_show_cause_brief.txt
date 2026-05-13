@@ -1,0 +1,14 @@
+Letter Type: HR show-cause notice
+Sender: People Operations, Horizon Components Private Limited
+Recipient: Ms. Neha Sharma, Executive - Operations
+Date to use in draft: 07 May 2026
+Subject intent: Repeated late attendance and failure to submit reports on time
+
+Facts to include:
+- Employee ID: HC-OPS-184
+- Late attendance recorded on 14 Apr 2026, 18 Apr 2026, and 22 Apr 2026.
+- Monthly operations report due on 25 Apr 2026 was submitted on 30 Apr 2026.
+- Earlier verbal counseling was given by reporting manager on 23 Apr 2026.
+- Employee should be asked to submit a written explanation within 48 hours.
+- Tone must remain professional and non-accusatory.
+- Closing signatory: Kavita Rao, Head - People Operations

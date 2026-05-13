@@ -1,0 +1,16 @@
+Assessee: Rohan Gupta
+Assessment Year: 2026-27
+
+Income details:
+- Salary income as per Form 16: 1680000
+- Interest from savings account: 18000
+- Short-term capital gain on listed equity: 95000
+- Interest on housing loan for self-occupied property: 180000
+
+Tax credit details:
+- TDS on salary: 142000
+- Advance tax paid: 15000
+
+Instructions:
+- Prepare a concise income-tax computation summary from the above data.
+- Mention missing inputs if any further regime comparison would require them.

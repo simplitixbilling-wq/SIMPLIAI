@@ -22,6 +22,15 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Generate logo / icon if create_logo.py exists
+if exist create_logo.py (
+  echo Generating app icon...
+  "%PYEXE%" create_logo.py
+  if errorlevel 1 (
+    echo WARNING: Logo generation failed, continuing without icon.
+  )
+)
+
 REM Clean previous build artifacts
 if exist build\SIMPLE_AI_WEB rmdir /s /q build\SIMPLE_AI_WEB
 if exist dist\SIMPLE_AI_WEB rmdir /s /q dist\SIMPLE_AI_WEB

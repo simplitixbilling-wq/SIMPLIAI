@@ -1,0 +1,4 @@
+Bill Date,Supplier Name,GSTIN,Invoice No,Expense Nature,Taxable Amount,CGST,SGST,IGST,Gross Amount,State,Remark
+2026-04-03,Metro Stationers,27AACCM1111A1Z5,MS-221,Office Supplies,12000,1080,1080,0,14160,Maharashtra,Monthly stationery purchase
+2026-04-09,Bluechip Travels,29AADCB2222B1Z4,BT-991,Travel Expense,18000,0,0,3240,21240,Karnataka,Interstate hotel booking
+2026-04-11,Prime Facility Services,27AADCP2222B1Z3,PFS-177,Repairs and Maintenance,25000,2250,2250,0,29500,Maharashtra,Office AC servicing

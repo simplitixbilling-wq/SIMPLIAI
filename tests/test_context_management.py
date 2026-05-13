@@ -1,7 +1,10 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "desktop_app"))
 
 from generation import GenerationMixin
 from rag_handler import RAGHandlerMixin

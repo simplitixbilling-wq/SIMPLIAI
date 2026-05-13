@@ -1,0 +1,9 @@
+Tally Mapping Guide:
+- Office Supplies -> Office Expenses
+- Travel Expense -> Travelling Expenses
+- Repairs and Maintenance -> Repairs & Maintenance
+- Voucher Type for all rows: Purchase
+- Use supplier name as Party Ledger.
+- For intra-state Maharashtra bills, populate CGST and SGST.
+- For interstate bills, populate IGST.
+- Note column should mention if GST classification was inferred from state.

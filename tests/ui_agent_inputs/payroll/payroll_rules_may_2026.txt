@@ -1,0 +1,8 @@
+Payroll Rules:
+- PF employee deduction: 12% of Basic where PF Applicable = Yes.
+- ESI employee deduction: 0.75% of Gross Earnings where ESI Applicable = Yes.
+- Professional Tax: 200 per employee if Gross Earnings exceed 15000.
+- Overtime rate: Basic / 208 * Overtime Hours.
+- Loss of pay should reduce gross proportionately based on total working days.
+- TDS for this sample: EMP001 = 1800, EMP002 = 0, EMP003 = 950.
+- Flag employees with missing bank account in Review Note.

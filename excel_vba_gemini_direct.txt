@@ -1,0 +1,600 @@
+Option Explicit
+
+Private Const AI_CFG_SHEET As String = "_AI_CONFIG"
+Private Const GEMINI_MODEL As String = "gemini-1.5-flash"
+Private Const GEMINI_URL_BASE As String = "https://generativelanguage.googleapis.com/v1beta/models/"
+
+' ══════════════════════════════════════════════════════════════
+'  CONFIG / UTIL
+' ══════════════════════════════════════════════════════════════
+
+Private Function EnsureConfigSheet() As Worksheet
+    On Error Resume Next
+    Set EnsureConfigSheet = ThisWorkbook.Worksheets(AI_CFG_SHEET)
+    On Error GoTo 0
+
+    If EnsureConfigSheet Is Nothing Then
+        Set EnsureConfigSheet = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+        EnsureConfigSheet.Name = AI_CFG_SHEET
+        EnsureConfigSheet.Cells(1, 1).Value = "key"
+        EnsureConfigSheet.Cells(1, 2).Value = "value"
+        EnsureConfigSheet.Visible = xlSheetVeryHidden
+    End If
+End Function
+
+Private Function GetConfigValue(cfg As Worksheet, keyName As String) As String
+    Dim lastRow As Long, r As Long
+    lastRow = cfg.Cells(cfg.Rows.Count, 1).End(xlUp).Row
+    For r = 2 To lastRow
+        If LCase$(Trim$(CStr(cfg.Cells(r, 1).Value2))) = LCase$(keyName) Then
+            GetConfigValue = Trim$(CStr(cfg.Cells(r, 2).Value2))
+            Exit Function
+        End If
+    Next r
+    GetConfigValue = ""
+End Function
+
+Private Sub SetConfigValue(cfg As Worksheet, keyName As String, valueText As String)
+    Dim lastRow As Long, r As Long
+    lastRow = cfg.Cells(cfg.Rows.Count, 1).End(xlUp).Row
+    If lastRow < 2 Then lastRow = 1
+
+    For r = 2 To lastRow
+        If LCase$(Trim$(CStr(cfg.Cells(r, 1).Value2))) = LCase$(keyName) Then
+            cfg.Cells(r, 2).Value = valueText
+            Exit Sub
+        End If
+    Next r
+
+    cfg.Cells(lastRow + 1, 1).Value = keyName
+    cfg.Cells(lastRow + 1, 2).Value = valueText
+End Sub
+
+Private Function GetGeminiApiKey() As String
+    Dim cfg As Worksheet
+    Dim k As String
+
+    Set cfg = EnsureConfigSheet()
+    k = GetConfigValue(cfg, "gemini_api_key")
+    If Len(k) > 0 Then
+        GetGeminiApiKey = k
+        Exit Function
+    End If
+
+    k = Trim$(InputBox("Enter Gemini API Key:", "Gemini API Key"))
+    If Len(k) = 0 Then
+        GetGeminiApiKey = ""
+        Exit Function
+    End If
+
+    SetConfigValue cfg, "gemini_api_key", k
+    cfg.Visible = xlSheetVeryHidden
+    GetGeminiApiKey = k
+End Function
+
+Public Sub ResetGeminiApiKey()
+    Dim cfg As Worksheet
+    Set cfg = EnsureConfigSheet()
+    SetConfigValue cfg, "gemini_api_key", ""
+    cfg.Visible = xlSheetVeryHidden
+    MsgBox "Gemini API key reset.", vbInformation
+End Sub
+
+Private Function JsonEscape(ByVal s As String) As String
+    s = Replace(s, "\", "\\")
+    s = Replace(s, """", "\""")
+    s = Replace(s, vbCrLf, "\n")
+    s = Replace(s, vbCr, "\n")
+    s = Replace(s, vbLf, "\n")
+    JsonEscape = s
+End Function
+
+Private Function JsonUnescape(ByVal s As String) As String
+    s = Replace(s, "\n", vbLf)
+    s = Replace(s, "\""", """")
+    s = Replace(s, "\\", "\")
+    JsonUnescape = s
+End Function
+
+Private Function IsPointStart(ByVal lineText As String) As Boolean
+    Dim t As String
+    t = Trim$(lineText)
+    If Len(t) = 0 Then
+        IsPointStart = False
+        Exit Function
+    End If
+
+    If Left$(t, 1) = "-" Or Left$(t, 1) = "*" Then
+        IsPointStart = True
+        Exit Function
+    End If
+
+    Dim i As Long
+    i = 1
+    Do While i <= Len(t) And Mid$(t, i, 1) >= "0" And Mid$(t, i, 1) <= "9"
+        i = i + 1
+    Loop
+    If i > 1 And i <= Len(t) Then
+        If Mid$(t, i, 1) = "." Or Mid$(t, i, 1) = ")" Then
+            IsPointStart = True
+            Exit Function
+        End If
+    End If
+
+    If Right$(t, 1) = ":" Then
+        IsPointStart = True
+        Exit Function
+    End If
+
+    IsPointStart = False
+End Function
+
+Private Function StripPointPrefix(ByVal lineText As String) As String
+    Dim t As String
+    t = Trim$(lineText)
+    If Len(t) = 0 Then
+        StripPointPrefix = ""
+        Exit Function
+    End If
+
+    If Left$(t, 1) = "-" Or Left$(t, 1) = "*" Then
+        StripPointPrefix = Trim$(Mid$(t, 2))
+        Exit Function
+    End If
+
+    Dim i As Long
+    i = 1
+    Do While i <= Len(t) And Mid$(t, i, 1) >= "0" And Mid$(t, i, 1) <= "9"
+        i = i + 1
+    Loop
+    If i > 1 And i <= Len(t) Then
+        If Mid$(t, i, 1) = "." Or Mid$(t, i, 1) = ")" Then
+            StripPointPrefix = Trim$(Mid$(t, i + 1))
+            Exit Function
+        End If
+    End If
+
+    StripPointPrefix = t
+End Function
+
+' ══════════════════════════════════════════════════════════════
+'  INPUT BUILDERS
+' ══════════════════════════════════════════════════════════════
+
+Private Function RangeToPromptText(rng As Range, sheetName As String, maxCellChars As Long) As String
+    Dim r As Long, c As Long
+    Dim lines As String
+
+    lines = "Sheet: " & sheetName & vbLf
+    lines = lines & "Rows sent: " & CStr(Application.Max(0, rng.Rows.Count - 1)) & vbLf & vbLf
+    lines = lines & "Table:" & vbLf
+
+    For c = 1 To rng.Columns.Count
+        If c > 1 Then lines = lines & " | "
+        lines = lines & Left$(Trim$(CStr(rng.Cells(1, c).Value2)), maxCellChars)
+    Next c
+    lines = lines & vbLf
+
+    For c = 1 To rng.Columns.Count
+        If c > 1 Then lines = lines & " | "
+        lines = lines & "---"
+    Next c
+    lines = lines & vbLf
+
+    For r = 2 To rng.Rows.Count
+        For c = 1 To rng.Columns.Count
+            If c > 1 Then lines = lines & " | "
+            lines = lines & Left$(Trim$(CStr(rng.Cells(r, c).Value2)), maxCellChars)
+        Next c
+        lines = lines & vbLf
+    Next r
+
+    RangeToPromptText = lines
+End Function
+
+Private Function WorkbookToPromptText(wb As Workbook, maxCellChars As Long) As String
+    Dim ws As Worksheet
+    Dim out As String
+    out = ""
+
+    For Each ws In wb.Worksheets
+        If Left$(ws.Name, 3) = "AI_" Or ws.Name = "_AI_CONFIG" Then GoTo NextWs
+        If ws.UsedRange.Rows.Count < 2 Or ws.UsedRange.Columns.Count < 1 Then GoTo NextWs
+
+        out = out & RangeToPromptText(ws.UsedRange, ws.Name, maxCellChars) & vbLf & vbLf
+NextWs:
+    Next ws
+
+    If Len(out) = 0 Then
+        WorkbookToPromptText = "No usable workbook data found."
+    Else
+        WorkbookToPromptText = out
+    End If
+End Function
+
+Private Function InferAction(ByVal instruction As String) As String
+    Dim t As String
+    t = LCase$(Trim$(instruction))
+
+    If InStr(t, "chart") > 0 Or InStr(t, "graph") > 0 Or InStr(t, "plot") > 0 Or _
+       InStr(t, "visuali") > 0 Or InStr(t, "bar ") > 0 Or InStr(t, "pie ") > 0 Or _
+       InStr(t, "line chart") > 0 Or InStr(t, "scatter") > 0 Or InStr(t, "histogram") > 0 Then
+        InferAction = "chart": Exit Function
+    End If
+    If InStr(t, "predict") > 0 Or InStr(t, "forecast") > 0 Or InStr(t, "project") > 0 Or _
+       InStr(t, "extrapolat") > 0 Or InStr(t, "next ") > 0 Or InStr(t, "future ") > 0 Or _
+       InStr(t, "trend") > 0 Then
+        InferAction = "predict": Exit Function
+    End If
+    If InStr(t, "anomal") > 0 Or InStr(t, "outlier") > 0 Or InStr(t, "unusual") > 0 Or _
+       InStr(t, "spike") > 0 Or InStr(t, "deviation") > 0 Then
+        InferAction = "anomalies": Exit Function
+    End If
+    If InStr(t, "format") > 0 Or InStr(t, "color") > 0 Or InStr(t, "colour") > 0 Or _
+       InStr(t, "highlight") > 0 Or InStr(t, "conditional") > 0 Or InStr(t, "heatmap") > 0 Then
+        InferAction = "format": Exit Function
+    End If
+    If InStr(t, "formula") > 0 Or InStr(t, "calculate") > 0 Or InStr(t, "vlookup") > 0 Or _
+       InStr(t, "sumif") > 0 Then
+        InferAction = "formula": Exit Function
+    End If
+    If InStr(t, "clean") > 0 Or InStr(t, "fix") > 0 Or InStr(t, "duplicate") > 0 Or _
+       InStr(t, "missing") > 0 Or InStr(t, "typo") > 0 Or InStr(t, "invalid") > 0 Then
+        InferAction = "clean": Exit Function
+    End If
+    If InStr(t, "summary") > 0 Or InStr(t, "dashboard") > 0 Or InStr(t, "overview") > 0 Or _
+       InStr(t, "statistic") > 0 Or InStr(t, "kpi") > 0 Then
+        InferAction = "summary": Exit Function
+    End If
+    InferAction = "analyze"
+End Function
+
+Private Function ChatPrompt(ByRef outInstruction As String, _
+                             Optional ByVal contextLabel As String = "") As String
+    Dim prompt As String
+    prompt = InputBox( _
+        "What would you like to do with " & IIf(Len(contextLabel) > 0, contextLabel, "the selected data") & "?" & vbCrLf & vbCrLf & _
+        "Just type naturally, for example:" & vbCrLf & _
+        "  • ""Summarize key insights""" & vbCrLf & _
+        "  • ""Create a bar chart by region""" & vbCrLf & _
+        "  • ""Predict next 5 months of sales""" & vbCrLf & _
+        "  • ""Find outliers and anomalies""" & vbCrLf & _
+        "  • ""Add conditional formatting""" & vbCrLf & _
+        "  • ""Generate useful formulas""" & vbCrLf & _
+        "  • ""Clean up duplicates""" & vbCrLf & _
+        "  • ""Build a summary dashboard""", _
+        "Gemini AI", "Summarize key insights and outliers")
+
+    If Len(Trim$(prompt)) = 0 Then
+        ChatPrompt = ""
+        outInstruction = ""
+        Exit Function
+    End If
+
+    outInstruction = Trim$(prompt)
+    ChatPrompt = InferAction(outInstruction)
+End Function
+
+Private Function BuildActionTask(action As String, instruction As String) As String
+    Dim task As String
+    Select Case action
+        Case "chart"
+            task = "Return chart recommendation with title, x-axis, y-series, and one-line rationale."
+        Case "predict"
+            task = "Forecast next 5 values and explain method/confidence."
+        Case "anomalies"
+            task = "List anomalies with row/column/value and reason."
+        Case "format"
+            task = "Suggest conditional formatting rules with thresholds."
+        Case "formula"
+            task = "Suggest Excel formulas and where to apply them."
+        Case "clean"
+            task = "Identify data issues and suggested fixes."
+        Case "summary"
+            task = "Provide a concise dashboard-style summary with key stats and insights."
+        Case Else
+            task = "Provide clear, actionable bullet insights."
+    End Select
+
+    BuildActionTask = "Instruction: " & instruction & vbLf & _
+                      "Action: " & action & vbLf & _
+                      "Task: " & task
+End Function
+
+' ══════════════════════════════════════════════════════════════
+'  GEMINI API
+' ══════════════════════════════════════════════════════════════
+
+Private Function ExtractGeminiText(ByVal responseJson As String) As String
+    Dim p As Long, i As Long, n As Long
+    Dim ch As String
+    Dim esc As Boolean
+    Dim out As String
+
+    p = InStr(1, responseJson, """text""", vbTextCompare)
+    If p = 0 Then
+        ExtractGeminiText = ""
+        Exit Function
+    End If
+
+    p = InStr(p, responseJson, ":")
+    If p = 0 Then
+        ExtractGeminiText = ""
+        Exit Function
+    End If
+
+    i = p + 1
+    n = Len(responseJson)
+    Do While i <= n And Mid$(responseJson, i, 1) <> """"
+        i = i + 1
+    Loop
+    If i > n Then
+        ExtractGeminiText = ""
+        Exit Function
+    End If
+
+    i = i + 1
+    out = ""
+    esc = False
+
+    Do While i <= n
+        ch = Mid$(responseJson, i, 1)
+        If esc Then
+            out = out & "\" & ch
+            esc = False
+        ElseIf ch = "\" Then
+            esc = True
+        ElseIf ch = """" Then
+            Exit Do
+        Else
+            out = out & ch
+        End If
+        i = i + 1
+    Loop
+
+    ExtractGeminiText = JsonUnescape(out)
+End Function
+
+Private Function CallGemini(apiKey As String, promptText As String) As Object
+    Dim url As String
+    Dim payload As String
+
+    url = GEMINI_URL_BASE & GEMINI_MODEL & ":generateContent?key=" & apiKey
+
+    payload = "{" & _
+              """contents"": [{" & _
+              """role"": ""user""," & _
+              """parts"": [{"""text"": """ & JsonEscape(promptText) & """}]" & _
+              "}]" & _
+              "}"
+
+    Dim http As Object
+    Set http = CreateObject("MSXML2.XMLHTTP")
+    http.Open "POST", url, False
+    http.setRequestHeader "Content-Type", "application/json"
+    http.send payload
+
+    Set CallGemini = http
+End Function
+
+' ══════════════════════════════════════════════════════════════
+'  OUTPUT WRITER (POINT-LEVEL)
+' ══════════════════════════════════════════════════════════════
+
+Private Sub WritePointOutput(wb As Workbook, aiText As String, action As String, sourceText As String, instruction As String)
+    Dim outWs As Worksheet
+    On Error Resume Next
+    Set outWs = wb.Worksheets("AI_Output_Gemini")
+    On Error GoTo 0
+
+    If outWs Is Nothing Then
+        Set outWs = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+        outWs.Name = "AI_Output_Gemini"
+    End If
+
+    If Len(Trim$(CStr(outWs.Cells(1, 1).Value2))) = 0 Then
+        outWs.Cells(1, 1).Value = "#"
+        outWs.Cells(1, 2).Value = "Timestamp"
+        outWs.Cells(1, 3).Value = "Action"
+        outWs.Cells(1, 4).Value = "Source"
+        outWs.Cells(1, 5).Value = "Instruction"
+        outWs.Cells(1, 6).Value = "Finding"
+        outWs.Rows(1).Font.Bold = True
+        outWs.Columns("A").ColumnWidth = 5
+        outWs.Columns("B").ColumnWidth = 18
+        outWs.Columns("C").ColumnWidth = 12
+        outWs.Columns("D").ColumnWidth = 20
+        outWs.Columns("E").ColumnWidth = 36
+        outWs.Columns("F").ColumnWidth = 90
+    End If
+
+    Dim startRow As Long
+    startRow = outWs.Cells(outWs.Rows.Count, 1).End(xlUp).Row + 1
+    If startRow < 2 Then startRow = 2
+
+    Dim lines() As String
+    Dim cleanText As String
+    cleanText = Replace(Replace(aiText, vbCrLf, vbLf), vbCr, vbLf)
+    lines = Split(cleanText, vbLf)
+
+    Dim points() As String
+    Dim pointCount As Long, lineNum As Long
+    Dim currentPoint As String
+    ReDim points(1 To 1)
+    pointCount = 0
+    currentPoint = ""
+
+    For lineNum = 0 To UBound(lines)
+        Dim ln As String
+        ln = Trim$(lines(lineNum))
+        If Len(ln) = 0 Then GoTo ContinueLine
+
+        If IsPointStart(ln) Then
+            If Len(currentPoint) > 0 Then
+                pointCount = pointCount + 1
+                ReDim Preserve points(1 To pointCount)
+                points(pointCount) = currentPoint
+            End If
+            currentPoint = StripPointPrefix(ln)
+        Else
+            If Len(currentPoint) = 0 Then
+                currentPoint = ln
+            Else
+                currentPoint = currentPoint & " " & ln
+            End If
+        End If
+ContinueLine:
+    Next lineNum
+
+    If Len(currentPoint) > 0 Then
+        pointCount = pointCount + 1
+        ReDim Preserve points(1 To pointCount)
+        points(pointCount) = currentPoint
+    End If
+
+    Dim ts As String
+    ts = Format$(Now, "yyyy-mm-dd hh:mm")
+
+    Dim r As Long
+    For r = 1 To pointCount
+        outWs.Cells(startRow + r - 1, 1).Value = r
+        outWs.Cells(startRow + r - 1, 2).Value = ts
+        outWs.Cells(startRow + r - 1, 3).Value = UCase$(action)
+        outWs.Cells(startRow + r - 1, 4).Value = sourceText
+        outWs.Cells(startRow + r - 1, 5).Value = instruction
+        outWs.Cells(startRow + r - 1, 6).Value = points(r)
+        outWs.Cells(startRow + r - 1, 6).WrapText = True
+    Next r
+
+    If pointCount = 0 Then
+        outWs.Cells(startRow, 1).Value = 1
+        outWs.Cells(startRow, 2).Value = ts
+        outWs.Cells(startRow, 3).Value = UCase$(action)
+        outWs.Cells(startRow, 4).Value = sourceText
+        outWs.Cells(startRow, 5).Value = instruction
+        outWs.Cells(startRow, 6).Value = aiText
+        outWs.Cells(startRow, 6).WrapText = True
+        pointCount = 1
+    End If
+
+    Dim lastRow As Long
+    lastRow = startRow + pointCount - 1
+    Dim dataRange As Range
+    Set dataRange = outWs.Range(outWs.Cells(startRow, 1), outWs.Cells(lastRow, 6))
+    dataRange.Borders.LineStyle = xlContinuous
+    dataRange.Borders.Weight = xlThin
+    dataRange.Rows.EntireRow.AutoFit
+
+    outWs.Activate
+    outWs.Cells(startRow, 6).Select
+End Sub
+
+' ══════════════════════════════════════════════════════════════
+'  PUBLIC MACROS
+' ══════════════════════════════════════════════════════════════
+
+Public Sub AskGemini_FromSelection()
+    On Error GoTo EH
+
+    If TypeName(Selection) <> "Range" Then
+        MsgBox "Please select a table range first (header + data rows).", vbExclamation
+        Exit Sub
+    End If
+
+    Dim sel As Range
+    Set sel = Selection
+    If sel.Rows.Count < 2 Then
+        MsgBox "Selection must include at least 2 rows: header + one data row.", vbExclamation
+        Exit Sub
+    End If
+
+    ' Chat-style prompt — single input, action inferred automatically
+    Dim action As String
+    Dim instruction As String
+    action = ChatPrompt(instruction, "the selected data")
+    If Len(action) = 0 Then Exit Sub
+
+    Dim apiKey As String
+    apiKey = GetGeminiApiKey()
+    If Len(apiKey) = 0 Then
+        MsgBox "Gemini API key is required.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim prompt As String
+    prompt = BuildActionTask(action, instruction) & vbLf & vbLf & RangeToPromptText(sel, ActiveSheet.Name, 120)
+
+    Application.StatusBar = "Gemini: Processing " & UCase$(action) & "..."
+    Application.Cursor = xlWait
+
+    Dim http As Object
+    Set http = CallGemini(apiKey, prompt)
+
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+
+    If http.Status < 200 Or http.Status >= 300 Then
+        MsgBox "Gemini API error " & http.Status & ": " & http.responseText, vbCritical
+        Exit Sub
+    End If
+
+    Dim aiText As String
+    aiText = ExtractGeminiText(http.responseText)
+    If Len(Trim$(aiText)) = 0 Then aiText = http.responseText
+
+    WritePointOutput ActiveWorkbook, aiText, action, ActiveSheet.Name & " " & sel.Address(False, False), instruction
+    MsgBox "Gemini output written to AI_Output_Gemini.", vbInformation
+    Exit Sub
+
+EH:
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+    MsgBox "Error: " & Err.Description, vbCritical
+End Sub
+
+Public Sub AskGemini_FromWorkbookMultiSheet()
+    On Error GoTo EH
+
+    ' Chat-style prompt — single input, action inferred automatically
+    Dim action As String
+    Dim instruction As String
+    action = ChatPrompt(instruction, "all sheets in this workbook")
+    If Len(action) = 0 Then Exit Sub
+
+    Dim apiKey As String
+    apiKey = GetGeminiApiKey()
+    If Len(apiKey) = 0 Then
+        MsgBox "Gemini API key is required.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim prompt As String
+    prompt = BuildActionTask(action, instruction) & vbLf & vbLf & WorkbookToPromptText(ActiveWorkbook, 120)
+
+    Application.StatusBar = "Gemini: Processing workbook " & UCase$(action) & "..."
+    Application.Cursor = xlWait
+
+    Dim http As Object
+    Set http = CallGemini(apiKey, prompt)
+
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+
+    If http.Status < 200 Or http.Status >= 300 Then
+        MsgBox "Gemini API error " & http.Status & ": " & http.responseText, vbCritical
+        Exit Sub
+    End If
+
+    Dim aiText As String
+    aiText = ExtractGeminiText(http.responseText)
+    If Len(Trim$(aiText)) = 0 Then aiText = http.responseText
+
+    WritePointOutput ActiveWorkbook, aiText, action, ActiveWorkbook.Name & " (All sheets)", instruction
+    MsgBox "Gemini workbook output written to AI_Output_Gemini.", vbInformation
+    Exit Sub
+
+EH:
+    Application.StatusBar = False
+    Application.Cursor = xlDefault
+    MsgBox "Error: " & Err.Description, vbCritical
+End Sub

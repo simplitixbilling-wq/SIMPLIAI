@@ -1,0 +1,4 @@
+Employee ID,Employee Name,Department,Basic,HRA,Conveyance,Special Allowance,PF Applicable,ESI Applicable,Bank Account
+EMP001,Anita Verma,Accounts,32000,16000,1600,5400,Yes,No,12345678901
+EMP002,Rajesh Iyer,Operations,18000,9000,1200,2800,Yes,Yes,22345678901
+EMP003,Sana Khan,HR,28000,14000,1600,4400,Yes,No,

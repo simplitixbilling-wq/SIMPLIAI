@@ -1,0 +1,17 @@
+Letter Type: Audit information request letter
+Sender: Apex & Co., Chartered Accountants
+Recipient: The Finance Manager, Horizon Components Private Limited
+Date to use in draft: 07 May 2026
+Subject intent: Request documents and schedules for statutory audit for FY 2025-26
+
+Key points to include:
+- Thank the client for appointing the audit team.
+- Request the following items by 15 May 2026:
+  1. Trial balance and general ledger for FY 2025-26
+  2. Bank statements for all active accounts from April 2025 to March 2026
+  3. GST returns, workings, and reconciliation files
+  4. Fixed asset register and additions/deletions schedule
+  5. Debtors and creditors ageing as at year-end
+- Mention that early submission will help complete field work on schedule.
+- Tone should be formal, professional, and collaborative.
+- Closing signatory: For Apex & Co., CA Rohan Mehta, Partner

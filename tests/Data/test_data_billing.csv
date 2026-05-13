@@ -1,0 +1,11 @@
+OrderID,CustomerName,Item,Qty,Price,Amount,Date,Verification
+ORD001,Acme Corp,Laptop,2,1200.00,2400.00,2024-01-15,Verified
+ORD002,TechStart,Monitor,5,350.00,1750.00,2024-01-16,Verified
+ORD003,Global Solutions,Keyboard,10,50.00,500.00,2024-01-17,Pending
+ORD004,Digital Minds,Mouse,20,25.00,500.00,2024-01-18,Verified
+ORD005,CloudSync Ltd,USB Cable,50,8.00,400.00,2024-01-19,Verified
+ORD006,DataFlow Systems,Monitor Stand,3,120.00,360.00,2024-01-20,Pending
+ORD007,NetworkGen Inc,Printer,2,850.00,1700.00,2024-01-21,Pending
+ORD008,SecureBit Solutions,Monitor,3,350.00,1050.00,2024-01-22,Verified
+ORD010,Quantum Lab,Router,4,200.00,800.00,2024-01-24,Verified
+ORD011,TechVision,Webcam,2,75.00,150.00,2024-01-25,New

@@ -70,12 +70,15 @@ async function waitForApi() {
 let currentChatId = null;
 let sidebarVisible = true;
 let attachedImageName = null;
+let attachedImagePreview = null;  // base64 data URI for inline preview
 let attachedDocName = null;
+let attachedFiles = [];  // multi-file: [{name, chars}]
 let contextLimitTokens = 0;
 let actualContext = { used: 0, total: 0 };
 
 function normalizeReplyTokenLimit(value) {
   const n = Number.parseInt(String(value ?? ''), 10);
+  if (n === -1) return -1;  // "Max" — use model's full context
   if (Number.isFinite(n) && n > 0) return n;
   return 0;
 }
@@ -261,17 +264,19 @@ window.closeModal = closeModal;
  * Styled confirm dialog — replaces browser confirm().
  * Returns a Promise<boolean>.
  */
-function showPrompt(title = 'Rename', defaultValue = '') {
+function showPrompt(title = 'Rename', defaultValue = '', placeholder = '') {
   return new Promise((resolve) => {
     const modal = document.getElementById('modal-prompt');
     document.getElementById('prompt-title').textContent = title;
     const input = document.getElementById('prompt-input');
     input.value = defaultValue;
+    input.placeholder = placeholder;
     modal.classList.remove('hidden');
     input.focus();
     input.select();
     function cleanup() {
       modal.classList.add('hidden');
+      input.placeholder = '';
       document.getElementById('prompt-ok').removeEventListener('click', onOk);
       document.getElementById('prompt-cancel').removeEventListener('click', onCancel);
       input.removeEventListener('keydown', onKey);
@@ -504,6 +509,8 @@ function assistantActionsHtml() {
     <button onclick="branchConversation()">Branch</button>
     <button onclick="speakMessage(this)">Speak</button>
     <button onclick="exportMessage(this)">Export</button>
+    <button class="msg-rate-btn" onclick="rateMessage(this, 'up')" title="Good response">👍</button>
+    <button class="msg-rate-btn" onclick="rateMessage(this, 'down')" title="Bad response">👎</button>
   `;
 }
 
@@ -520,6 +527,29 @@ function exportMessage(btn) {
     label: `Export response #${idx}`,
   });
 }
+
+/** Rate a message thumbs up or down */
+async function rateMessage(btn, rating) {
+  const msgDiv = btn.closest('.message[data-msg-index]');
+  if (!msgDiv || !currentChatId) return;
+  const idx = parseInt(msgDiv.getAttribute('data-msg-index'), 10);
+  if (Number.isNaN(idx)) return;
+  // Toggle: if already rated same, remove rating
+  const current = msgDiv.getAttribute('data-rating');
+  const newRating = current === rating ? null : rating;
+  // Update UI
+  msgDiv.querySelectorAll('.msg-rate-btn').forEach(b => b.classList.remove('rated'));
+  if (newRating) {
+    btn.classList.add('rated');
+  }
+  msgDiv.setAttribute('data-rating', newRating || '');
+  // Save to backend
+  try {
+    await api.rate_message(currentChatId, idx, newRating);
+  } catch (_) {}
+  showToast(newRating ? (newRating === 'up' ? 'Liked' : 'Disliked') : 'Rating removed', 'info', 1500);
+}
+window.rateMessage = rateMessage;
 
 async function exportMessageWav(btn) {
   const msgDiv = btn.closest('.message[data-msg-index]');
@@ -603,6 +633,88 @@ function buildSourceCardsHtml(sources) {
   return cards;
 }
 
+/** Build horizontal scrollable document/RAG source cards HTML */
+function buildDocSourceCardsHtml(sources) {
+  if (!sources || !sources.length) return '';
+  const icons = { rag: '📄', file: '📎' };
+  let cards = '<div class="doc-source-cards">';
+  sources.forEach((s, i) => {
+    const icon = icons[s.type] || '📄';
+    const ext = (s.name || '').split('.').pop().toLowerCase();
+    const typeLabel = s.type === 'rag' ? (s.db || 'Knowledge Base') : ext.toUpperCase();
+    cards += `<div class="doc-source-card" title="${escapeHtml(s.name)}">` +
+      `<div class="src-head">` +
+        `<span class="doc-icon">${icon}</span>` +
+        `<span class="src-domain">${escapeHtml(typeLabel)}</span>` +
+        `<span class="src-index">${i + 1}</span>` +
+      `</div>` +
+      `<div class="src-title">${escapeHtml(s.name || 'Untitled')}</div>` +
+      `<div class="src-snippet">${escapeHtml(s.snippet || '')}</div>` +
+    `</div>`;
+  });
+  cards += '</div>';
+  return cards;
+}
+
+/** Render think blocks as collapsible details elements */
+function renderThinkBlocks(thinkBlocks, thinkingInProgress) {
+  if ((!thinkBlocks || !thinkBlocks.length) && !thinkingInProgress) return '';
+  let html = '';
+  if (thinkBlocks && thinkBlocks.length) {
+    for (const block of thinkBlocks) {
+      // Strip the <think>...</think> or <|channel>thought...<channel|> tags
+      let content = block
+        .replace(/^<think>|<\/think>$/g, '')
+        .replace(/^<\|channel>thought|<channel\|>$/g, '')
+        .trim();
+      if (!content) continue;
+      html += `<details class="think-block"><summary>💭 Thinking</summary><div class="think-content">${renderMarkdown(content)}</div></details>`;
+    }
+  }
+  if (thinkingInProgress) {
+    let content = thinkingInProgress
+      .replace(/^<think>/, '')
+      .replace(/^<\|channel>thought/, '')
+      .trim();
+    html += `<details class="think-block thinking-active" open><summary>💭 Thinking…</summary><div class="think-content">${renderMarkdown(content)}</div></details>`;
+  }
+  return html;
+}
+
+/** Generate follow-up question suggestions from assistant response */
+function generateFollowUpSuggestions(responseText) {
+  if (!responseText || responseText.length < 80) return [];
+  const suggestions = [];
+  // Extract key topics from the response (look for headings, bold text, key nouns)
+  const headings = responseText.match(/^#{1,3}\s+(.+)$/gm) || [];
+  const boldTerms = responseText.match(/\*\*([^*]+)\*\*/g) || [];
+  const topics = [
+    ...headings.map(h => h.replace(/^#+\s+/, '').trim()),
+    ...boldTerms.map(b => b.replace(/\*\*/g, '').trim()).filter(t => t.length > 3 && t.length < 60),
+  ];
+  // Generate questions from topics
+  const uniqueTopics = [...new Set(topics)].slice(0, 5);
+  for (const topic of uniqueTopics) {
+    if (topic.length > 4 && topic.length < 50) {
+      suggestions.push(`Tell me more about ${topic}`);
+    }
+    if (suggestions.length >= 2) break;
+  }
+  // If response mentions a list or steps, offer to go deeper
+  if (/\d+\.\s/.test(responseText) && suggestions.length < 3) {
+    suggestions.push('Can you explain this in more detail?');
+  }
+  // If response is an explanation, offer alternatives
+  if (responseText.length > 300 && suggestions.length < 3) {
+    suggestions.push('Can you give me an example?');
+  }
+  // Generic useful follow-up
+  if (suggestions.length < 2) {
+    suggestions.push('Can you summarize this?');
+  }
+  return suggestions.slice(0, 3);
+}
+
 /** Render markdown with optional web citation badges */
 function renderMarkdownWithCitations(text, sources) {
   let html = renderMarkdown(text);
@@ -657,7 +769,7 @@ function renderMarkdownMarked(text) {
         return linkText || '';
       },
 
-      // Override code blocks to add language header + copy button
+      // Override code blocks to add language header, copy button, and line numbers
       // marked v12 passes positional args: (text, lang, escaped)
       code(codeText, lang) {
         const raw = (codeText != null) ? String(codeText) : '';
@@ -672,11 +784,25 @@ function renderMarkdownMarked(text) {
             }
           } catch (_) { /* use escaped text */ }
         }
+        // Build line-numbered code
+        const lines = highlighted.split('\n');
+        // Don't add line numbers for single-line code
+        let codeBody;
+        if (lines.length <= 1) {
+          codeBody = `<code class="hljs lang-${escapeHtml(language)}">${highlighted}</code>`;
+        } else {
+          // Remove trailing empty line from trailing newline
+          if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+          const numberedLines = lines.map((line, i) =>
+            `<span class="code-line"><span class="code-line-num">${i + 1}</span><span class="code-line-content">${line || ' '}</span></span>`
+          ).join('\n');
+          codeBody = `<code class="hljs lang-${escapeHtml(language)} has-line-numbers">${numberedLines}</code>`;
+        }
         const langLabel = language || 'code';
         return `<div class="code-block-wrapper">` +
           `<div class="code-block-header"><span class="code-lang">${escapeHtml(langLabel)}</span>` +
           `<button class="code-copy-btn" onclick="copyCodeBlock(this)">Copy</button></div>` +
-          `<pre><code class="hljs lang-${escapeHtml(language)}">${highlighted}</code></pre></div>`;
+          `<pre>${codeBody}</pre></div>`;
       },
     },
   });
@@ -690,7 +816,12 @@ function copyCodeBlock(btn) {
   if (!wrapper) return;
   const code = wrapper.querySelector('code');
   if (!code) return;
-  navigator.clipboard.writeText(code.textContent).then(() => {
+  // Extract only code content, excluding line numbers
+  const contentSpans = code.querySelectorAll('.code-line-content');
+  const text = contentSpans.length > 0
+    ? Array.from(contentSpans).map(s => s.textContent).join('\n')
+    : code.textContent;
+  navigator.clipboard.writeText(text).then(() => {
     btn.textContent = 'Copied!';
     setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
   }).catch(() => {
@@ -846,10 +977,13 @@ async function init() {
     $('#btn-load-model').textContent = 'Unload';
     $('#btn-load-model').disabled = false;
     $('#context-bar-container').style.display = '';
+    modelIsLoaded = true;
   } else {
     contextLimitTokens = 0;
     $('#context-bar-container').style.display = 'none';
+    modelIsLoaded = false;
   }
+  setAgentActionButtons(false);
 
   // Load chats and select first
   await safeStep('Loading chats', refreshChats);
@@ -986,6 +1120,9 @@ $('#btn-load-model').addEventListener('click', async function() {
     updateContextBar();
     showToast('Model unloaded', 'info');
     this.textContent = 'Load';
+    modelIsLoaded = false;
+    setAgentActionButtons(false);
+    return;
   }
   const r = await api.load_model();
   if (r.error) {
@@ -1052,7 +1189,13 @@ async function selectChat(chatId) {
   renderMessages(r.messages);
   highlightActiveChat();
   // Restore per-chat file attachment state
-  syncUploadButton(r.attached_file || null);
+  if (r.attached_files && r.attached_files.length > 0) {
+    syncUploadButtonMulti(r.attached_files);
+  } else {
+    syncUploadButton(r.attached_file || null);
+    attachedFiles = r.attached_file ? [{ name: r.attached_file }] : [];
+    renderChatFileChips();
+  }
   // Load system prompt
   const sp = await api.get_system_prompt();
   $('#system-prompt-input').value = sp || '';
@@ -1120,7 +1263,15 @@ function appendMessage(role, content, streaming = false, messageIndex = null) {
       bubble.appendChild(actions);
     }
   } else {
-    bubble.innerHTML = renderMarkdown(content);
+    // Highlight @rag mentions and /commands in user messages
+    let userHtml = renderMarkdown(content);
+    userHtml = userHtml.replace(/@"([^"]+)"/g, '<span class="mention-tag">@$1</span>');
+    userHtml = userHtml.replace(/@(\S+)/g, (m, name) => {
+      if (m.includes('mention-tag')) return m; // already processed
+      return `<span class="mention-tag">@${name}</span>`;
+    });
+    userHtml = userHtml.replace(/(^|[>\s])(\/\w+)/g, '$1<span class="command-tag">$2</span>');
+    bubble.innerHTML = userHtml;
     if (!streaming) {
       bubble.classList.add('editable');
       bubble.title = 'Double-click to edit and regenerate';
@@ -1398,10 +1549,151 @@ sendBtn.addEventListener('click', sendMessage);
     agentInput.addEventListener('blur', onBlur);
   }
 })();
+
+// ── /Command autocomplete ─────────────────────────────────────
+(function setupCommandAutocomplete() {
+  const dropdown = document.createElement('div');
+  dropdown.id = 'cmd-autocomplete-dropdown';
+  dropdown.style.cssText = 'position:absolute;display:none;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.35);z-index:2000;max-height:220px;overflow-y:auto;min-width:200px;max-width:min(440px, calc(100vw - 16px));overflow-x:hidden;';
+  document.body.appendChild(dropdown);
+
+  let activeInput = null;
+  let slashPos = -1;
+  let cachedCmds = [];
+
+  async function fetchCmds() {
+    try { cachedCmds = (await api.get_plugin_commands()) || []; } catch { cachedCmds = []; }
+  }
+
+  function hide() { dropdown.style.display = 'none'; activeInput = null; slashPos = -1; }
+
+  function show(input) {
+    const text = input.value;
+    const cursor = input.selectionStart;
+    // Only trigger when / is at position 0 (start of input)
+    if (text[0] !== '/') { hide(); return; }
+    slashPos = 0;
+
+    const fragment = text.slice(1, cursor).toLowerCase().split(/\s/)[0];
+    const matches = cachedCmds.filter(c => c.command.toLowerCase().includes('/' + fragment));
+    if (matches.length === 0) { hide(); return; }
+
+    activeInput = input;
+    dropdown.innerHTML = '';
+    matches.forEach(cmd => {
+      const item = document.createElement('div');
+      item.className = 'cmd-autocomplete-item';
+      item.innerHTML = `<span class="cmd-name">${escapeHtml(cmd.command)}</span><span class="cmd-desc">${escapeHtml(cmd.description)}</span>`;
+      item.title = cmd.command + ' — ' + cmd.description;
+      item.addEventListener('mouseenter', () => item.classList.add('active'));
+      item.addEventListener('mouseleave', () => item.classList.remove('active'));
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        insertCommand(cmd.command);
+      });
+      dropdown.appendChild(item);
+    });
+
+    // Position above or below input
+    const rect = input.getBoundingClientRect();
+    const margin = 8;
+    const viewW = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewH = window.innerHeight || document.documentElement.clientHeight || 0;
+    dropdown.style.display = 'block';
+    const maxW = Math.max(200, Math.min(440, Math.floor(rect.width)));
+    dropdown.style.width = Math.min(maxW, viewW - margin * 2) + 'px';
+    const box = dropdown.getBoundingClientRect();
+    let left = rect.left;
+    if (left + box.width > viewW - margin) left = viewW - margin - box.width;
+    if (left < margin) left = margin;
+    // Prefer above input for command menu
+    let top = rect.top - box.height - 4;
+    if (top < margin) top = rect.bottom + 4;
+    dropdown.style.left = Math.round(left) + 'px';
+    dropdown.style.top = Math.round(top) + 'px';
+  }
+
+  function insertCommand(command) {
+    if (!activeInput) return;
+    const text = activeInput.value;
+    const afterSlash = text.indexOf(' ');
+    const rest = afterSlash >= 0 ? text.slice(afterSlash) : ' ';
+    activeInput.value = command + (rest === ' ' ? ' ' : rest);
+    const pos = command.length + 1;
+    activeInput.selectionStart = activeInput.selectionEnd = pos;
+    activeInput.focus();
+    hide();
+  }
+
+  function onInput(e) {
+    const input = e.target;
+    const text = input.value;
+    if (text.startsWith('/')) {
+      // Only show if no space typed yet (still completing the command name)
+      const firstSpace = text.indexOf(' ');
+      const cursor = input.selectionStart;
+      if (firstSpace < 0 || cursor <= firstSpace) {
+        fetchCmds().then(() => show(input));
+      } else {
+        hide();
+      }
+    } else if (dropdown.style.display !== 'none') {
+      hide();
+    }
+  }
+
+  function onKeydown(e) {
+    if (dropdown.style.display === 'none') return;
+    const items = [...dropdown.querySelectorAll('.cmd-autocomplete-item')];
+    if (!items.length) return;
+    let sel = items.findIndex(el => el.classList.contains('active'));
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (sel >= 0) items[sel].classList.remove('active');
+      if (e.key === 'ArrowDown') sel = (sel + 1) % items.length;
+      else sel = sel <= 0 ? items.length - 1 : sel - 1;
+      items[sel].classList.add('active');
+      items[sel].scrollIntoView({ block: 'nearest' });
+    } else if ((e.key === 'Tab' || e.key === 'Enter') && sel >= 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      const cmdText = items[sel].querySelector('.cmd-name')?.textContent || '';
+      insertCommand(cmdText);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      hide();
+    }
+  }
+
+  function onBlur() { setTimeout(hide, 200); }
+
+  // Attach to both inputs
+  const chatInput = $('#user-input');
+  if (chatInput) {
+    chatInput.addEventListener('input', onInput);
+    chatInput.addEventListener('keydown', onKeydown);
+    chatInput.addEventListener('blur', onBlur);
+  }
+  const agentInput = $('#agent-input');
+  if (agentInput) {
+    agentInput.addEventListener('input', onInput);
+    agentInput.addEventListener('keydown', onKeydown);
+    agentInput.addEventListener('blur', onBlur);
+  }
+})();
+
 stopBtn.addEventListener('click', async () => {
   stopBtn.disabled = true;
+  stopBtn.textContent = '⏳';
   setStatus('Stopping generation...', true);
-  await api.stop_generation();
+  try {
+    await api.stop_generation();
+  } catch (_) {
+    // ignore
+  } finally {
+    stopBtn.textContent = '■';
+    stopBtn.disabled = false;
+  }
 });
 
 function updateSendButton() {
@@ -1435,8 +1727,15 @@ async function sendMessage() {
     await refreshChats();
   }
 
-  // Show user message immediately
-  appendMessage('user', text);
+  // Show user message immediately (with image preview if attached)
+  const userBubble = appendMessage('user', text);
+  if (attachedImagePreview && userBubble) {
+    const imgWrap = document.createElement('div');
+    imgWrap.className = 'msg-image-preview';
+    imgWrap.innerHTML = `<img src="${attachedImagePreview}" alt="${escapeHtml(attachedImageName || 'image')}" />`;
+    userBubble.insertBefore(imgWrap, userBubble.firstChild);
+    attachedImagePreview = null;
+  }
   updateContextBar();
 
   // Show typing indicator, then create streaming bubble
@@ -1477,6 +1776,7 @@ async function sendMessage() {
 // ═══ BACKEND EVENTS ═══════════════════════════════════════════
 
 let pendingWebSources = null;       // sources from web_sources event
+let pendingDocSources = null;       // sources from doc_sources event
 
 window.addEventListener('app_status', (e) => {
   const text = e?.detail?.text;
@@ -1509,6 +1809,25 @@ window.addEventListener('web_sources', (e) => {
   }
 });
 
+// ── Tool permission request ──────────────────────────────────
+window.addEventListener('tool_permission_request', async (e) => {
+  const { command, args, description } = e?.detail || {};
+  const msg = `AI wants to run:\n\n${command}  ${args || ''}\n\n(${description || 'No description'})`;
+  const allowed = await showConfirm(msg, '🔧 Tool Permission', 'Allow');
+  if (allowed) {
+    await pywebview.api.approve_tool_execution();
+  } else {
+    await pywebview.api.deny_tool_execution();
+  }
+});
+
+// Document / RAG source events
+window.addEventListener('doc_sources', (e) => {
+  const sources = e?.detail?.sources;
+  if (!Array.isArray(sources) || !sources.length) return;
+  pendingDocSources = sources;
+});
+
 // Generation events
 window.addEventListener('generation_start', () => {
   isGenerating = true;
@@ -1521,8 +1840,10 @@ window.addEventListener('generation_start', () => {
 window.addEventListener('generation_token', (e) => {
   removeTypingIndicator();
   if (streamingBubble) {
-    const cardsHtml = pendingWebSources ? buildSourceCardsHtml(pendingWebSources) : '';
-    streamingBubble.innerHTML = cardsHtml + renderMarkdownWithCitations(e.detail.text, pendingWebSources);
+    const webCards = pendingWebSources ? buildSourceCardsHtml(pendingWebSources) : '';
+    const docCards = pendingDocSources ? buildDocSourceCardsHtml(pendingDocSources) : '';
+    const thinkHtml = renderThinkBlocks(e.detail.think, e.detail.thinking);
+    streamingBubble.innerHTML = webCards + docCards + thinkHtml + renderMarkdownWithCitations(e.detail.text, pendingWebSources);
     scrollToBottom();
   }
 });
@@ -1531,22 +1852,46 @@ window.addEventListener('generation_done', (e) => {
   removeTypingIndicator();
   isGenerating = false;
   const sources = e?.detail?.web_sources || pendingWebSources || null;
+  const docSources = e?.detail?.doc_sources || pendingDocSources || null;
   if (streamingBubble) {
     streamingBubble.classList.remove('streaming');
     streamingBubble.setAttribute(
       'data-msg-index',
       String(document.querySelectorAll('#messages-container .message').length - 1)
     );
-    const cardsHtml = sources && sources.length ? buildSourceCardsHtml(sources) : '';
-    streamingBubble.innerHTML = cardsHtml + renderMarkdownWithCitations(e.detail.text, sources);
+    const webCards = sources && sources.length ? buildSourceCardsHtml(sources) : '';
+    const docCards = docSources && docSources.length ? buildDocSourceCardsHtml(docSources) : '';
+    const thinkHtml = renderThinkBlocks(e?.detail?.think, null);
+    streamingBubble.innerHTML = webCards + docCards + thinkHtml + renderMarkdownWithCitations(e.detail.text, sources);
     // Add action buttons
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     actions.innerHTML = assistantActionsHtml();
     streamingBubble.appendChild(actions);
+    // Add follow-up suggestions
+    const followUps = generateFollowUpSuggestions(e.detail.text);
+    if (followUps.length) {
+      const chipsDiv = document.createElement('div');
+      chipsDiv.className = 'followup-chips';
+      followUps.forEach(q => {
+        const chip = document.createElement('button');
+        chip.className = 'followup-chip';
+        chip.textContent = q;
+        chip.addEventListener('click', () => {
+          $('#user-input').value = q;
+          autoResize($('#user-input'));
+          updateSendButton();
+          document.querySelectorAll('.followup-chips').forEach(el => el.remove());
+          sendMessage();
+        });
+        chipsDiv.appendChild(chip);
+      });
+      streamingBubble.appendChild(chipsDiv);
+    }
     streamingBubble = null;
   }
   pendingWebSources = null;
+  pendingDocSources = null;
   sendBtn.style.display = '';
   stopBtn.style.display = 'none';
   stopBtn.disabled = false;
@@ -1563,6 +1908,7 @@ window.addEventListener('generation_error', (e) => {
   removeTypingIndicator();
   isGenerating = false;
   pendingWebSources = null;
+  pendingDocSources = null;
   if (streamingBubble) {
     streamingBubble.classList.remove('streaming');
     streamingBubble.innerHTML = `<span style="color:var(--danger)">Error: ${escapeHtml(e.detail.error)}</span>`;
@@ -1592,6 +1938,7 @@ window.addEventListener('generation_stopped', (e) => {
     streamingBubble = null;
   }
   pendingWebSources = null;
+  pendingDocSources = null;
   sendBtn.style.display = '';
   stopBtn.style.display = 'none';
   stopBtn.disabled = false;
@@ -1665,6 +2012,8 @@ window.addEventListener('model_loaded', (e) => {
   $('#context-bar-container').style.display = '';
   updateContextBar();
   showToast(`Model loaded in ${d.load_time}s (${backend})`, 'info');
+  modelIsLoaded = true;
+  setAgentActionButtons(false);
   updateSendButton();
 });
 
@@ -1679,6 +2028,17 @@ window.addEventListener('model_error', (e) => {
 // System monitor
 window.addEventListener('system_stats', (e) => {
   $('#system-monitor').textContent = e.detail.text;
+});
+
+// Memory pressure warnings from watchdog
+window.addEventListener('memory_warning', (e) => {
+  const d = e.detail;
+  const lvl = d.stage === 'critical' ? 'error' : d.stage === 'high' ? 'error' : 'info';
+  if (d.stage !== 'normal') {
+    showToast(`⚠️ ${d.message}`, lvl);
+    const mon = $('#system-monitor');
+    if (mon) mon.textContent += ` | MEM: ${d.available_gb.toFixed(1)}GB free [${d.stage.toUpperCase()}]`;
+  }
 });
 
 // Download events
@@ -1703,9 +2063,19 @@ window.addEventListener('download_error', (e) => {
 
 function copyMessage(btn) {
   const msgEl = btn.closest('.message');
-  const text = msgEl.innerText
-    .replace(/Copy|Regenerate|Branch|Speak|Export/g, '')
-    .trim();
+  // Extract text without line numbers: for code blocks, use only .code-line-content spans
+  const clone = msgEl.cloneNode(true);
+  // Remove action buttons from the clone
+  clone.querySelectorAll('.msg-actions, .code-block-header').forEach(el => el.remove());
+  // Replace code blocks that have line numbers with plain code text
+  clone.querySelectorAll('code.has-line-numbers').forEach(code => {
+    const contentSpans = code.querySelectorAll('.code-line-content');
+    if (contentSpans.length > 0) {
+      const plainCode = Array.from(contentSpans).map(s => s.textContent).join('\n');
+      code.textContent = plainCode;
+    }
+  });
+  const text = clone.innerText.trim();
   navigator.clipboard.writeText(text).then(() => showToast('Copied!', 'info'));
 }
 
@@ -2232,9 +2602,11 @@ $('#chat-max-tokens')?.addEventListener('change', async function() {
   await api.save_app_settings({ max_response_tokens: maxResponseTokens });
   applyReplyTokenLimitUi(maxResponseTokens);
   showToast(
-    maxResponseTokens > 0
-      ? `Reply length limit set to ${maxResponseTokens} tokens`
-      : 'Reply length set to Auto (context-based)',
+    maxResponseTokens === -1
+      ? 'Reply length set to Max (model limit)'
+      : maxResponseTokens > 0
+        ? `Reply length limit set to ${maxResponseTokens} tokens`
+        : 'Reply length set to Auto (context-based)',
     'info'
   );
 });
@@ -2271,7 +2643,8 @@ $('#btn-model-settings').addEventListener('click', async () => {
   const s = await api.get_per_model_settings();
   $('#ms-temperature').value = Math.round((s.temperature || 0.25) * 100);
   $('#ms-temp-val').textContent = (s.temperature || 0.25).toFixed(2);
-  if (s.n_ctx) { $('#ms-n-ctx').value = String(s.n_ctx); }
+  if (s.n_ctx === -1) { $('#ms-n-ctx').value = 'max'; }
+  else if (s.n_ctx) { $('#ms-n-ctx').value = String(s.n_ctx); }
   else { $('#ms-n-ctx').value = 'default'; }
   $('#ms-threads').value = s.n_threads || 4;
   $('#ms-threads-val').textContent = s.n_threads || 4;
@@ -2292,10 +2665,16 @@ $('#btn-save-model-settings').addEventListener('click', async () => {
     n_threads: parseInt($('#ms-threads').value),
   };
   const nCtx = $('#ms-n-ctx').value;
-  if (nCtx !== 'default') cfg.n_ctx = parseInt(nCtx);
-  await api.save_per_model_settings(cfg);
+  if (nCtx === 'max') cfg.n_ctx = -1;       // Max — use model's native limit
+  else if (nCtx !== 'default') cfg.n_ctx = parseInt(nCtx);
+  const res = await api.save_per_model_settings(cfg);
   closeModal('modal-model-settings');
-  showToast('Model settings saved', 'info');
+  if (res && res.n_ctx_changed) {
+    showToast('Reloading model with new context window...', 'info');
+    await api.load_model($('#model-select').value);
+  } else {
+    showToast('Model settings saved', 'info');
+  }
 });
 
 $('#btn-reset-model-settings').addEventListener('click', async () => {
@@ -2416,6 +2795,7 @@ async function openPluginsModal() {
 
 $('#btn-settings-compare').addEventListener('click', openCompareModal);
 $('#btn-settings-plugins').addEventListener('click', openPluginsModal);
+$('#btn-settings-mcp').addEventListener('click', openMcpModal);
 
 $('#btn-reload-plugins').addEventListener('click', async () => {
   const r = await api.reload_plugins();
@@ -2658,6 +3038,177 @@ async function hfSearch() {
   }
 }
 
+// ═══ MCP SERVER MANAGEMENT ════════════════════════════════════
+
+async function openMcpModal() {
+  openModal('modal-mcp');
+  await mcpRefreshList();
+}
+
+async function mcpRefreshList() {
+  const list = document.getElementById('mcp-server-list');
+  if (!list) return;
+  list.innerHTML = '<div class="muted small" style="padding:8px;">Loading...</div>';
+
+  let servers = [];
+  try { servers = await api.get_mcp_servers(); } catch(e) {}
+  if (!servers || !servers.length) {
+    list.innerHTML = '<div class="muted small" style="padding:12px;text-align:center;">No MCP servers configured.<br>Click <b>+ Add Server</b> to get started.</div>';
+    return;
+  }
+
+  list.innerHTML = '';
+  for (const srv of servers) {
+    const card = document.createElement('div');
+    card.className = 'mcp-card';
+    const statusDot = srv.connected ? '<span class="mcp-dot mcp-dot-on"></span>' : '<span class="mcp-dot mcp-dot-off"></span>';
+    const statusText = srv.connected ? `Connected \u2022 ${srv.tool_count} tool${srv.tool_count!==1?'s':''}` : 'Disconnected';
+    const transportBadge = `<span class="mcp-badge">${srv.transport.toUpperCase()}</span>`;
+    const cmdInfo = srv.transport === 'stdio'
+      ? `<span class="muted small">${srv.command} ${(srv.args||[]).join(' ')}</span>`
+      : `<span class="muted small">${srv.url}</span>`;
+
+    card.innerHTML = `
+      <div class="mcp-card-header">
+        <div class="mcp-card-title">${statusDot} <strong>${srv.name}</strong> ${transportBadge}</div>
+        <div class="mcp-card-actions">
+          ${srv.connected
+            ? `<button class="btn ghost small" onclick="mcpDisconnect('${srv.name}')">Disconnect</button>`
+            : `<button class="btn accent small" onclick="mcpConnect('${srv.name}')">Connect</button>`
+          }
+          <button class="btn ghost small" onclick="mcpEditServer('${srv.name}')">Edit</button>
+          <button class="btn ghost small" onclick="mcpRemoveServer('${srv.name}')" style="color:var(--danger,#e55);">Remove</button>
+        </div>
+      </div>
+      <div class="mcp-card-info">
+        ${cmdInfo}
+        <span class="muted small" style="margin-left:8px;">${statusText}</span>
+      </div>
+    `;
+    list.appendChild(card);
+  }
+}
+
+async function mcpConnect(name) {
+  showToast('Connecting to ' + name + '...', 'info');
+  const r = await api.connect_mcp_server(name);
+  if (r?.error) {
+    showToast('Connection failed: ' + r.error, 'error');
+  } else {
+    const tools = r.tools || [];
+    showToast(`Connected! ${tools.length} tool${tools.length!==1?'s':''} available.`, 'info');
+  }
+  await mcpRefreshList();
+}
+
+async function mcpDisconnect(name) {
+  await api.disconnect_mcp_server(name);
+  showToast(name + ' disconnected', 'info');
+  await mcpRefreshList();
+}
+
+async function mcpRemoveServer(name) {
+  if (!confirm(`Remove MCP server "${name}"?`)) return;
+  const r = await api.remove_mcp_server(name);
+  if (r?.error) { showToast(r.error, 'error'); return; }
+  showToast('Server removed', 'info');
+  await mcpRefreshList();
+}
+
+function mcpShowAddForm() {
+  document.getElementById('mcp-form').style.display = '';
+  document.getElementById('mcp-form-title').textContent = 'Add MCP Server';
+  document.getElementById('mcp-edit-name').value = '';
+  document.getElementById('mcp-name').value = '';
+  document.getElementById('mcp-name').disabled = false;
+  document.getElementById('mcp-transport').value = 'stdio';
+  document.getElementById('mcp-command').value = '';
+  document.getElementById('mcp-args').value = '';
+  document.getElementById('mcp-env').value = '';
+  document.getElementById('mcp-url').value = '';
+  document.getElementById('mcp-headers').value = '';
+  mcpTransportChanged();
+  document.getElementById('btn-mcp-add').style.display = 'none';
+}
+
+async function mcpEditServer(name) {
+  let servers = [];
+  try { servers = await api.get_mcp_servers(); } catch(e) {}
+  const srv = servers.find(s => s.name === name);
+  if (!srv) return;
+
+  document.getElementById('mcp-form').style.display = '';
+  document.getElementById('mcp-form-title').textContent = 'Edit: ' + name;
+  document.getElementById('mcp-edit-name').value = name;
+  document.getElementById('mcp-name').value = srv.name;
+  document.getElementById('mcp-name').disabled = false;
+  document.getElementById('mcp-transport').value = srv.transport || 'stdio';
+  document.getElementById('mcp-command').value = srv.command || '';
+  document.getElementById('mcp-args').value = (srv.args || []).join(', ');
+  document.getElementById('mcp-env').value = '';
+  document.getElementById('mcp-url').value = srv.url || '';
+  document.getElementById('mcp-headers').value = '';
+  mcpTransportChanged();
+  document.getElementById('btn-mcp-add').style.display = 'none';
+}
+
+function mcpCancelForm() {
+  document.getElementById('mcp-form').style.display = 'none';
+  document.getElementById('btn-mcp-add').style.display = '';
+}
+
+function mcpTransportChanged() {
+  const t = document.getElementById('mcp-transport').value;
+  document.getElementById('mcp-stdio-fields').style.display = t === 'stdio' ? '' : 'none';
+  document.getElementById('mcp-sse-fields').style.display = t === 'sse' ? '' : 'none';
+}
+
+async function mcpSaveServer() {
+  const editName = document.getElementById('mcp-edit-name').value;
+  const name = document.getElementById('mcp-name').value.trim();
+  if (!name) { showToast('Server name is required', 'error'); return; }
+
+  const transport = document.getElementById('mcp-transport').value;
+  const config = { name, transport, enabled: true };
+
+  if (transport === 'stdio') {
+    config.command = document.getElementById('mcp-command').value.trim();
+    const argsRaw = document.getElementById('mcp-args').value.trim();
+    config.args = argsRaw ? argsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const envRaw = document.getElementById('mcp-env').value.trim();
+    config.env = {};
+    if (envRaw) {
+      for (const line of envRaw.split('\n')) {
+        const eq = line.indexOf('=');
+        if (eq > 0) config.env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+      }
+    }
+    if (!config.command) { showToast('Command is required for stdio transport', 'error'); return; }
+  } else {
+    config.url = document.getElementById('mcp-url').value.trim();
+    const hdrRaw = document.getElementById('mcp-headers').value.trim();
+    config.headers = {};
+    if (hdrRaw) {
+      for (const line of hdrRaw.split('\n')) {
+        const colon = line.indexOf(':');
+        if (colon > 0) config.headers[line.slice(0, colon).trim()] = line.slice(colon + 1).trim();
+      }
+    }
+    if (!config.url) { showToast('URL is required for SSE transport', 'error'); return; }
+  }
+
+  let r;
+  if (editName) {
+    r = await api.update_mcp_server(editName, config);
+  } else {
+    r = await api.add_mcp_server(config);
+  }
+  if (r?.error) { showToast(r.error, 'error'); return; }
+  showToast('Server saved', 'info');
+  mcpCancelForm();
+  await mcpRefreshList();
+}
+
 // ═══ FILE UPLOAD ══════════════════════════════════════════════
 
 function syncUploadButton(fileName) {
@@ -2669,24 +3220,66 @@ function syncUploadButton(fileName) {
     $('#btn-upload').classList.remove('active');
     $('#btn-upload').title = 'Upload file';
   }
+  renderChatFileChips();
+}
+
+function syncUploadButtonMulti(fileNames) {
+  attachedFiles = (fileNames || []).map(n => ({ name: n }));
+  if (attachedFiles.length > 0) {
+    attachedDocName = attachedFiles[0].name;
+    $('#btn-upload').classList.add('active');
+    $('#btn-upload').title = `${attachedFiles.length} file(s) loaded (click to clear all)`;
+  } else {
+    attachedDocName = null;
+    $('#btn-upload').classList.remove('active');
+    $('#btn-upload').title = 'Upload file';
+  }
+  renderChatFileChips();
+}
+
+function renderChatFileChips() {
+  const container = $('#chat-file-chips');
+  if (!container) return;
+  container.innerHTML = '';
+  for (const file of attachedFiles) {
+    const chip = document.createElement('span');
+    chip.className = 'file-chip';
+    const ext = (file.name || '').split('.').pop().toLowerCase();
+    const icon = ['csv', 'xlsx', 'xls'].includes(ext) ? '📊' : '📄';
+    chip.innerHTML = `${icon} ${escapeHtml(file.name)} <button class="chip-remove" title="Remove">✕</button>`;
+    chip.querySelector('.chip-remove').addEventListener('click', async () => {
+      await api.clear_uploaded_document(file.name);
+      attachedFiles = attachedFiles.filter(f => f.name !== file.name);
+      if (attachedFiles.length === 0) {
+        attachedDocName = null;
+        $('#btn-upload').classList.remove('active');
+        $('#btn-upload').title = 'Upload file';
+      } else {
+        attachedDocName = attachedFiles[0].name;
+      }
+      renderChatFileChips();
+      showToast(`Removed: ${file.name}`, 'info');
+    });
+    container.appendChild(chip);
+  }
 }
 
 $('#btn-upload').addEventListener('click', () => {
-  if (attachedDocName) {
-    clearUploadedDocument();
+  if (attachedDocName || attachedFiles.length > 0) {
+    clearAllUploadedDocuments();
     return;
   }
   uploadDocument();
 });
 
-async function clearUploadedDocument() {
+async function clearAllUploadedDocuments() {
   await api.clear_uploaded_document();
   attachedDocName = null;
+  attachedFiles = [];
   $('#btn-upload').classList.remove('active');
   $('#btn-upload').title = 'Upload file';
-  showToast('Uploaded file context cleared', 'info');
-  
-  // Display file cleared message in chat
+  renderChatFileChips();
+  showToast('All file contexts cleared', 'info');
   appendMessage('assistant', '📄 **File context cleared.** Upload a new file to continue analysis.');
 }
 
@@ -2699,19 +3292,47 @@ async function uploadDocument() {
   if (!r?.selected) {
     return;
   }
-  attachedDocName = r.name;
-  $('#btn-upload').classList.add('active');
-  $('#btn-upload').title = `File loaded: ${r.name} (click to clear)`;
+
+  // Dialog upload replaces previous files (drag-drop appends)
+  attachedFiles = [];
+
+  // Multi-file response
+  if (r.files && r.files.length > 0) {
+    for (const f of r.files) {
+      if (f.error) {
+        showToast(`Error: ${f.name} — ${f.error}`, 'error');
+        continue;
+      }
+      if (f.duplicate) continue;
+      if (!attachedFiles.find(af => af.name === f.name)) {
+        attachedFiles.push({ name: f.name, chars: f.chars || 0 });
+      }
+    }
+    syncUploadButtonMulti(attachedFiles.map(f => f.name));
+  } else {
+    // Legacy single-file response
+    if (!attachedFiles.find(af => af.name === r.name)) {
+      attachedFiles.push({ name: r.name, chars: r.chars || 0 });
+    }
+    syncUploadButtonMulti(attachedFiles.map(f => f.name));
+  }
 
   if (r.processing) {
-    // PDF is being processed in background (OCR etc.)
-    showToast(`Processing PDF: ${r.name} — please wait...`, 'info', 8000);
-    const fileIcon = '📄';
-    appendMessage('assistant', `${fileIcon} **Processing PDF:** ${r.name} — extracting text and running OCR on scanned pages. This may take a moment for large files...`);
+    const names = r.files ? r.files.filter(f => f.processing).map(f => f.name).join(', ') : r.name;
+    showToast(`Processing: ${names} — please wait...`, 'info', 8000);
+    appendMessage('assistant', `📄 **Processing:** ${names} — extracting text. This may take a moment for large files...`);
   } else {
-    showToast(`File loaded: ${r.name} (${r.chars.toLocaleString()} chars)`, 'info');
-    const fileIcon = r.name.endsWith('.csv') || r.name.endsWith('.xlsx') || r.name.endsWith('.xls') ? '📊' : '📄';
-    appendMessage('assistant', `${fileIcon} **File uploaded:** ${r.name} (${r.chars.toLocaleString()} chars). You can now ask questions about this file.`);
+    const totalChars = r.chars || 0;
+    const count = attachedFiles.length;
+    const label = count > 1 ? `${count} files` : r.name || attachedFiles[0]?.name;
+    showToast(`Loaded: ${label} (${totalChars.toLocaleString()} chars)`, 'info');
+
+    const names = attachedFiles.map(f => {
+      const ext = (f.name || '').split('.').pop().toLowerCase();
+      const icon = ['csv', 'xlsx', 'xls'].includes(ext) ? '📊' : '📄';
+      return `${icon} ${f.name}`;
+    }).join(', ');
+    appendMessage('assistant', `**Files uploaded:** ${names} (${totalChars.toLocaleString()} chars). You can now ask questions about ${count > 1 ? 'these files' : 'this file'}.`);
   }
 }
 
@@ -2725,14 +3346,118 @@ window.addEventListener('file_upload_done', (e) => {
   }
   const pages = d.pages || 0;
   const chars = d.chars || 0;
-  showToast(`PDF ready: ${pages} pages, ${chars.toLocaleString()} chars`, 'info');
-  appendMessage('assistant', `📄 **PDF ready:** ${d.name} — ${pages} pages, ${chars.toLocaleString()} chars extracted. You can now ask questions about this file.`);
+  const name = d.name || '';
+  // Update chars in attachedFiles
+  const entry = attachedFiles.find(f => f.name === name);
+  if (entry) entry.chars = chars;
+  showToast(`PDF ready: ${name} — ${pages} pages, ${chars.toLocaleString()} chars`, 'info');
+  appendMessage('assistant', `📄 **PDF ready:** ${name} — ${pages} pages, ${chars.toLocaleString()} chars extracted. You can now ask questions about this file.`);
 });
+
+// ═══ DRAG & DROP ON CHAT AREA ═════════════════════════════════
+(function initChatDragDrop() {
+  const chatArea = $('#chat-area');
+  const overlay = $('#chat-drop-overlay');
+  if (!chatArea || !overlay) return;
+
+  const ALLOWED_EXT = ['.txt', '.md', '.pdf', '.csv', '.docx', '.xlsx', '.xls', '.json', '.xml', '.html', '.htm', '.yaml', '.yml', '.log', '.tsv', '.sql', '.py', '.js', '.css', '.ini', '.cfg', '.toml', '.rtf'];
+  let dragCounter = 0;
+
+  chatArea.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    dragCounter++;
+    if (dragCounter === 1) overlay.classList.remove('hidden');
+  });
+
+  chatArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+
+  chatArea.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      overlay.classList.add('hidden');
+    }
+  });
+
+  chatArea.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    dragCounter = 0;
+    overlay.classList.add('hidden');
+
+    const files = e.dataTransfer.files;
+    if (!files || files.length === 0) return;
+
+    const validFiles = [];
+    for (const file of files) {
+      const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+      if (ALLOWED_EXT.includes(ext)) {
+        validFiles.push(file);
+      } else {
+        showToast(`Unsupported file: ${file.name}`, 'error');
+      }
+    }
+    if (validFiles.length === 0) return;
+
+    showToast(`Uploading ${validFiles.length} file(s)...`, 'info');
+    let hasAsync = false;
+
+    for (const file of validFiles) {
+      // Skip duplicates
+      if (attachedFiles.find(f => f.name === file.name)) continue;
+
+      try {
+        const base64 = await fileToBase64(file);
+        const r = await api.upload_file_from_data(file.name, base64);
+        if (r?.error) {
+          showToast(`Error: ${file.name} — ${r.error}`, 'error');
+          continue;
+        }
+        if (r?.duplicate) continue;
+        attachedFiles.push({ name: file.name, chars: r.chars || 0 });
+        if (r.processing) hasAsync = true;
+      } catch (err) {
+        showToast(`Upload failed: ${file.name}`, 'error');
+      }
+    }
+
+    syncUploadButtonMulti(attachedFiles.map(f => f.name));
+
+    if (hasAsync) {
+      appendMessage('assistant', `📄 **Processing files** — extracting text from PDFs. Please wait...`);
+    } else if (attachedFiles.length > 0) {
+      const names = attachedFiles.map(f => {
+        const ext = (f.name || '').split('.').pop().toLowerCase();
+        const icon = ['csv', 'xlsx', 'xls'].includes(ext) ? '📊' : '📄';
+        return `${icon} ${f.name}`;
+      }).join(', ');
+      const totalChars = attachedFiles.reduce((s, f) => s + (f.chars || 0), 0);
+      appendMessage('assistant', `**Files uploaded:** ${names} (${totalChars.toLocaleString()} chars). You can now ask questions about ${attachedFiles.length > 1 ? 'these files' : 'this file'}.`);
+    }
+  });
+})();
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      // result is "data:...;base64,XXXXX" — extract base64 part
+      const b64 = reader.result.split(',')[1];
+      resolve(b64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 $('#btn-image').addEventListener('click', async () => {
   if (attachedImageName) {
     await api.clear_attached_image();
     attachedImageName = null;
+    attachedImagePreview = null;
     $('#btn-image').classList.remove('active');
     $('#btn-image').textContent = '▦';
     showToast('Image cleared', 'info');
@@ -2749,6 +3474,11 @@ $('#btn-image').addEventListener('click', async () => {
   }
 
   attachedImageName = r.name;
+  // Fetch base64 preview for inline display
+  try {
+    const prev = await api.get_attached_image_preview();
+    attachedImagePreview = prev?.preview || null;
+  } catch (_) { attachedImagePreview = null; }
   $('#btn-image').classList.add('active');
   $('#btn-image').textContent = '✓';
 
@@ -2855,11 +3585,11 @@ document.addEventListener('keydown', (e) => {
     if (openModal) {
       openModal.classList.add('hidden');
     } else if (stopBtn.style.display !== 'none') {
-      api.stop_generation();
+      stopBtn.click();
     } else {
       const agentStopBtn = $('#btn-agent-stop');
-      if (agentStopBtn && agentStopBtn.style.display !== 'none') {
-        api.stop_generation();
+      if (agentStopBtn && !agentStopBtn.disabled && agentGenerationInProgress) {
+        agentStopBtn.click();
       }
     }
   }
@@ -2878,6 +3608,7 @@ let selectedInstructionName = null;
 let activeInstructionFormat = 'excel';
 let agentGenerationInProgress = false;
 let agentStopRequested = false;
+let modelIsLoaded = false;
 
 function setAgentActionButtons(processing) {
   const send = $('#btn-agent-send');
@@ -2887,8 +3618,14 @@ function setAgentActionButtons(processing) {
     send.disabled = true;
     stop.disabled = false;
   } else {
-    send.disabled = !fullAccessGranted;
+    send.disabled = !fullAccessGranted || !modelIsLoaded;
     stop.disabled = true;
+  }
+  // Show a tooltip so the user knows why Send is disabled
+  if (send.disabled && !processing) {
+    send.title = !modelIsLoaded ? 'Load a model first' : 'Activation required';
+  } else {
+    send.title = 'Send';
   }
 }
 
@@ -2975,12 +3712,17 @@ function fillInstructionFormFromTemplate(name, tpl) {
   const taskInput = $('#agent-instr-task');
   const stepsInput = $('#agent-instr-steps');
   const formatInput = $('#agent-instr-format');
+  const schemaInput = $('#agent-instr-json-schema');
 
   if (nameInput && !nameInput.disabled) nameInput.value = String(name || '').trim();
   if (roleInput) roleInput.value = t.role || '';
   if (taskInput) taskInput.value = t.task || '';
   if (stepsInput) stepsInput.value = t.steps || '';
-  if (formatInput) formatInput.value = t.format || 'excel';
+  if (formatInput) {
+    formatInput.value = t.format || 'excel';
+    toggleJsonSchemaField(formatInput.value);
+  }
+  if (schemaInput) schemaInput.value = t.json_schema || '';
 }
 
 async function openTemplateImportPicker() {
@@ -3173,6 +3915,10 @@ function openAgentChat(name) {
   const tpl = templates[name];
   if (!tpl) return;
 
+  // Keep the current running session visible when re-opening the same instruction.
+  const sameInstruction = selectedInstructionName === name;
+  const keepCurrentSession = sameInstruction && (agentGenerationInProgress || agentMessages.length > 0);
+
   selectedInstructionName = name;
   // Support both old format (text) and new format (role/task/steps)
   const instrRole = (typeof tpl === 'object' && tpl.role) ? tpl.role : '';
@@ -3183,6 +3929,13 @@ function openAgentChat(name) {
   // Update header
   const nameEl = $('#agent-active-name');
   if (nameEl) nameEl.textContent = `📋 ${name}`;
+
+  // Preserve running/current conversation when opening the same instruction.
+  if (keepCurrentSession) {
+    showAgentView('chat');
+    refreshInstructionList();
+    return;
+  }
 
   // Clear old messages and show chat view
   const msgs = $('#agent-messages');
@@ -3210,11 +3963,29 @@ function openAgentChat(name) {
 
 let editingInstructionName = null;
 
+function toggleJsonSchemaField(formatValue) {
+  const group = $('#json-schema-group');
+  if (!group) return;
+  group.style.display = (formatValue === 'csv_json') ? '' : 'none';
+}
+
+// Show/hide JSON schema field whenever the format select changes
+document.addEventListener('DOMContentLoaded', () => {
+  const fmt = $('#agent-instr-format');
+  if (fmt) fmt.addEventListener('change', () => toggleJsonSchemaField(fmt.value));
+});
+
 function openInstructionForm(existingName) {
+  if (agentGenerationInProgress) {
+    showToast('Please wait for AI to finish or click Stop before editing instructions.', 'warn');
+    return;
+  }
+
   editingInstructionName = existingName || null;
   const title = $('#agent-form-title');
   const nameInput = $('#agent-instr-name');
   const formatSelect = $('#agent-instr-format');
+  const schemaInput = $('#agent-instr-json-schema');
 
   const roleInput = $('#agent-instr-role');
   const taskInput = $('#agent-instr-task');
@@ -3228,12 +3999,14 @@ function openInstructionForm(existingName) {
     const instrTask = (typeof tpl === 'object' && tpl.task) ? tpl.task : (typeof tpl === 'string' ? tpl : (tpl.text || ''));
     const instrSteps = (typeof tpl === 'object' && tpl.steps) ? tpl.steps : '';
     const instrFormat = (typeof tpl === 'object' && tpl.format) ? tpl.format : 'excel';
+    const instrSchema = (typeof tpl === 'object' && tpl.json_schema) ? tpl.json_schema : '';
     title.textContent = 'Edit Instruction';
     nameInput.value = existingName;
     roleInput.value = instrRole;
     taskInput.value = instrTask;
     stepsInput.value = instrSteps;
     formatSelect.value = instrFormat;
+    if (schemaInput) schemaInput.value = instrSchema;
     nameInput.disabled = true;
   } else {
     title.textContent = 'New Instruction';
@@ -3242,14 +4015,20 @@ function openInstructionForm(existingName) {
     taskInput.value = '';
     stepsInput.value = '';
     formatSelect.value = 'excel';
+    if (schemaInput) schemaInput.value = '';
     nameInput.disabled = false;
   }
+  toggleJsonSchemaField(formatSelect.value);
 
   showAgentView('create');
 }
 
 // New instruction button
 $('#btn-new-instruction')?.addEventListener('click', () => {
+  if (agentGenerationInProgress) {
+    showToast('Please wait for AI to finish or click Stop before creating a new instruction.', 'warn');
+    return;
+  }
   openInstructionForm(null);
 });
 
@@ -3260,14 +4039,26 @@ $('#btn-save-instruction')?.addEventListener('click', () => {
   const task = $('#agent-instr-task').value.trim();
   const steps = $('#agent-instr-steps').value.trim();
   const format = $('#agent-instr-format').value;
+  const jsonSchema = ($('#agent-instr-json-schema')?.value || '').trim();
 
   if (!name) { showToast('Enter a name', 'warning'); return; }
   if (!task) { showToast('Enter a task description', 'warning'); return; }
 
+  // Validate custom JSON schema if provided
+  if (jsonSchema) {
+    try { JSON.parse(jsonSchema); } catch (e) {
+      showToast('JSON Schema is not valid JSON: ' + e.message, 'error');
+      return;
+    }
+  }
+
+  const tplObj = { role, task, steps, format };
+  if (jsonSchema) tplObj.json_schema = jsonSchema;
+
   const templates = getTemplates();
-  templates[name] = { role, task, steps, format };
+  templates[name] = tplObj;
   saveTemplatesLocal(templates);
-  api.save_instruction_template(name, JSON.stringify({ role, task, steps, format }));
+  api.save_instruction_template(name, JSON.stringify(tplObj));
 
   refreshInstructionList();
   showToast(`Saved: ${name}`, 'success');
@@ -3405,6 +4196,10 @@ $('#btn-rewrite-ai')?.addEventListener('click', async () => {
 
 // Back button from chat to empty
 $('#btn-back-to-instructions')?.addEventListener('click', () => {
+  if (agentGenerationInProgress) {
+    showToast('AI is still running. Click Stop first if you want to leave this chat.', 'warn');
+    return;
+  }
   selectedInstructionName = null;
   showAgentView('empty');
   refreshInstructionList();
@@ -3589,13 +4384,21 @@ $('#btn-agent-send')?.addEventListener('click', agentSend);
 $('#btn-agent-stop')?.addEventListener('click', async () => {
   if (!agentGenerationInProgress) return;
   const stop = $('#btn-agent-stop');
-  if (stop) stop.disabled = true;
+  if (stop) {
+    stop.disabled = true;
+    stop.textContent = '⏳';
+  }
   agentStopRequested = true;
   setAgentStatus('Stopping AI generation...', true);
   try {
     await api.stop_generation();
   } catch (_) {
     // Ignore stop RPC failure; backend may already be finishing.
+  } finally {
+    if (stop) {
+      stop.textContent = '■';
+      stop.disabled = false;
+    }
   }
 });
 
@@ -3641,6 +4444,7 @@ async function agentSend() {
   const agentTask = tpl ? (typeof tpl === 'object' && tpl.task ? tpl.task : (typeof tpl === 'string' ? tpl : (tpl.text || ''))) : '';
   const agentSteps = tpl ? (typeof tpl === 'object' && tpl.steps ? tpl.steps : '') : '';
   const format = tpl ? (typeof tpl === 'object' && tpl.format ? tpl.format : 'excel') : 'excel';
+  const agentJsonSchema = tpl ? (typeof tpl === 'object' && tpl.json_schema ? tpl.json_schema : '') : '';
 
   // Show user message
   let userHtml = '';
@@ -3679,7 +4483,7 @@ async function agentSend() {
       if (!fullInstructions.trim()) fullInstructions = text || '';
       setAgentStatus('AI processing...', true);
       
-      const result = await api.process_files_with_ai(fileData, fullInstructions, format);
+      const result = await api.process_files_with_ai(fileData, fullInstructions, format, agentJsonSchema);
 
       // Remove the "Processing..." system message
       removeLastSystemMsg();
@@ -3706,6 +4510,9 @@ async function agentSend() {
         let warningHtml = '';
         if (result.warning) {
           warningHtml = `<div class="muted small" style="margin:8px 0;color:#f39c12;">⚠ ${escapeHtml(result.warning)}</div>`;
+        }
+        if (result?.context_trimmed) {
+          warningHtml += `<div class="muted small" style="margin:8px 0;color:#f39c12;">⚠ Context was auto-trimmed to fit model limits.</div>`;
         }
         addAgentMessage('assistant', `
           ${responseHtml}
@@ -3737,7 +4544,7 @@ async function agentSend() {
       // Pure chat / question (no files) — pass role/task/steps for context
       setAgentStatus('Generating response...', true);
 
-      const result = await api.agent_chat(text, agentRole, agentTask, agentSteps);
+      const result = await api.agent_chat(text, agentRole, agentTask, agentSteps, format, agentJsonSchema);
       removeLastSystemMsg();
 
       if (result?.stopped || (result?.error && /stopp?ed by user|generation stopped/i.test(String(result.error)))) {
@@ -3750,7 +4557,24 @@ async function agentSend() {
         addAgentMessage('assistant', `❌ ${escapeHtml(result.error)}`);
       } else {
         const response = result?.text || '';
-        addAgentMessage('assistant', renderMarkdown(response));
+        let html = renderMarkdown(response);
+        if (result?.context_trimmed) {
+          html += `<div class="muted small" style="margin-top:8px;color:#f39c12;">⚠ Context was auto-trimmed to fit model limits.</div>`;
+        }
+        // If a file was created, show download button
+        if (result?.file_path) {
+          const fileName = result.file_path.split(/[\\\/]/).pop();
+          const fileExt = fileName.split('.').pop().toUpperCase();
+          html += `<div style="margin-top:10px;">
+            <div class="muted small">Output: ${escapeHtml(fileName)}</div>
+            <div style="display:flex;gap:8px;margin-top:6px;">
+              <button class="download-btn" onclick="openAgentFile('${escapeJs(result.file_path)}')">⬇ Open ${fileExt} File</button>
+              <button class="download-btn" style="background:var(--error,#e74c3c);" onclick="deleteAgentFile('${escapeJs(result.file_path)}', this)">🗑 Delete</button>
+            </div>
+          </div>`;
+          refreshProcessedFiles();
+        }
+        addAgentMessage('assistant', html);
       }
       setAgentStatus('Ready', false);
     }
@@ -3833,8 +4657,199 @@ $('#btn-agent-web')?.addEventListener('click', async () => {
   }
 });
 
+// Scrape URL button for agent — prompts for URL, scrapes, and inserts into input
+$('#btn-agent-scrape')?.addEventListener('click', async () => {
+  const input = $('#agent-input');
+  // Check if input already has a URL
+  const urlMatch = input?.value?.match(/https?:\/\/[^\s]+/i);
+  let url = urlMatch ? urlMatch[0] : '';
+  if (!url) {
+    url = await showPrompt('🕷 Scrape URL', '', 'https://example.com/page');
+  }
+  if (!url || !url.trim()) return;
+  url = url.trim();
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    url = 'https://' + url;
+  }
+
+  const btn = $('#btn-agent-scrape');
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  setAgentStatus('Scraping page...', true);
+
+  try {
+    const result = await api.scrape_url(url);
+    if (result?.error) {
+      showToast(`Scrape failed: ${result.error}`, 'error');
+      setAgentStatus('Scrape failed', false);
+      return;
+    }
+    if (result?.ok && result?.content) {
+      const title = result.title || url;
+      const tables = result.tables_count || 0;
+      const chars = result.text_length || 0;
+
+      // If input already has the URL, keep it. Otherwise prepend it.
+      if (!input.value.includes(url)) {
+        const currentText = input.value.trim();
+        input.value = url + (currentText ? '\n' + currentText : '');
+      }
+
+      // Show scraped preview as a system message
+      const preview = result.content.substring(0, 500).replace(/\n/g, ' ');
+      addAgentMessage('system',
+        `🕷 Scraped: <strong>${escapeHtml(title)}</strong><br>` +
+        `<span class="muted small">${chars.toLocaleString()} chars, ${tables} table(s)</span><br>` +
+        `<span class="muted small">${escapeHtml(preview)}${chars > 500 ? '…' : ''}</span><br>` +
+        `<em class="muted small">Click ➤ Send to process with the agent.</em>`
+      );
+
+      showToast(`Scraped ${chars.toLocaleString()} chars, ${tables} table(s)`, 'success', 3000);
+      setAgentStatus('Page scraped — ready to send', false);
+    } else {
+      showToast('No content could be extracted', 'warning');
+      setAgentStatus('Ready', false);
+    }
+  } catch (err) {
+    showToast(`Scrape error: ${err.message}`, 'error');
+    setAgentStatus('Scrape error', false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🕷';
+  }
+});
+
 // Load instruction list on startup
 refreshInstructionList();
+
+// ═══ CONVERSATION SEARCH ══════════════════════════════════════
+(function setupConversationSearch() {
+  const bar = $('#conv-search-bar');
+  const input = $('#conv-search-input');
+  const countEl = $('#conv-search-count');
+  const prevBtn = $('#conv-search-prev');
+  const nextBtn = $('#conv-search-next');
+  const closeBtn = $('#conv-search-close');
+  if (!bar || !input) return;
+
+  let matches = [];
+  let currentIdx = -1;
+
+  function openSearch() {
+    bar.classList.remove('hidden');
+    input.focus();
+    input.select();
+  }
+
+  function closeSearch() {
+    bar.classList.add('hidden');
+    input.value = '';
+    clearHighlights();
+    matches = [];
+    currentIdx = -1;
+    countEl.textContent = '';
+  }
+
+  function clearHighlights() {
+    document.querySelectorAll('.conv-search-highlight').forEach(el => {
+      const parent = el.parentNode;
+      parent.replaceChild(document.createTextNode(el.textContent), el);
+      parent.normalize();
+    });
+  }
+
+  function highlightMatches(query) {
+    clearHighlights();
+    matches = [];
+    currentIdx = -1;
+    if (!query) { countEl.textContent = ''; return; }
+
+    const container = $('#messages-container');
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        // Skip script/style/code-copy-btn/msg-actions
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        if (parent.closest('.msg-actions, .code-copy-btn, .code-block-header, script, style, .conv-search-highlight')) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    const textNodes = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+
+    const lowerQuery = query.toLowerCase();
+    for (const node of textNodes) {
+      const text = node.textContent;
+      const lowerText = text.toLowerCase();
+      let startIdx = 0;
+      let pos;
+      const parts = [];
+      let lastEnd = 0;
+
+      while ((pos = lowerText.indexOf(lowerQuery, startIdx)) !== -1) {
+        if (pos > lastEnd) parts.push({ text: text.slice(lastEnd, pos), match: false });
+        parts.push({ text: text.slice(pos, pos + query.length), match: true });
+        lastEnd = pos + query.length;
+        startIdx = pos + 1;
+      }
+
+      if (parts.length > 0) {
+        if (lastEnd < text.length) parts.push({ text: text.slice(lastEnd), match: false });
+        const frag = document.createDocumentFragment();
+        for (const part of parts) {
+          if (part.match) {
+            const mark = document.createElement('mark');
+            mark.className = 'conv-search-highlight';
+            mark.textContent = part.text;
+            frag.appendChild(mark);
+            matches.push(mark);
+          } else {
+            frag.appendChild(document.createTextNode(part.text));
+          }
+        }
+        node.parentNode.replaceChild(frag, node);
+      }
+    }
+
+    countEl.textContent = matches.length ? `${matches.length} found` : 'No matches';
+    if (matches.length) goToMatch(0);
+  }
+
+  function goToMatch(idx) {
+    if (!matches.length) return;
+    if (currentIdx >= 0 && currentIdx < matches.length) {
+      matches[currentIdx].classList.remove('conv-search-active');
+    }
+    currentIdx = ((idx % matches.length) + matches.length) % matches.length;
+    matches[currentIdx].classList.add('conv-search-active');
+    matches[currentIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    countEl.textContent = `${currentIdx + 1}/${matches.length}`;
+  }
+
+  let debounceTimer;
+  input.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => highlightMatches(input.value.trim()), 250);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); goToMatch(currentIdx + (e.shiftKey ? -1 : 1)); }
+    if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+  });
+  prevBtn.addEventListener('click', () => goToMatch(currentIdx - 1));
+  nextBtn.addEventListener('click', () => goToMatch(currentIdx + 1));
+  closeBtn.addEventListener('click', closeSearch);
+
+  // Ctrl+F to open conversation search when chat area is active
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !$('#chat-area').classList.contains('hidden')) {
+      e.preventDefault();
+      openSearch();
+    }
+  });
+})();
 
 // ═══ START ════════════════════════════════════════════════════
 init().catch(e => {

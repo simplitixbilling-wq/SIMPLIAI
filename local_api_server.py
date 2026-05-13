@@ -1,4 +1,5 @@
 import json
+import os
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,21 +59,22 @@ class LocalApiServer:
             return ""
         return str(value)
 
-    def _excel_rows_to_prompt(self, sheet_name, headers, rows, max_rows=200, max_cols=20, max_cell_chars=120):
+    def _excel_rows_to_prompt(self, sheet_name, headers, rows, max_rows=None, max_cols=None, max_cell_chars=120):
         safe_sheet = self._to_text(sheet_name) or "Sheet1"
         hdr = [self._to_text(h).strip()[:max_cell_chars] for h in (headers or [])]
         data_rows = rows or []
 
-        # Keep request bounded for predictable latency and token usage.
-        clipped_rows = data_rows[:max_rows]
-        if hdr:
+        # Optional clipping (None means no explicit limit).
+        clipped_rows = data_rows if max_rows is None else data_rows[:max_rows]
+        if hdr and max_cols is not None:
             hdr = hdr[:max_cols]
 
         normalized = []
         for r in clipped_rows:
             if not isinstance(r, list):
                 continue
-            row = [self._to_text(c).strip()[:max_cell_chars] for c in r[:max_cols]]
+            row_src = r if max_cols is None else r[:max_cols]
+            row = [self._to_text(c).strip()[:max_cell_chars] for c in row_src]
             if row:
                 normalized.append(row)
 
@@ -98,6 +100,162 @@ class LocalApiServer:
         if len(table_text) > 24000:
             table_text = table_text[:24000] + "\n...[table truncated]"
         return table_text
+
+    def _excel_sheets_to_prompt(self, sheets, max_cell_chars=120):
+        """Build a combined workbook prompt from multiple sheets."""
+        if not isinstance(sheets, list) or not sheets:
+            return "No usable workbook data was provided.", 0, 0, 0
+
+        blocks = []
+        total_rows = 0
+        max_cols = 0
+        used_sheets = 0
+
+        for s in sheets:
+            if not isinstance(s, dict):
+                continue
+            sheet_name = s.get("sheet_name", "Sheet")
+            headers = s.get("headers", [])
+            rows = s.get("rows", [])
+            if not isinstance(rows, list) or not rows:
+                continue
+
+            block = self._excel_rows_to_prompt(
+                sheet_name=sheet_name,
+                headers=headers,
+                rows=rows,
+                max_rows=None,
+                max_cols=None,
+                max_cell_chars=max_cell_chars,
+            )
+            blocks.append(block)
+            total_rows += len(rows)
+            if isinstance(headers, list):
+                max_cols = max(max_cols, len(headers))
+            used_sheets += 1
+
+        if not blocks:
+            return "No usable workbook data was provided.", 0, 0, 0
+
+        text = "\n\n".join(blocks)
+        if len(text) > 80000:
+            text = text[:80000] + "\n...[workbook truncated]"
+        return text, used_sheets, total_rows, max_cols
+
+    def _excel_action_prompt(self, action: str, instruction: str):
+        """Return (role, task, steps) tuned for each Excel action type."""
+
+        base_role = "You are an expert data analyst and Excel specialist."
+
+        if action == "chart":
+            return (
+                base_role,
+                "Recommend the best chart for this data. Return ONLY a JSON block with keys: "
+                "chart_type (one of: bar, line, pie, column, scatter, area), "
+                "title (string), x_column (header name for X axis), "
+                "y_columns (array of header names for Y values), "
+                "insight (one sentence why this chart). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Examine headers and data types.\n"
+                "2. Pick the most insightful chart type.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        if action == "predict":
+            return (
+                base_role,
+                "Forecast the next 5 values based on the trend in the data. Return ONLY a JSON block with keys: "
+                "column (header name being predicted), "
+                "values (array of 5 predicted numbers), "
+                "method (e.g. 'linear trend', 'moving average'), "
+                "confidence (low/medium/high), "
+                "explanation (one sentence). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Identify numeric columns with trends.\n"
+                "2. Calculate projected values.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        if action == "anomalies":
+            return (
+                base_role,
+                "Find anomalies/outliers in the data. Return ONLY a JSON block with keys: "
+                "anomalies (array of objects, each with: row (1-based data row number), "
+                "column (header name), value (the anomalous value), "
+                "reason (why it is anomalous)), "
+                "summary (one sentence overview). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Examine each numeric column for statistical outliers.\n"
+                "2. Check for missing, duplicate, or inconsistent values.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        if action == "format":
+            return (
+                base_role,
+                "Suggest conditional formatting rules for this data. Return ONLY a JSON block with keys: "
+                "rules (array of objects, each with: column (header name), "
+                "condition (e.g. 'greater_than', 'less_than', 'equals', 'contains', 'top_n', 'bottom_n'), "
+                "threshold (value), color (red/yellow/green/blue/orange)), "
+                "summary (one sentence). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Identify columns that benefit from visual highlighting.\n"
+                "2. Pick meaningful thresholds from the data.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        if action == "formula":
+            return (
+                base_role,
+                "Generate Excel formulas for the user's request. Return ONLY a JSON block with keys: "
+                "formulas (array of objects, each with: cell (e.g. 'I2'), "
+                "formula (Excel formula string starting with =), "
+                "description (what it calculates)), "
+                "fill_down (true/false — should formulas be filled down for all rows). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Map user request to Excel formula syntax.\n"
+                "2. Use actual column letters based on the headers provided.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        if action == "clean":
+            return (
+                base_role,
+                "Identify data quality issues and suggest fixes. Return ONLY a JSON block with keys: "
+                "issues (array of objects, each with: row (1-based), column (header name), "
+                "current_value, suggested_value, issue_type (e.g. 'missing', 'typo', 'format', 'duplicate')), "
+                "summary (one sentence overview). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Scan for missing, inconsistent, duplicate values.\n"
+                "2. Suggest corrected values where possible.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        if action == "summary":
+            return (
+                base_role,
+                "Create a comprehensive summary dashboard of this data with statistics. "
+                "Return ONLY a JSON block with keys: "
+                "total_rows (number), columns_analyzed (array of header names), "
+                "stats (array of objects, each with: column, min, max, avg, sum, unique_count), "
+                "top_insights (array of 3-5 short insight strings), "
+                "data_quality_score (0-100). "
+                "Do NOT include any text outside the JSON block.",
+                "1. Compute statistics for all numeric columns.\n"
+                "2. Identify top insights.\n"
+                "3. Return ONLY valid JSON, no markdown fences."
+            )
+
+        # Default: analyze (text output)
+        return (
+            base_role,
+            "Analyze the provided worksheet range and answer the user instruction with clear, actionable output. "
+            "Compute totals/trends directly from the provided table and mention any data quality concerns.",
+            "1. Parse rows and columns carefully.\n"
+            "2. Compute requested metrics from the table.\n"
+            "3. Return concise results with bullet points.\n"
+            "4. If data is insufficient, state exactly what is missing."
+        )
 
     @staticmethod
     def _json_response(handler, status_code, payload):
@@ -182,12 +340,13 @@ class LocalApiServer:
                     role = str(payload.get("role", ""))
                     task = str(payload.get("task", ""))
                     steps = str(payload.get("steps", ""))
+                    output_format = str(payload.get("output_format", "none")).strip().lower()
                     if not text:
                         api._json_response(self, 400, {"error": "'text' is required"})
                         return
 
                     with api.request_lock:
-                        result = api.bridge.agent_chat(text=text, role=role, task=task, steps=steps)
+                        result = api.bridge.agent_chat(text=text, role=role, task=task, steps=steps, output_format=output_format)
 
                     status = 200 if not result.get("error") else 400
                     api._json_response(self, status, result)
@@ -220,26 +379,29 @@ class LocalApiServer:
                     sheet_name = payload.get("sheet_name", "Sheet1")
                     headers = payload.get("headers", [])
                     rows = payload.get("rows", [])
+                    sheets = payload.get("sheets", [])
+                    action = str(payload.get("action", "analyze")).strip().lower()
 
                     if not instruction:
                         api._json_response(self, 400, {"error": "'instruction' is required"})
                         return
-                    if not isinstance(rows, list) or not rows:
-                        api._json_response(self, 400, {"error": "'rows' must be a non-empty array"})
-                        return
 
-                    table_text = api._excel_rows_to_prompt(sheet_name, headers, rows)
-                    role = str(payload.get("role", "You are an expert spreadsheet analyst.")).strip()
-                    task = (
-                        "Analyze the provided worksheet range and answer the user instruction with clear, actionable output. "
-                        "Compute totals/trends directly from the provided table and mention any data quality concerns."
-                    )
-                    steps = (
-                        "1. Parse rows and columns carefully.\n"
-                        "2. Compute requested metrics from the table.\n"
-                        "3. Return concise results with bullet points.\n"
-                        "4. If data is insufficient, state exactly what is missing."
-                    )
+                    use_multi_sheet = isinstance(sheets, list) and len(sheets) > 0
+                    if use_multi_sheet:
+                        table_text, sheets_used, rows_used, cols_used = api._excel_sheets_to_prompt(sheets)
+                        if rows_used <= 0:
+                            api._json_response(self, 400, {"error": "'sheets' must include at least one sheet with non-empty rows"})
+                            return
+                    else:
+                        if not isinstance(rows, list) or not rows:
+                            api._json_response(self, 400, {"error": "'rows' must be a non-empty array"})
+                            return
+                        table_text = api._excel_rows_to_prompt(sheet_name, headers, rows, max_rows=None, max_cols=None)
+                        sheets_used = 1
+                        rows_used = len(rows)
+                        cols_used = len(headers) if isinstance(headers, list) else 0
+
+                    role, task, steps = api._excel_action_prompt(action, instruction)
                     chat_text = f"Instruction: {instruction}\n\n{table_text}"
 
                     with api.request_lock:
@@ -252,14 +414,29 @@ class LocalApiServer:
 
                     # Retry in compact mode if the model returned empty output.
                     if result.get("error") and "No response from model" in str(result.get("error", "")):
-                        compact = api._excel_rows_to_prompt(
-                            sheet_name,
-                            headers,
-                            rows,
-                            max_rows=60,
-                            max_cols=12,
-                            max_cell_chars=80,
-                        )
+                        if use_multi_sheet:
+                            compact_blocks = []
+                            for s in sheets[:3]:
+                                if not isinstance(s, dict):
+                                    continue
+                                compact_blocks.append(api._excel_rows_to_prompt(
+                                    s.get("sheet_name", "Sheet"),
+                                    s.get("headers", []),
+                                    s.get("rows", []),
+                                    max_rows=40,
+                                    max_cols=12,
+                                    max_cell_chars=80,
+                                ))
+                            compact = "\n\n".join(compact_blocks)
+                        else:
+                            compact = api._excel_rows_to_prompt(
+                                sheet_name,
+                                headers,
+                                rows,
+                                max_rows=60,
+                                max_cols=12,
+                                max_cell_chars=80,
+                            )
                         compact_text = (
                             f"Instruction: {instruction}\n\n"
                             f"Use this compact table sample if the full table is too large:\n{compact}"
@@ -279,11 +456,42 @@ class LocalApiServer:
                     api._json_response(self, 200, {
                         "ok": True,
                         "text": result.get("text", ""),
+                        "action": action,
                         "sheet_name": api._to_text(sheet_name) or "Sheet1",
-                        "rows_received": len(rows),
-                        "rows_used": min(len(rows), 200),
-                        "columns_used": min(len(headers) if isinstance(headers, list) else 0, 20),
+                        "sheets_used": sheets_used,
+                        "rows_received": rows_used,
+                        "rows_used": rows_used,
+                        "columns_used": cols_used,
                     })
+                    return
+
+                if path == "/v1/batch-jsonl":
+                    jsonl_content = str(payload.get("jsonl", "")).strip()
+                    jsonl_path = str(payload.get("jsonl_path", "")).strip()
+                    checkpoint_dir = str(payload.get("checkpoint_dir", "")).strip()
+                    try:
+                        checkpoint_every = int(payload.get("checkpoint_every", 12))
+                    except (TypeError, ValueError):
+                        checkpoint_every = 12
+
+                    if not jsonl_content and not jsonl_path:
+                        api._json_response(self, 400, {"error": "'jsonl' or 'jsonl_path' is required"})
+                        return
+
+                    # Prevent path traversal: resolve to absolute path
+                    if jsonl_path:
+                        jsonl_path = os.path.realpath(jsonl_path)
+
+                    with api.request_lock:
+                        result = api.bridge.run_jsonl_queue(
+                            jsonl=jsonl_content,
+                            jsonl_path=jsonl_path,
+                            checkpoint_dir=checkpoint_dir,
+                            checkpoint_every=checkpoint_every,
+                        )
+
+                    status = 200 if result.get("ok") else 400
+                    api._json_response(self, status, result)
                     return
 
                 if path == "/v1/stop":

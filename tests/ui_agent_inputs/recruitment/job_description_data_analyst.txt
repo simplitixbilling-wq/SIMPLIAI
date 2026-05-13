@@ -1,0 +1,20 @@
+Role: Senior Data Analyst
+Location: Bengaluru
+Experience Required: 4 to 7 years
+Notice Preference: 30 days or less
+
+Must-have skills:
+- SQL
+- Power BI
+- Excel
+- Stakeholder reporting
+
+Preferred skills:
+- Python
+- Finance analytics
+- Team mentoring
+
+Decision rule:
+- Shortlist candidates who meet at least all must-have skills and are within the notice/experience band.
+- Hold if one must-have is missing but profile is otherwise strong.
+- Reject if multiple must-haves are missing.

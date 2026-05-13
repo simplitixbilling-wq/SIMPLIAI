@@ -1,0 +1,53 @@
+[
+  {
+    "id": "tc01_gst_tds_reco",
+    "title": "GST/TDS reconciliation for audit exceptions",
+    "template_name": "GST_TDS_Reco_Audit_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/gst_tds_reco/gstr2b_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/gst_tds_reco/purchase_register_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/gst_tds_reco/form26as_tds_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/gst_tds_reco/tds_ledger_apr_2025_sample.csv"
+    ],
+    "expected_checks": [
+      "Prime Services LLP should appear as a GST value mismatch.",
+      "Rapid Office Supplies should appear as missing in books or purchase register.",
+      "Office Interiors India should appear as missing in portal / GSTR-2B.",
+      "Green Hill Manufacturing should appear as a TDS mismatch.",
+      "Northwind Consulting should appear as missing in Form 26AS."
+    ]
+  },
+  {
+    "id": "tc02_audit_bank_reco",
+    "title": "Other audit reconciliation: bank statement vs cash book",
+    "template_name": "Audit_Bank_Reco_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/audit_reco/bank_statement_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/audit_reco/cash_book_apr_2025_sample.csv"
+    ],
+    "expected_checks": [
+      "Bank charges of 750 should appear as not booked in books.",
+      "Prime Services payment should appear as an amount mismatch.",
+      "Cheque CHQ-391245 should appear as issued not yet presented / not seen in bank.",
+      "The output should classify each issue into an exception type."
+    ]
+  },
+  {
+    "id": "tc03_letters_audit_hr",
+    "title": "Formal letter generation for audit and HR use cases",
+    "template_name": "Audit_HR_Letter_Generator_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/letters/audit_information_request_brief.txt",
+      "tests/ui_agent_inputs/letters/letter_style_guide.txt"
+    ],
+    "alternate_input_files": [
+      "tests/ui_agent_inputs/letters/hr_show_cause_brief.txt",
+      "tests/ui_agent_inputs/letters/letter_style_guide.txt"
+    ],
+    "expected_checks": [
+      "Audit letter should request all five listed documents and mention 15 May 2026.",
+      "HR letter should mention the three late attendance dates, delayed report, and 48-hour response window.",
+      "Generated output should read like a formal letter and be exportable through the UI as PDF."
+    ]
+  }
+]

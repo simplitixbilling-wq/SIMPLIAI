@@ -11,6 +11,9 @@ from PIL import Image, ImageDraw
 WORKSPACE = Path(__file__).resolve().parents[1]
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
+DESKTOP_APP = WORKSPACE / "desktop_app"
+if str(DESKTOP_APP) not in sys.path:
+    sys.path.insert(0, str(DESKTOP_APP))
 
 from rag_handler import RAGHandlerMixin
 from rag_manager import RAGManager

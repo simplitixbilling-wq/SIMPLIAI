@@ -809,8 +809,35 @@ class RAGManager:
         """Return canonical markdown snapshot path for a RAG database."""
         return os.path.join(self.base_directory, rag_name, "knowledge.md")
 
+    def read_knowledge_markdown(self, rag_name: str) -> str:
+        """Read the full knowledge.md content for a RAG database.
+
+        Returns the complete markdown text without truncation.
+        """
+        md_path = self.get_markdown_path(rag_name)
+        if not os.path.exists(md_path):
+            # Try generating it on the fly if the database exists.
+            if rag_name in self.databases:
+                try:
+                    self.export_database_markdown(rag_name)
+                except Exception:
+                    return ""
+            else:
+                return ""
+        try:
+            with open(md_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            return content
+        except Exception:
+            return ""
+
     def export_database_markdown(self, rag_name: str, max_chunk_chars: int = 1200) -> str:
-        """Write a markdown snapshot for quick human inspection and lightweight text lookup.
+        """Write an optimised markdown snapshot designed for LLM consumption.
+
+        The output merges all chunks per source file into a single continuous
+        block, cleans up common OCR artefacts, preserves tabular data as
+        markdown tables, and removes redundant chunk headers so the resulting
+        file is as token-efficient and readable as possible.
 
         Returns the markdown file path.
         """
@@ -821,17 +848,17 @@ class RAGManager:
         md_path = self.get_markdown_path(rag_name)
         os.makedirs(os.path.dirname(md_path), exist_ok=True)
 
-        lines = []
-        lines.append(f"# RAG Knowledge Snapshot: {rag_name}")
+        lines: list[str] = []
+        lines.append(f"# Knowledge Base: {rag_name}")
         lines.append("")
-        lines.append(f"- Total chunks: {len(db.chunks)}")
-        lines.append(f"- Embedding model: {db.embedding_model_name}")
+        lines.append(f"- **Documents**: {len(set(m.get('source', '') for m in db.metadata))}")
+        lines.append(f"- **Total chunks**: {len(db.chunks)}")
         if db.source_folder:
-            lines.append(f"- Source: {db.source_folder}")
+            lines.append(f"- **Source**: {db.source_folder}")
         lines.append("")
 
-        # Build compact chunk sections grouped by source file.
-        by_source = defaultdict(list)
+        # ── Group chunks by source file, preserving chunk_index order ──
+        by_source: Dict[str, list] = defaultdict(list)
         for idx, chunk in enumerate(db.chunks):
             source = ""
             if idx < len(db.metadata):
@@ -841,22 +868,447 @@ class RAGManager:
             by_source[source].append((idx, chunk))
 
         for source in sorted(by_source.keys()):
-            lines.append(f"## Source: {source}")
+            ext = os.path.splitext(source)[1].lower()
+            lines.append(f"## {source}")
             lines.append("")
-            for idx, chunk in by_source[source]:
-                lines.append(f"### Chunk {idx}")
-                lines.append("")
-                cleaned = re.sub(r'^---\s*File:\s*.+?\s*---\s*', '', chunk, flags=re.IGNORECASE)
-                cleaned = cleaned.strip()
-                if len(cleaned) > max_chunk_chars:
-                    cleaned = cleaned[:max_chunk_chars].rstrip() + " ..."
-                lines.append(cleaned if cleaned else "(empty chunk)")
-                lines.append("")
+
+            # Merge all chunks into one continuous text per file
+            merged_parts: list[str] = []
+            for _idx, chunk in by_source[source]:
+                # Strip internal file markers added during chunking
+                cleaned = re.sub(r'^---\s*File:\s*.+?\s*---\s*', '', chunk,
+                                 flags=re.IGNORECASE).strip()
+                if cleaned:
+                    merged_parts.append(cleaned)
+
+            merged_text = "\n".join(merged_parts)
+
+            # ── Clean common OCR noise ──
+            merged_text = self._clean_ocr_text(merged_text)
+
+            # ── Format tabular data as markdown table ──
+            if ext in ('.csv', '.xlsx', '.xls'):
+                merged_text = self._format_as_markdown_table(merged_text)
+
+            lines.append(merged_text)
+            lines.append("")
 
         with open(md_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines).strip() + "\n")
 
         return md_path
+
+    # ── Known compound words / brand names / tech terms that must NOT be
+    # split by CamelCase logic.  Lowercase for fast lookup. ──
+    _CAMEL_PRESERVE = frozenset({
+        'javascript', 'typescript', 'python', 'powershell', 'postgresql',
+        'mongodb', 'mysql', 'sqlite', 'nodejs', 'expressjs', 'reactjs',
+        'vuejs', 'angularjs', 'nextjs', 'nuxtjs', 'tensorflow', 'pytorch',
+        'opencv', 'iphone', 'ipad', 'ipod', 'imac', 'macos', 'ios',
+        'linkedin', 'youtube', 'github', 'gitlab', 'bitbucket', 'stackoverflow',
+        'wordpress', 'shopify', 'salesforce', 'powerpoint', 'outlook',
+        'onenote', 'onedrive', 'sharepoint', 'wikipedia', 'chatgpt',
+        'openai', 'deepseek', 'mcdonald', 'mcdonalds', 'starbucks',
+        'dataframe', 'dataset', 'datetime', 'timestamp', 'filename',
+        'filepath', 'username', 'password', 'checkbox', 'dropdown',
+        'healthcare', 'payroll', 'workflow', 'backend', 'frontend',
+        'middleware', 'endpoint', 'localhost', 'subnet', 'ethernet',
+        'bluetooth', 'wifi', 'taxpayer', 'subtotal', 'reinvest',
+        'clearone', 'cleartax', 'paytm', 'phonepe', 'razorpay',
+        'getelementbyid', 'innerhtml', 'classname', 'addeventlistener',
+    })
+
+    @staticmethod
+    def _safe_camelcase_split(text: str) -> str:
+        """Split CamelCase words while preserving known compound/brand names."""
+        def _replace(m: re.Match) -> str:
+            # Get the full word containing this CamelCase boundary
+            start = m.start()
+            end = m.end()
+            # Expand to full word boundary
+            while start > 0 and text[start - 1].isalnum():
+                start -= 1
+            while end < len(text) and text[end].isalnum():
+                end += 1
+            full_word = text[start:end]
+            # Very short words (≤3 chars) are likely measurement units
+            # like dL, mL, kW, pH — never split these
+            if len(full_word) <= 3:
+                return m.group(0)
+            if full_word.lower() in RAGManager._CAMEL_PRESERVE:
+                return m.group(0)  # preserve
+            return m.group(1) + ' ' + m.group(2)
+
+        # lowerUpper → lower Upper
+        text = re.sub(r'([a-z])([A-Z])', _replace, text)
+        # ACRONYMWord → ACRONYM Word
+        text = re.sub(r'([A-Z]{2,})([A-Z][a-z])', _replace, text)
+        return text
+
+    @staticmethod
+    def _detect_doc_type(text: str) -> str:
+        """Heuristic document type detection for context-aware cleaning.
+        Uses a scoring approach — requires 2+ keyword hits to classify,
+        preventing false positives from single-word mentions."""
+        text_lower = text[:3000].lower()
+
+        def _count(keywords):
+            return sum(1 for kw in keywords if kw in text_lower)
+
+        # Invoice/billing — strong indicators
+        inv = _count(['gstin', 'bill to', 'billto', 'tax invoice', 'hsn/sac',
+                       'hsn', 'sac', 'cgst', 'sgst', 'igst'])
+        # 'invoice' alone is weak (appears in legal, emails), only count with others
+        if 'invoice' in text_lower:
+            inv += 1
+        if inv >= 2:
+            return 'invoice'
+
+        # Bank statement
+        if _count(['account statement', 'bank statement', 'opening balance',
+                    'closing balance', 'narration', 'cheque no']) >= 2:
+            return 'bank_statement'
+
+        # Medical / lab report
+        if _count(['patient name', 'lab report', 'diagnosis', 'blood test',
+                    'haemoglobin', 'hemoglobin', 'test name', 'reference range',
+                    'specimen', 'pathology']) >= 2:
+            return 'medical'
+
+        # HR / payslip
+        if _count(['payslip', 'pay slip', 'salary slip', 'basic salary',
+                    'gross salary', 'provident fund', 'employee id',
+                    'offer letter', 'designation', 'hra', 'epf', 'esi']) >= 2:
+            return 'hr'
+
+        # Legal
+        if _count(['whereas', 'hereinafter', 'indemnify', 'jurisdiction',
+                    'arbitration', 'terms and conditions', 'agreement',
+                    'confidentiality', 'governing law']) >= 2:
+            return 'legal'
+
+        return 'general'
+
+    @staticmethod
+    def _clean_ocr_text(text: str) -> str:
+        """Clean common OCR artefacts to improve LLM readability.
+
+        Works across all document types: invoices, bank statements, legal
+        contracts, medical reports, HR docs, technical specs, etc.
+        """
+        doc_type = RAGManager._detect_doc_type(text)
+
+        # ── 1. Tax-specific fixes (only for invoices / financial docs) ──
+        if doc_type in ('invoice', 'hr', 'bank_statement'):
+            text = re.sub(r'\b(C ?GST|S ?GST|I ?GST)a(\d)', r'\1 @ \2',
+                          text, flags=re.IGNORECASE)
+            # Fix OCR misreads of ₹
+            text = re.sub(r'\bR(\d[\d,.]*\.\d{2})\b', r'₹\1', text)
+            text = re.sub(r'\bRO\.00\b', '₹0.00', text)
+            text = re.sub(r'\?(\d[\d,.]*\.\d{2})', r'₹\1', text)
+
+        # ── 2. CamelCase splitting (safe — preserves known terms) ──
+        text = RAGManager._safe_camelcase_split(text)
+
+        # ── 3. Fix word-number jams (lowercase 2+ chars only) ──
+        # Only [g-z] range to preserve hex codes (a-f adjacent to digits).
+        # Requires 2+ chars so single-char units (m, k, g) are untouched.
+        text = re.sub(r'([g-z]{2,})(\d)', r'\1 \2', text)
+        text = re.sub(r'(\d)([g-z]{2,})', r'\1 \2', text)
+
+        # ── 4. General OCR character-swap fixes ──
+        text = re.sub(r'\bllame\b', 'Name', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bDeseription\b', 'Description', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bExecuive\b', 'Executive', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bSub ?Tota1\b', 'SubTotal', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bTota1\b', 'Total', text)
+        text = re.sub(r'\bl\b(?=\s*\d)', '1', text)  # lone "l" before number → "1"
+        text = re.sub(r'\bO(\d{3,})\b', r'0\1', text)  # O followed by digits → 0
+
+        # ── 5. Normalise separators ──
+        text = re.sub(r'(\w)&(\w)', r'\1 & \2', text)
+
+        # ── 6. Compress blank lines ──
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        # ── 7. Context-aware noise removal ──
+        # Always remove these (software watermarks)
+        always_noise = {'MADE WITH', 'MADEWITH'}
+        # Invoice-specific noise
+        invoice_noise = {'EXPWP', 'QRCODE', 'SUPPLYTYPECODE', 'DOCUMENTTYPECODE',
+                         'SUPPLY TYPE CODE', 'DOCUMENT TYPE CODE',
+                         'CLEARONE', 'CLEAR ONE'}
+        noise_set = always_noise.copy()
+        if doc_type == 'invoice':
+            noise_set |= invoice_noise
+
+        cleaned_lines = []
+        for line in text.split('\n'):
+            stripped = line.strip()
+            if stripped and stripped.upper() not in noise_set:
+                cleaned_lines.append(line)
+            elif not stripped:
+                cleaned_lines.append('')
+        text = '\n'.join(cleaned_lines)
+
+        # ── 8. Compact table-like short-line sequences ──
+        text = RAGManager._compact_table_lines(text, doc_type)
+
+        return text.strip()
+
+    @staticmethod
+    def _compact_table_lines(text: str, doc_type: str = 'general') -> str:
+        """Detect tabular data rows in OCR text and join their cells with pipe
+        separators for cleaner LLM readability.
+
+        Handles diverse document types:
+        - Invoices: ITEM NAME / QTY / PRICE / AMOUNT
+        - Bank statements: Date / Narration / Debit / Credit / Balance
+        - Medical reports: Test Name / Result / Reference Range / Unit
+        - HR / Payslip: Component / Earnings / Deductions
+        - General: Sr No / Name / Description / Value + any 2-keyword match
+        """
+        # ── Table header keywords by doc type ──
+        _COMMON_HEADERS = {
+            'name', 'description', 'amount', 'total', 'date', 'no',
+            'sr', 'sl', 'number', 'type', 'status', 'remarks', 'value',
+        }
+        _DOMAIN_HEADERS = {
+            'invoice': {'item', 'qty', 'quantity', 'price', 'hsn', 'sac',
+                        'gst', 'rate', 'discount', 'unit', 'tax'},
+            'bank_statement': {'narration', 'particular', 'particulars',
+                               'debit', 'credit', 'balance', 'withdrawal',
+                               'deposit', 'transaction', 'cheque', 'ref'},
+            'medical': {'test', 'result', 'reference', 'range', 'unit',
+                        'specimen', 'method', 'finding', 'observation',
+                        'parameter', 'normal'},
+            'hr': {'component', 'earning', 'earnings', 'deduction',
+                   'deductions', 'particular', 'particulars',
+                   'days', 'rate'},
+            'legal': set(),
+            'general': {'quantity', 'price', 'rate', 'unit', 'qty',
+                        'specification', 'model', 'category', 'size',
+                        'weight', 'code', 'id'},
+        }
+        table_headers = _COMMON_HEADERS | _DOMAIN_HEADERS.get(doc_type, set())
+
+        _SUMMARY_KW = {
+            'subtotal', 'sub total', 'total due', 'grand total', 'total',
+            'cgst', 'sgst', 'igst', 'totaldue', 'net total', 'gross total',
+            'net pay', 'net salary', 'take home', 'closing balance',
+            'opening balance',
+        }
+
+        # Words that signal the line is a column header (vs data)
+        _HEADER_WORDS = table_headers | {'#', 'sr', 'sl', 'no'}
+
+        lines = text.split('\n')
+        result: list[str] = []
+        i = 0
+        in_table = False
+        num_cols = 0
+
+        while i < len(lines):
+            stripped = lines[i].strip()
+            stripped_lower = stripped.lower()
+
+            # ── Detect table start ──
+            if not in_table:
+                vert_start = None
+                vert_lines = []
+                # Count how many table-header keywords appear in this line
+                words_in_line = set(re.findall(r'[a-z]+', stripped_lower))
+                header_hits = len(words_in_line & table_headers)
+
+                # Path B: Vertical header detection.
+                # OCR often puts each column header on its own line.
+                # Look for 3+ consecutive short lines where each contains
+                # at least one header keyword. Lines with ':' are key:value
+                # pairs and don't count.
+                if header_hits < 2:
+                    vert_start = None
+                    if (stripped and len(stripped) <= 30
+                            and ':' not in stripped
+                            and words_in_line & table_headers):
+                        vert_lines = [i]
+                        for wi in range(1, 8):
+                            if i + wi >= len(lines):
+                                break
+                            wl = lines[i + wi].strip()
+                            if not wl:
+                                continue  # skip blank lines
+                            if len(wl) > 30 or ':' in wl:
+                                break
+                            wl_words = set(re.findall(r'[a-z]+', wl.lower()))
+                            if wl_words & table_headers:
+                                vert_lines.append(i + wi)
+                            else:
+                                break  # must be consecutive header lines
+                        if len(vert_lines) >= 3:
+                            header_hits = len(vert_lines)
+                            vert_start = i
+
+                if header_hits >= 2:
+                    in_table = True
+
+                    if vert_start is not None:
+                        # Vertical headers: use exactly the detected lines
+                        col_headers = [lines[li].strip() for li in vert_lines]
+                        num_cols = len(col_headers)
+                        i = vert_lines[-1] + 1
+                        # Skip blanks after headers
+                        while i < len(lines) and not lines[i].strip():
+                            i += 1
+                    else:
+                        # Path A: single line had 2+ header keywords
+                        num_cols = 0
+                        col_headers = [stripped]
+                        i += 1
+                        while i < len(lines):
+                            s = lines[i].strip()
+                            s_lower = s.lower()
+                            if not s:
+                                i += 1
+                                continue
+                            # Data row: starts with digit or contains currency
+                            if re.match(r'^\d{1,3}$', s):
+                                break
+                            if re.search(r'[₹$€£]|^\d[\d,]*\.\d{2}$', s):
+                                break
+                            # Key:value line — not a header
+                            if ':' in s:
+                                break
+                            # Still a header word?
+                            s_words = set(re.findall(r'[a-z]+', s_lower))
+                            if s_words & _HEADER_WORDS or s in ('#', '/'):
+                                col_headers.append(s)
+                                i += 1
+                                continue
+                            break
+                        num_cols = max(len(col_headers), 2)
+
+                    result.append(' | '.join(col_headers))
+                    continue
+
+                # Not in table — emit as-is
+                result.append(lines[i])
+                i += 1
+                continue
+
+            # ── Inside table zone ──
+            if not stripped:
+                k = i + 1
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k >= len(lines) or k - i > 2:
+                    in_table = False
+                    result.append('')
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            # Summary keyword — own line
+            if any(kw in stripped_lower for kw in _SUMMARY_KW):
+                result.append(stripped)
+                i += 1
+                continue
+
+            # Row-number line → start collecting data cells
+            if re.match(r'^\d{1,3}$', stripped):
+                row_cells = [stripped]
+                # Row-number is extra (not a column), so target = num_cols + 1
+                row_target = (num_cols + 1) if num_cols > 0 else 0
+                i += 1
+                while i < len(lines):
+                    s = lines[i].strip()
+                    if not s:
+                        break
+                    # Only treat digit-only line as new row number when full
+                    if re.match(r'^\d{1,3}$', s):
+                        if row_target <= 0 or len(row_cells) >= row_target - 1:
+                            break
+                    if any(kw in s.lower() for kw in _SUMMARY_KW):
+                        break
+                    row_cells.append(s)
+                    if row_target > 0 and len(row_cells) >= row_target:
+                        i += 1
+                        break
+                    i += 1
+                result.append(' | '.join(row_cells))
+                continue
+
+            # Other line in table — collect cells, break at column count
+            row_cells = [stripped]
+            i += 1
+            while i < len(lines):
+                s = lines[i].strip()
+                if not s:
+                    break
+                if re.match(r'^\d{1,3}$', s):
+                    break
+                if any(kw in s.lower() for kw in _SUMMARY_KW):
+                    break
+                if len(s) > 80:
+                    in_table = False
+                    break
+                row_cells.append(s)
+                if num_cols > 0 and len(row_cells) >= num_cols:
+                    i += 1
+                    break
+                i += 1
+            result.append(' | '.join(row_cells))
+
+        return '\n'.join(result)
+
+    @staticmethod
+    def _format_as_markdown_table(text: str) -> str:
+        """Convert tabular text (e.g. from CSV/Excel to_string()) into a
+        markdown table.  Falls back to the original text if parsing fails."""
+        lines = [l for l in text.split('\n') if l.strip()]
+        if len(lines) < 2:
+            return text
+
+        # Detect pandas to_string() format: first line is headers, remaining
+        # lines are data rows with consistent column alignment.
+        # Also handles pipe-delimited or tab-delimited data.
+        try:
+            # Try tab-delimited first
+            if '\t' in lines[0]:
+                rows = [line.split('\t') for line in lines]
+            # Try pipe-delimited
+            elif '|' in lines[0] and lines[0].count('|') >= 2:
+                rows = [[c.strip() for c in line.split('|') if c.strip()] for line in lines]
+            else:
+                # Pandas to_string() uses fixed-width alignment.  Detect column
+                # boundaries from the header row's whitespace pattern:
+                # multi-space gaps separate columns.
+                header_parts = re.split(r'  +', lines[0].strip())
+                if len(header_parts) >= 2:
+                    rows = [re.split(r'  +', l.strip()) for l in lines]
+                else:
+                    return text
+
+            if len(rows) < 2 or not rows[0]:
+                return text
+
+            # Normalise column count
+            ncols = max(len(r) for r in rows)
+            for r in rows:
+                while len(r) < ncols:
+                    r.append('')
+
+            # Build markdown table
+            md_lines = []
+            header = '| ' + ' | '.join(rows[0]) + ' |'
+            separator = '| ' + ' | '.join(['---'] * ncols) + ' |'
+            md_lines.append(header)
+            md_lines.append(separator)
+            for row in rows[1:]:
+                md_lines.append('| ' + ' | '.join(row) + ' |')
+            return '\n'.join(md_lines)
+        except Exception:
+            return text
     
     def create_from_folder(self, folder_path: str, rag_name: str, chunk_size: int = 512, chunk_overlap: int = 100, progress_callback=None) -> RAGDatabase:
         """
@@ -1006,7 +1458,8 @@ class RAGManager:
         Returns list of (filename, text) tuples."""
         file_texts = []
         supported_extensions = {
-            ".txt", ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".pptx", ".ppt",
+            ".txt", ".md", ".json", ".xml", ".html", ".htm",
+            ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".pptx", ".ppt",
             ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"
         }
         
@@ -1048,9 +1501,53 @@ class RAGManager:
         """Extract text from a single file"""
         ext = Path(file_path).suffix.lower()
         
-        if ext == ".txt":
+        if ext in (".txt", ".md"):
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
+        
+        elif ext == ".json":
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+            try:
+                data = json.loads(raw)
+                return json.dumps(data, indent=2, ensure_ascii=False)
+            except (json.JSONDecodeError, ValueError):
+                return raw  # Return raw text if not valid JSON
+        
+        elif ext == ".xml":
+            try:
+                import lxml.etree as ET
+                tree = ET.parse(file_path)
+                # Extract all text content, preserving tag structure as headings
+                parts: list[str] = []
+                for elem in tree.iter():
+                    if elem.text and elem.text.strip():
+                        tag = elem.tag.split('}')[-1] if '}' in str(elem.tag) else elem.tag
+                        parts.append(f"[{tag}] {elem.text.strip()}")
+                    if elem.tail and elem.tail.strip():
+                        parts.append(elem.tail.strip())
+                return '\n'.join(parts)
+            except Exception:
+                # Fallback: strip XML tags with regex
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    raw = f.read()
+                text = re.sub(r'<[^>]+>', ' ', raw)
+                return re.sub(r'\s+', ' ', text).strip()
+        
+        elif ext in (".html", ".htm"):
+            try:
+                from bs4 import BeautifulSoup
+            except ImportError:
+                # Fallback: strip tags
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    raw = f.read()
+                return re.sub(r'<[^>]+>', ' ', raw).strip()
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                html = f.read()
+            soup = BeautifulSoup(html, 'html.parser')
+            for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+                tag.decompose()
+            return soup.get_text(separator='\n', strip=True)
         
         elif ext == ".pdf":
             text = ""
@@ -1084,31 +1581,71 @@ class RAGManager:
         
         elif ext == ".csv":
             df = pd.read_csv(file_path)
-            return df.to_string()
+            with pd.option_context('display.max_columns', None,
+                                   'display.max_rows', None,
+                                   'display.width', None,
+                                   'display.max_colwidth', None):
+                return df.to_string()
         
         elif ext in (".xlsx", ".xls"):
-            # Read all sheets
             xls = pd.ExcelFile(file_path)
             texts = []
             for sheet in xls.sheet_names:
                 df = pd.read_excel(file_path, sheet_name=sheet)
-                texts.append(f"[Sheet: {sheet}]\n{df.to_string()}")
+                with pd.option_context('display.max_columns', None,
+                                       'display.max_rows', None,
+                                       'display.width', None,
+                                       'display.max_colwidth', None):
+                    texts.append(f"[Sheet: {sheet}]\n{df.to_string()}")
             return "\n\n".join(texts)
         
         elif ext == ".docx":
             from docx import Document
-            text = ""
+            parts: list[str] = []
             doc = Document(file_path)
+            # Main body paragraphs
             for paragraph in doc.paragraphs:
                 if paragraph.text.strip():
-                    text += paragraph.text + "\n"
-            # Also extract from tables
+                    parts.append(paragraph.text)
+            # Tables in body
             for table in doc.tables:
                 for row in table.rows:
-                    row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-                    if row_text:
-                        text += row_text + "\n"
-            return text
+                    cells = []
+                    prev_text = None
+                    for cell in row.cells:
+                        ct = cell.text.strip()
+                        # Skip merged cells (python-docx repeats them)
+                        if ct and ct != prev_text:
+                            cells.append(ct)
+                            prev_text = ct
+                    if cells:
+                        parts.append(' | '.join(cells))
+            # Headers and footers
+            for section in doc.sections:
+                for hdr in (section.header, section.first_page_header):
+                    if hdr and hdr.paragraphs:
+                        for p in hdr.paragraphs:
+                            if p.text.strip():
+                                parts.append(p.text)
+                for ftr in (section.footer, section.first_page_footer):
+                    if ftr and ftr.paragraphs:
+                        for p in ftr.paragraphs:
+                            if p.text.strip():
+                                parts.append(p.text)
+            # Footnotes (if python-docx exposes them via the XML)
+            try:
+                from docx.opc.constants import RELATIONSHIP_TYPE as RT
+                footnotes_part = doc.part.rels.get(RT.FOOTNOTES)
+                if footnotes_part:
+                    import lxml.etree as ET
+                    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+                    for fn in footnotes_part.target_part.element.findall('.//w:footnote', ns):
+                        fn_text = ' '.join(t.text for t in fn.findall('.//w:t', ns) if t.text)
+                        if fn_text.strip():
+                            parts.append(f'[Footnote] {fn_text.strip()}')
+            except Exception:
+                pass  # Footnote extraction is best-effort
+            return '\n'.join(parts)
         
         elif ext in (".pptx", ".ppt"):
             if not PPTX_AVAILABLE:
@@ -1128,6 +1665,11 @@ class RAGManager:
                             row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
                             if row_text:
                                 slide_text += row_text + "\n"
+                # Speaker notes
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    notes = slide.notes_slide.notes_text_frame.text.strip()
+                    if notes:
+                        slide_text += f"[Notes] {notes}\n"
                 if slide_text.strip() != f"[Slide {slide_num}]":
                     text += slide_text + "\n"
             return text
@@ -1174,7 +1716,13 @@ class RAGManager:
         return [c for c in chunks if _should_keep(c)]
 
     def _load_markdown_snapshot_entries(self, rag_name: str) -> List[Dict[str, str]]:
-        """Parse knowledge.md into searchable entries and cache by mtime."""
+        """Parse knowledge.md into searchable entries and cache by mtime.
+
+        The new merged format has one ``## filename`` section per source file
+        with all text merged underneath (no ``### Chunk`` sub-headings).  We
+        split each source section into paragraph-sized entries (~500 chars) so
+        the lexical pre-search still returns focused snippets.
+        """
         md_path = self.get_markdown_path(rag_name)
         if not os.path.exists(md_path):
             return []
@@ -1186,37 +1734,65 @@ class RAGManager:
 
         entries: List[Dict[str, str]] = []
         current_source = "unknown"
-        current_chunk = ""
         current_lines: List[str] = []
 
-        def flush_entry():
-            nonlocal current_chunk, current_lines
+        def flush_source():
+            nonlocal current_lines
             text = "\n".join(current_lines).strip()
-            if current_chunk and text:
+            if not text:
+                current_lines = []
+                return
+            # Split long merged text into ~500-char paragraph entries
+            # so the lexical search returns focused snippets.
+            paragraphs = re.split(r'\n{2,}', text)
+            buf = ""
+            entry_idx = 0
+            for para in paragraphs:
+                para = para.strip()
+                if not para:
+                    continue
+                if buf and len(buf) + len(para) > 500:
+                    entries.append({
+                        "source": current_source,
+                        "chunk": f"{current_source}_{entry_idx}",
+                        "text": buf,
+                        "lower": buf.lower(),
+                    })
+                    entry_idx += 1
+                    buf = para
+                else:
+                    buf = (buf + "\n\n" + para) if buf else para
+            if buf.strip():
                 entries.append({
                     "source": current_source,
-                    "chunk": current_chunk,
-                    "text": text,
-                    "lower": text.lower(),
+                    "chunk": f"{current_source}_{entry_idx}",
+                    "text": buf,
+                    "lower": buf.lower(),
                 })
-            current_chunk = ""
             current_lines = []
 
         with open(md_path, "r", encoding="utf-8", errors="ignore") as f:
             for raw in f:
                 line = raw.rstrip("\n")
-                if line.startswith("## Source: "):
-                    flush_entry()
-                    current_source = line[len("## Source: "):].strip() or "unknown"
+                # New format: ## filename  (no "Source: " prefix)
+                # Also support legacy: ## Source: filename
+                if line.startswith("## "):
+                    flush_source()
+                    heading = line[3:].strip()
+                    if heading.startswith("Source: "):
+                        heading = heading[len("Source: "):]
+                    current_source = heading or "unknown"
                     continue
+                # Skip the top-level title / metadata lines
+                if line.startswith("# ") or line.startswith("- **"):
+                    continue
+                # Legacy: ### Chunk N — just treat as a paragraph break
                 if line.startswith("### Chunk "):
-                    flush_entry()
-                    current_chunk = line[len("### Chunk "):].strip()
+                    current_lines.append("")
                     continue
-                if current_chunk:
-                    current_lines.append(line)
+                current_lines.append(line)
 
-        flush_entry()
+        flush_source()
 
         self._md_snapshot_cache[rag_name] = {
             "mtime": mtime,

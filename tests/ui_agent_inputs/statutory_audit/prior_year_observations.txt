@@ -1,0 +1,5 @@
+Prior-Year Audit Observations:
+- Revenue cut-off testing found two invoices recorded before dispatch at year end.
+- Inventory count differences were noted at the Pune warehouse.
+- One major customer balance confirmation remained outstanding.
+- GST payable reconciliation was delayed during finalization.

@@ -1,0 +1,6 @@
+Date,Reference,Narration,Debit,Credit,Balance
+2025-04-02,UPI-240402-11,Customer receipt - Aster Retail,0,125000,845000
+2025-04-05,CHQ-391221,Cheque issued - Metro Metals,118000,0,727000
+2025-04-09,BANK-CHG-APR,Bank charges April,750,0,726250
+2025-04-12,NEFT-8891,Vendor payment - Prime Services,61360,0,664890
+2025-04-18,CASHDEP-118,Cash deposit,45000,0,709890

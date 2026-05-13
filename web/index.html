@@ -86,7 +86,26 @@
 
     <!-- ═══ CHAT AREA ═══ -->
     <main id="chat-area">
+      <!-- Conversation search bar -->
+      <div id="conv-search-bar" class="hidden">
+        <input type="text" id="conv-search-input" placeholder="Search in conversation…" autocomplete="off" />
+        <span id="conv-search-count"></span>
+        <button id="conv-search-prev" class="btn-icon" title="Previous match">▲</button>
+        <button id="conv-search-next" class="btn-icon" title="Next match">▼</button>
+        <button id="conv-search-close" class="btn-icon" title="Close search">✕</button>
+      </div>
       <div id="messages-container"></div>
+
+      <!-- Drag-drop overlay -->
+      <div id="chat-drop-overlay" class="drop-overlay hidden">
+        <div class="drop-overlay-content">
+          <span class="drop-icon">📎</span>
+          <span>Drop files here</span>
+        </div>
+      </div>
+
+      <!-- File chips (shown above input bar when files are attached) -->
+      <div id="chat-file-chips"></div>
 
       <!-- Input bar -->
       <div id="input-bar">
@@ -108,6 +127,7 @@
             <option value="4096">4096</option>
             <option value="8192">8192</option>
             <option value="16384">16384</option>
+            <option value="-1">Max</option>
           </select>
         </div>
         <span id="token-counter" class="muted small">0 tokens</span>
@@ -189,9 +209,20 @@
                   <option value="none">UI Only (no file export)</option>
                   <option value="excel">Excel (.xlsx)</option>
                   <option value="csv">CSV (.csv)</option>
+                  <option value="csv_json">CSV via JSON Schema (structured)</option>
                   <option value="pdf">PDF Report</option>
+                  <option value="docx">Word Document (.docx)</option>
                   <option value="txt">Text (.txt)</option>
                 </select>
+              </div>
+              <div class="form-group" id="json-schema-group" style="display:none;">
+                <label>🗂 JSON Schema <span class="muted small">(optional — define exact output columns)</span></label>
+                <textarea id="agent-instr-json-schema" rows="4"
+                  placeholder='{"rows":[{"Date":"DD-MM-YYYY","Amount":"0.00","Category":"name","Notes":"desc"}]}'
+                  style="font-family:monospace;font-size:12px;"></textarea>
+                <div class="muted small" style="margin-top:4px;">
+                  Leave blank to let the model choose column names automatically. Provide a sample JSON object to lock column names and order.
+                </div>
               </div>
               <div class="agent-form-actions">
                 <button id="btn-save-instruction" class="btn accent">💾 Save Instruction</button>
@@ -223,6 +254,7 @@
                   <button id="btn-agent-upload" class="btn-icon" title="Upload files">📎</button>
                   <input id="agent-file-input" type="file" multiple style="display:none;" accept=".xlsx,.xls,.csv,.pdf,.txt,.md,.docx,.png,.jpg,.jpeg,.webp,.bmp,.tiff">
                   <button id="btn-agent-web" class="btn-icon" title="Toggle web search">🌐</button>
+                  <button id="btn-agent-scrape" class="btn-icon" title="Scrape a URL — paste a link and click to fetch page data">🕷</button>
                 </div>
                 <textarea id="agent-input" rows="1" placeholder="Upload files and send, or ask a question…"></textarea>
                 <button id="btn-agent-send" class="btn accent" title="Send">➤</button>
@@ -316,6 +348,7 @@
             <option value="4096">4096</option>
             <option value="8192">8192</option>
             <option value="16384">16384</option>
+            <option value="-1">Max</option>
           </select>
         </div>
         <hr>
@@ -360,6 +393,9 @@
         <div class="settings-section">
           <button class="btn ghost" id="btn-settings-plugins">Plugins</button>
         </div>
+        <div class="settings-section">
+          <button class="btn ghost" id="btn-settings-mcp">MCP Servers</button>
+        </div>
       </div>
       <div class="modal-footer">
         <button class="btn accent" id="btn-save-settings">Save</button>
@@ -401,6 +437,7 @@
           <option value="16384">16384</option>
           <option value="32768">32768</option>
           <option value="65536">65536</option>
+          <option value="max">Max</option>
         </select>
       </div>
       <div class="settings-section">
@@ -510,6 +547,67 @@
         <button class="btn accent" id="btn-reload-plugins">Reload</button>
         <button class="btn accent" id="btn-create-plugin-ai" onclick="openPluginAiModal()">✨ Create with AI</button>
         <button class="btn ghost" onclick="closeModal('modal-plugins')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MCP Servers modal -->
+  <div id="modal-mcp" class="modal hidden">
+    <div class="modal-content modal-large">
+      <h3>MCP Servers</h3>
+      <p class="muted small">Connect to external tool servers via the Model Context Protocol. The AI can call their tools during chat.</p>
+
+      <!-- Server list -->
+      <div id="mcp-server-list" class="scrollable-list" style="max-height:280px;"></div>
+
+      <!-- Add / Edit form -->
+      <div id="mcp-form" class="mcp-form" style="display:none;">
+        <h4 id="mcp-form-title">Add MCP Server</h4>
+        <input type="hidden" id="mcp-edit-name" value="">
+        <div class="form-row">
+          <label>Name</label>
+          <input type="text" id="mcp-name" placeholder="e.g. filesystem" />
+        </div>
+        <div class="form-row">
+          <label>Transport</label>
+          <select id="mcp-transport" onchange="mcpTransportChanged()">
+            <option value="stdio">stdio (subprocess)</option>
+            <option value="sse">SSE (HTTP)</option>
+          </select>
+        </div>
+        <div id="mcp-stdio-fields">
+          <div class="form-row">
+            <label>Command</label>
+            <input type="text" id="mcp-command" placeholder="e.g. npx" />
+          </div>
+          <div class="form-row">
+            <label>Arguments <span class="muted small">(comma-separated)</span></label>
+            <input type="text" id="mcp-args" placeholder="e.g. -y, @modelcontextprotocol/server-filesystem, C:\Users" />
+          </div>
+          <div class="form-row">
+            <label>Environment <span class="muted small">(KEY=VALUE, one per line)</span></label>
+            <textarea id="mcp-env" rows="2" placeholder="GITHUB_TOKEN=ghp_xxx"></textarea>
+          </div>
+        </div>
+        <div id="mcp-sse-fields" style="display:none;">
+          <div class="form-row">
+            <label>Server URL</label>
+            <input type="text" id="mcp-url" placeholder="http://localhost:8080/mcp" />
+          </div>
+          <div class="form-row">
+            <label>Headers <span class="muted small">(KEY: VALUE, one per line)</span></label>
+            <textarea id="mcp-headers" rows="2" placeholder="Authorization: Bearer xxx"></textarea>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn accent" onclick="mcpSaveServer()">Save</button>
+          <button class="btn ghost" onclick="mcpCancelForm()">Cancel</button>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn accent" id="btn-mcp-add" onclick="mcpShowAddForm()">+ Add Server</button>
+        <button class="btn ghost" onclick="closeModal('modal-mcp')">Close</button>
       </div>
     </div>
   </div>

@@ -1,0 +1,162 @@
+[
+  {
+    "id": "tc01_gst_tds_reco",
+    "title": "GST/TDS reconciliation for audit exceptions",
+    "template_name": "GST_TDS_Reco_Audit_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/gst_tds_reco/gstr2b_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/gst_tds_reco/purchase_register_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/gst_tds_reco/form26as_tds_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/gst_tds_reco/tds_ledger_apr_2025_sample.csv"
+    ],
+    "expected_checks": [
+      "Prime Services LLP should appear as a GST value mismatch.",
+      "Rapid Office Supplies should appear as missing in books or purchase register.",
+      "Office Interiors India should appear as missing in portal / GSTR-2B.",
+      "Green Hill Manufacturing should appear as a TDS mismatch.",
+      "Northwind Consulting should appear as missing in Form 26AS."
+    ]
+  },
+  {
+    "id": "tc02_audit_bank_reco",
+    "title": "Other audit reconciliation: bank statement vs cash book",
+    "template_name": "Audit_Bank_Reco_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/audit_reco/bank_statement_apr_2025_sample.csv",
+      "tests/ui_agent_inputs/audit_reco/cash_book_apr_2025_sample.csv"
+    ],
+    "expected_checks": [
+      "Bank charges of 750 should appear as not booked in books.",
+      "Prime Services payment should appear as an amount mismatch.",
+      "Cheque CHQ-391245 should appear as issued not yet presented / not seen in bank.",
+      "The output should classify each issue into an exception type."
+    ]
+  },
+  {
+    "id": "tc03_letters_audit_hr",
+    "title": "Formal letter generation for audit and HR use cases",
+    "template_name": "Audit_HR_Letter_Generator_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/letters/audit_information_request_brief.txt",
+      "tests/ui_agent_inputs/letters/letter_style_guide.txt"
+    ],
+    "alternate_input_files": [
+      "tests/ui_agent_inputs/letters/hr_show_cause_brief.txt",
+      "tests/ui_agent_inputs/letters/letter_style_guide.txt"
+    ],
+    "expected_checks": [
+      "Audit letter should request all five listed documents and mention 15 May 2026.",
+      "HR letter should mention the three late attendance dates, delayed report, and 48-hour response window.",
+      "Generated output should read like a formal letter and be exportable through the UI as PDF."
+    ]
+  },
+  {
+    "id": "tc04_payroll_calculation",
+    "title": "Payroll related calculations with statutory deductions",
+    "template_name": "Payroll_Calculation_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/payroll/employee_master_may_2026.csv",
+      "tests/ui_agent_inputs/payroll/attendance_may_2026.csv",
+      "tests/ui_agent_inputs/payroll/payroll_rules_may_2026.txt"
+    ],
+    "expected_checks": [
+      "EMP001 should include overtime and reimbursement in earnings.",
+      "EMP002 should reflect loss of pay and ESI deduction.",
+      "EMP003 should be flagged for missing bank account.",
+      "Output should contain one payroll row per employee with Net Pay."
+    ]
+  },
+  {
+    "id": "tc05_cs_drafting",
+    "title": "CS drafting for minutes and directors report support",
+    "template_name": "CS_Drafting_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/cs/board_minutes_brief.txt",
+      "tests/ui_agent_inputs/cs/cs_style_guide.txt"
+    ],
+    "alternate_input_files": [
+      "tests/ui_agent_inputs/cs/directors_report_brief.txt",
+      "tests/ui_agent_inputs/cs/cs_style_guide.txt"
+    ],
+    "expected_checks": [
+      "Board minutes draft should mention all four agenda decisions and chairman block.",
+      "Directors report draft should cover financial performance, share capital, directors/KMP, internal controls, and acknowledgment.",
+      "Output should be review-ready and exportable as PDF."
+    ]
+  },
+  {
+    "id": "tc06_bills_to_tally",
+    "title": "Parsing bills and updating Tally-style sheet",
+    "template_name": "Bills_To_Tally_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/bills_tally/vendor_bills_sample.csv",
+      "tests/ui_agent_inputs/bills_tally/tally_mapping_guide.txt"
+    ],
+    "expected_checks": [
+      "Office Supplies should map to Office Expenses.",
+      "Bluechip Travels should populate IGST, not CGST/SGST.",
+      "Each bill should produce one normalized row with Party Ledger and Expense Ledger.",
+      "Any inferred GST classification should be mentioned in the Note field."
+    ]
+  },
+  {
+    "id": "tc07_recruitment_screening",
+    "title": "Recruitment shortlist from JD and candidate profiles",
+    "template_name": "Recruitment_Screening_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/recruitment/job_description_data_analyst.txt",
+      "tests/ui_agent_inputs/recruitment/candidate_profiles_sample.csv"
+    ],
+    "expected_checks": [
+      "Ritika Sen and Nisha Thomas should be shortlisted or ranked highest.",
+      "Mohit Rao should be hold or reject because of notice period and missing Power BI/stakeholder fit.",
+      "Karan Bedi should be rejected due to experience and missing must-have skills.",
+      "Output should include a decision and decision note for every candidate."
+    ]
+  },
+  {
+    "id": "tc08_labour_compliance",
+    "title": "Labour compliance report and filing tracker",
+    "template_name": "Labour_Compliance_Report_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/labour_compliance/employee_register_apr_2026.csv",
+      "tests/ui_agent_inputs/labour_compliance/wage_and_challan_notes_apr_2026.txt",
+      "tests/ui_agent_inputs/labour_compliance/compliance_calendar.txt"
+    ],
+    "expected_checks": [
+      "PF should be marked pending with due-date context.",
+      "ESI should be shown as paid or completed for the period.",
+      "Bonus register should appear as a pending action.",
+      "Labour welfare fund return should appear with due date 15 June 2026."
+    ]
+  },
+  {
+    "id": "tc09_income_tax_computation",
+    "title": "Income tax computation summary",
+    "template_name": "Income_Tax_Computation_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/income_tax/income_case_ay_2026_27.txt",
+      "tests/ui_agent_inputs/income_tax/deduction_proofs_sample.csv"
+    ],
+    "expected_checks": [
+      "Output should include gross total income, deductions, and taxable income.",
+      "TDS and advance tax credit should be reflected in the summary.",
+      "Notes should mention if further information is needed for more detailed regime analysis."
+    ]
+  },
+  {
+    "id": "tc10_statutory_audit_process",
+    "title": "Statutory audit planning and process tracker",
+    "template_name": "Statutory_Audit_Process_Test",
+    "input_files": [
+      "tests/ui_agent_inputs/statutory_audit/trial_balance_mar_2026.csv",
+      "tests/ui_agent_inputs/statutory_audit/prior_year_observations.txt",
+      "tests/ui_agent_inputs/statutory_audit/planning_brief.txt"
+    ],
+    "expected_checks": [
+      "Revenue, inventory, receivables, and GST should appear as audit areas.",
+      "Required documents and procedures should be specific to each audit area.",
+      "High-priority items should reflect prior year observations and planning brief focus."
+    ]
+  }
+]

@@ -22,10 +22,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM Generate logo / icon if create_logo.py exists
-if exist create_logo.py (
+REM Generate logo / icon if tools\create_logo.py exists
+if exist tools\create_logo.py (
   echo Generating app icon...
-  "%PYEXE%" create_logo.py
+  "%PYEXE%" tools\create_logo.py
   if errorlevel 1 (
     echo WARNING: Logo generation failed, continuing without icon.
   )

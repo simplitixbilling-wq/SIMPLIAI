@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rag_manager import RAGDatabase, RAGManager
+from app_core.rag_manager import RAGDatabase, RAGManager
 
 
 class RAGDatabaseTests(unittest.TestCase):
@@ -61,6 +61,28 @@ class RAGDatabaseTests(unittest.TestCase):
         results = self.db.retrieve("What salary is in the Alpha contract?", k=2)
 
         self.assertIn("Alpha contract", results[0][0])
+
+    def test_retrieve_detailed_returns_source_metadata_and_neighbors(self):
+        chunks = [
+            "Alpha contract introduction and parties.",
+            "Alpha contract states salary is Rs. 90,000 and joining date is 01/02/2025.",
+            "Alpha contract termination clause.",
+            "Beta unrelated note.",
+        ]
+        metadata = [
+            {"source": "alpha.txt", "chunk_index": 0},
+            {"source": "alpha.txt", "chunk_index": 1},
+            {"source": "alpha.txt", "chunk_index": 2},
+            {"source": "beta.txt", "chunk_index": 0},
+        ]
+        self.db.add_chunks(chunks, metadata)
+
+        results = self.db.retrieve_detailed("salary joining date alpha", k=1)
+
+        self.assertEqual(results[0]["source"], "alpha.txt")
+        self.assertEqual(results[0]["source_chunk_index"], 1)
+        self.assertTrue(results[0]["neighbors"])
+        self.assertIn("metadata", results[0])
 
     def test_retrieve_includes_document_reference_matches(self):
         chunks = ["Alpha project summary.", "Beta project summary."]
@@ -154,7 +176,7 @@ class RAGManagerTests(unittest.TestCase):
 
         items = self.manager._extract_texts_from_folder(str(docs))
 
-        self.assertEqual([name for name, _text in items], ["alpha.txt"])
+        self.assertEqual([name for name, _text in items], ["alpha.txt", "ignore.md"])
 
     def test_reindex_database_rebuilds_from_original_source_folder(self):
         docs = self.base / "docs"
@@ -183,3 +205,17 @@ class RAGManagerTests(unittest.TestCase):
 
     def test_delete_database_returns_false_for_unknown_name(self):
         self.assertFalse(self.manager.delete_database("missing"))
+
+    def test_retrieve_detailed_from_manager_includes_citation_fields(self):
+        docs = self.base / "docs"
+        docs.mkdir()
+        (docs / "alpha.txt").write_text(
+            "Alpha payroll policy says net pay is Rs. 75,000.00 for May 2026.",
+            encoding="utf-8",
+        )
+        self.manager.create_from_folder(str(docs), "payroll")
+
+        results = self.manager.retrieve_detailed("payroll", "What is alpha net pay?", k=1)
+
+        self.assertEqual(results[0]["source"], "alpha.txt")
+        self.assertIn("score", results[0])

@@ -23,10 +23,10 @@ from PySide6.QtCore import QTimer, Signal, QObject
 from styles import get_theme
 
 # ── Standalone modules ──────────────────────────────────────────────
-from utils import app_data_path
-from database import ChatDatabase, migrate_json_to_sqlite
-from plugin_manager import PluginManager
-from system_tools import SystemTools, TokenOptimizer  # noqa: F401
+from app_core.utils import app_data_path
+from app_core.database import ChatDatabase, migrate_json_to_sqlite
+from app_core.plugin_manager import PluginManager
+from app_core.system_tools import SystemTools, TokenOptimizer  # noqa: F401
 
 # ── Mixin modules ──────────────────────────────────────────────────
 from ui_components import UIComponentsMixin

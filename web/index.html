@@ -323,6 +323,18 @@
             <option value="light">Light</option>
           </select>
         </div>
+        <div class="settings-section">
+          <label>Check Activation System Code</label>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <input id="s-activation-system-code" type="text" readonly placeholder="Loading..." style="flex:1;min-width:220px;">
+            <button class="btn ghost" id="btn-settings-copy-system-code">Copy System Code</button>
+          </div>
+          <div class="muted small">Share this code to generate your activation key.</div>
+        </div>
+        <div class="settings-section">
+          <label>Activation Period</label>
+          <span id="s-activation-period" class="muted">Loading...</span>
+        </div>
         <hr>
         <h4>Generation Defaults</h4>
         <div class="settings-section">
@@ -395,6 +407,9 @@
         </div>
         <div class="settings-section">
           <button class="btn ghost" id="btn-settings-mcp">MCP Servers</button>
+        </div>
+        <div class="settings-section">
+          <button class="btn ghost" id="btn-settings-update-activation">Update Activation Key</button>
         </div>
       </div>
       <div class="modal-footer">

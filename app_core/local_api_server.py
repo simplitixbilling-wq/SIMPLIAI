@@ -1,11 +1,18 @@
 import json
 import os
-import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from utils import app_data_path
+from app_core.local_secret_store import LocalSecretStore
+from app_core.security_utils import (
+    LOCAL_API_MAX_BODY_BYTES,
+    is_allowed_local_origin,
+    is_loopback_host,
+    parse_content_length,
+    safe_local_path,
+)
+from app_core.utils import app_data_path
 
 
 class LocalApiServer:
@@ -17,41 +24,24 @@ class LocalApiServer:
     """
 
     def __init__(self, bridge, host="127.0.0.1", port=8765):
+        if not is_loopback_host(host):
+            raise ValueError("Local API may only bind to a loopback host")
         self.bridge = bridge
         self.host = host
         self.port = int(port)
         self.server = None
         self.thread = None
         self.request_lock = threading.Lock()
-        self.key_file = app_data_path("local_api_key.txt")
-        self.api_key = self._ensure_api_key()
-
-    def _ensure_api_key(self):
-        key = ""
-        try:
-            key = str((self.bridge.app_settings or {}).get("local_api_key", "")).strip()
-        except Exception:
-            key = ""
-
-        if not key:
-            key = secrets.token_urlsafe(24)
-            try:
-                self.bridge.save_app_settings({"local_api_key": key})
-            except Exception:
-                pass
-
-        # Write key to local file for easy retrieval from external tools.
-        try:
-            with open(self.key_file, "w", encoding="utf-8") as f:
-                f.write(key)
-        except Exception:
-            pass
-
-        return key
+        self.secret_store = LocalSecretStore(
+            app_settings=getattr(self.bridge, "app_settings", {}),
+            persist_settings=lambda settings: self.bridge.save_app_settings(settings),
+            app_data_dir=app_data_path(""),
+        )
+        self.api_key, self.key_file = self.secret_store.ensure_local_api_key()
 
     def _check_api_key(self, headers):
         got = headers.get("X-API-Key", "")
-        return bool(got and got == self.api_key)
+        return self.secret_store.check_secret(got, self.api_key)
 
     @staticmethod
     def _to_text(value):
@@ -260,14 +250,52 @@ class LocalApiServer:
     @staticmethod
     def _json_response(handler, status_code, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        origin = handler.headers.get("Origin", "")
         handler.send_response(status_code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Access-Control-Allow-Origin", "*")
-        handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
-        handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        if is_allowed_local_origin(origin):
+            handler.send_header("Access-Control-Allow-Origin", origin or "http://127.0.0.1")
+            handler.send_header("Vary", "Origin")
+            handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+            handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            handler.send_header("Access-Control-Max-Age", "600")
         handler.end_headers()
         handler.wfile.write(body)
+
+    @staticmethod
+    def _allowed_file_roots():
+        roots = [app_data_path("")]
+        home = os.path.expanduser("~")
+        if home:
+            roots.append(home)
+        return roots
+
+    def _safe_jsonl_path(self, path: str, *, must_exist: bool = False) -> str:
+        return safe_local_path(path, allowed_roots=self._allowed_file_roots(), must_exist=must_exist)
+
+    def _sanitize_file_payloads(self, files):
+        sanitized = []
+        for item in files:
+            if isinstance(item, str):
+                safe_path = self._safe_jsonl_path(item, must_exist=True)
+                sanitized.append({
+                    "name": os.path.basename(safe_path),
+                    "path": safe_path,
+                    "size": os.path.getsize(safe_path),
+                })
+                continue
+            if not isinstance(item, dict):
+                raise ValueError("Each file must be an object or path string")
+            copied = dict(item)
+            path = str(copied.get("path", "")).strip()
+            if path:
+                safe_path = self._safe_jsonl_path(path, must_exist=True)
+                copied["path"] = safe_path
+                copied.setdefault("name", os.path.basename(safe_path))
+                copied.setdefault("size", os.path.getsize(safe_path))
+            sanitized.append(copied)
+        return sanitized
 
     def _build_handler(self):
         api = self
@@ -278,6 +306,9 @@ class LocalApiServer:
                 return
 
             def do_OPTIONS(self):
+                if not is_allowed_local_origin(self.headers.get("Origin", "")):
+                    api._json_response(self, 403, {"error": "Origin not allowed"})
+                    return
                 api._json_response(self, 200, {"ok": True})
 
             def do_GET(self):
@@ -327,7 +358,14 @@ class LocalApiServer:
                     api._json_response(self, 401, {"error": "Unauthorized"})
                     return
 
-                length = int(self.headers.get("Content-Length", 0) or 0)
+                length, length_error = parse_content_length(
+                    self.headers.get("Content-Length", 0),
+                    max_bytes=LOCAL_API_MAX_BODY_BYTES,
+                )
+                if length_error:
+                    status = 413 if "too large" in length_error.lower() else 400
+                    api._json_response(self, status, {"error": length_error})
+                    return
                 raw = self.rfile.read(length) if length > 0 else b"{}"
                 try:
                     payload = json.loads(raw.decode("utf-8")) if raw else {}
@@ -361,6 +399,11 @@ class LocalApiServer:
                         return
                     if not instructions:
                         api._json_response(self, 400, {"error": "'instructions' is required"})
+                        return
+                    try:
+                        files = api._sanitize_file_payloads(files)
+                    except ValueError as e:
+                        api._json_response(self, 400, {"error": f"Invalid files: {e}"})
                         return
 
                     with api.request_lock:
@@ -478,9 +521,18 @@ class LocalApiServer:
                         api._json_response(self, 400, {"error": "'jsonl' or 'jsonl_path' is required"})
                         return
 
-                    # Prevent path traversal: resolve to absolute path
                     if jsonl_path:
-                        jsonl_path = os.path.realpath(jsonl_path)
+                        try:
+                            jsonl_path = api._safe_jsonl_path(jsonl_path, must_exist=True)
+                        except ValueError as e:
+                            api._json_response(self, 400, {"error": f"Invalid jsonl_path: {e}"})
+                            return
+                    if checkpoint_dir:
+                        try:
+                            checkpoint_dir = api._safe_jsonl_path(checkpoint_dir, must_exist=False)
+                        except ValueError as e:
+                            api._json_response(self, 400, {"error": f"Invalid checkpoint_dir: {e}"})
+                            return
 
                     with api.request_lock:
                         result = api.bridge.run_jsonl_queue(
@@ -510,7 +562,6 @@ class LocalApiServer:
                 "ok": True,
                 "host": self.host,
                 "port": self.port,
-                "api_key": self.api_key,
                 "api_key_file": self.key_file,
             }
 
@@ -523,7 +574,6 @@ class LocalApiServer:
             "ok": True,
             "host": self.host,
             "port": self.port,
-            "api_key": self.api_key,
             "api_key_file": self.key_file,
         }
 

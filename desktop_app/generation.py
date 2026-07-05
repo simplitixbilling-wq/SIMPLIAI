@@ -8,7 +8,7 @@ import time
 
 import psutil
 
-from system_tools import TokenOptimizer
+from app_core.system_tools import TokenOptimizer
 
 
 class GenerationMixin:

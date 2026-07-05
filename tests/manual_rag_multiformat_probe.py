@@ -13,7 +13,7 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
 
-from rag_manager import RAGManager
+from app_core.rag_manager import RAGManager
 
 
 def make_text_pdf(path: Path):

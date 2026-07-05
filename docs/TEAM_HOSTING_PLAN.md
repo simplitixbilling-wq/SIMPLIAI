@@ -117,7 +117,7 @@ nssm start SimpleAI
 ## Phase 7 — Excel & VS Code for Team
 
 **Excel VBA:**
-- Each user copies the `.xlsm` template or imports `excel_vba_integration_full.txt` module
+- Each user copies the `.xlsm` template or imports `integrations/excel/excel_vba_integration_full.txt`
 - On first run: folder picker is prompted — they select **a shared network path** or their local copy
 - The key file at that path is read automatically each time
 - If host IP changes: users run `ResetSimpleAIAppPath()` macro and re-select

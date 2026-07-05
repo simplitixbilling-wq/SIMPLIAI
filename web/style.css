@@ -816,6 +816,10 @@ input[type="range"] {
 }
 .modal.hidden { display: none; }
 
+#modal-prompt {
+  z-index: 1200;
+}
+
 .modal-content {
   background: var(--bg-secondary);
   border: 1px solid var(--border);

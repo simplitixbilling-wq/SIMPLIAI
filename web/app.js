@@ -364,6 +364,93 @@ async function ensureActivationGate(forcePrompt = false) {
   return unlocked;
 }
 
+async function updateActivationKeyFromSettings() {
+  if (!api || typeof api.activate_full_access !== 'function') {
+    showToast('Activation API is not available.', 'error', 4500);
+    return;
+  }
+
+  let status = null;
+  try {
+    status = await api.get_activation_status();
+  } catch (_) {
+    status = null;
+  }
+
+  const codeHint = status?.system_code ? `\nSystem code: ${status.system_code}` : '';
+  closeModal('modal-settings');
+  const entered = await showPrompt(`Update Activation Key${codeHint}\nPaste activation key:`, '');
+  if (entered == null) return;
+
+  try {
+    const result = await api.activate_full_access(entered);
+    if (result?.ok) {
+      applyAccessLockUi(false);
+      updateTrialPill(result?.status || null);
+      closeModal('modal-settings');
+      showToast('Activation key updated successfully.', 'success', 5000);
+      return;
+    }
+    showToast(result?.error || 'Invalid passkey', 'error', 4500);
+  } catch (e) {
+    showToast(`Activation update failed: ${e?.message || e}`, 'error', 4500);
+  }
+}
+
+async function refreshActivationSettingsUi() {
+  const codeInput = $('#s-activation-system-code');
+  const periodEl = $('#s-activation-period');
+  if (!codeInput || !api || typeof api.get_activation_status !== 'function') return;
+
+  codeInput.value = 'Loading...';
+  if (periodEl) periodEl.textContent = 'Loading...';
+  try {
+    const status = await api.get_activation_status();
+    const code = String(status?.system_code || '').trim();
+    codeInput.value = code || 'Unavailable';
+    if (periodEl) periodEl.textContent = activationPeriodText(status);
+    updateTrialPill(status);
+  } catch (_) {
+    codeInput.value = 'Unavailable';
+    if (periodEl) periodEl.textContent = 'Unavailable';
+  }
+}
+
+async function copyActivationSystemCodeFromSettings() {
+  const codeInput = $('#s-activation-system-code');
+  const code = String(codeInput?.value || '').trim();
+  if (!code || code === 'Loading...' || code === 'Unavailable') {
+    showToast('System code is not available yet.', 'warn', 3500);
+    return;
+  }
+
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(code);
+    } else {
+      throw new Error('Clipboard API unavailable');
+    }
+  } catch (_) {
+    try {
+      const temp = document.createElement('textarea');
+      temp.value = code;
+      temp.style.position = 'fixed';
+      temp.style.opacity = '0';
+      document.body.appendChild(temp);
+      temp.focus();
+      temp.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(temp);
+      if (!copied) throw new Error('Copy command failed');
+    } catch (err) {
+      showToast(`Copy failed: ${err?.message || err}`, 'error', 4500);
+      return;
+    }
+  }
+
+  showToast('System code copied.', 'success', 2500);
+}
+
 function showConfirm(message, title = 'Confirm', okLabel = 'Delete') {
   return new Promise((resolve) => {
     const modal = document.getElementById('modal-confirm');
@@ -415,7 +502,7 @@ function updateTrialPill(status) {
     return;
   }
 
-  const daysLeft = Number(status.days_left ?? 0);
+  const daysLeft = Number(status.trial_days_left ?? status.days_left ?? 0);
   if (status.requires_passkey || daysLeft <= 0) {
     pill.classList.add('expired');
     text.textContent = 'Trial expired';
@@ -426,6 +513,35 @@ function updateTrialPill(status) {
     pill.classList.add('warn');
   }
   text.textContent = `Free trial: ${daysLeft} day${daysLeft === 1 ? '' : 's'} left`;
+}
+
+function formatActivationDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const dt = new Date(raw);
+  if (Number.isNaN(dt.getTime())) return '';
+  return dt.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+}
+
+function activationPeriodText(status) {
+  if (!status || typeof status !== 'object') return 'Unavailable';
+  if (status.is_activated) {
+    const activatedOn = formatActivationDate(status.activated_at);
+    return activatedOn ? `Full access activated on ${activatedOn}` : 'Full access activated';
+  }
+
+  const daysLeft = Number(status.trial_days_left ?? status.days_left ?? 0);
+  const expiresOn = formatActivationDate(status.trial_expires_at);
+  if (status.requires_passkey || daysLeft <= 0) {
+    return expiresOn ? `Trial expired on ${expiresOn}` : 'Trial expired';
+  }
+
+  const dayLabel = `${daysLeft} day${daysLeft === 1 ? '' : 's'} left`;
+  return expiresOn ? `Trial: ${dayLabel}, expires ${expiresOn}` : `Trial: ${dayLabel}`;
 }
 
 /** Switch highlight.js stylesheet for dark/light theme */
@@ -2530,6 +2646,7 @@ $('#btn-settings').addEventListener('click', async () => {
   const vram = info.gpu.vram || 0;
   $('#s-gpu-info').textContent = `${gpuType} (${vram}GB VRAM) — ${info.config.mode}`;
   $('#s-system-info').textContent = `RAM: ${info.system_ram}GB`;
+  await refreshActivationSettingsUi();
 
   openModal('modal-settings');
 });
@@ -2671,7 +2788,30 @@ $('#btn-save-model-settings').addEventListener('click', async () => {
   closeModal('modal-model-settings');
   if (res && res.n_ctx_changed) {
     showToast('Reloading model with new context window...', 'info');
-    await api.load_model($('#model-select').value);
+    try {
+      const status = await api.get_model_status();
+      if (status?.loaded) {
+        await api.unload_model();
+      }
+      const reload = await api.load_model();
+      if (reload?.error) {
+        showToast(`Model reload failed: ${reload.error}`, 'error');
+        return;
+      }
+      try {
+        const post = await api.get_model_status();
+        const applied = post?.n_ctx;
+        if (applied) {
+          showToast(`Applied context window: ${applied}`, 'success', 4500);
+        } else {
+          showToast('Model reloaded with updated context settings.', 'success', 3500);
+        }
+      } catch (_) {
+        showToast('Model reloaded with updated context settings.', 'success', 3500);
+      }
+    } catch (e) {
+      showToast(`Model reload failed: ${e?.message || e}`, 'error');
+    }
   } else {
     showToast('Model settings saved', 'info');
   }
@@ -2796,6 +2936,8 @@ async function openPluginsModal() {
 $('#btn-settings-compare').addEventListener('click', openCompareModal);
 $('#btn-settings-plugins').addEventListener('click', openPluginsModal);
 $('#btn-settings-mcp').addEventListener('click', openMcpModal);
+$('#btn-settings-update-activation').addEventListener('click', updateActivationKeyFromSettings);
+$('#btn-settings-copy-system-code').addEventListener('click', copyActivationSystemCodeFromSettings);
 
 $('#btn-reload-plugins').addEventListener('click', async () => {
   const r = await api.reload_plugins();

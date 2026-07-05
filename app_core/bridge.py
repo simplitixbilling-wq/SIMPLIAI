@@ -1,11 +1,10 @@
-"""Pywebview JS API bridge — exposes backend to the web frontend."""
+"""Pywebview JS API bridge - exposes backend to the web frontend."""
 
 import gc
 import base64
 import csv
 import concurrent.futures
 import hashlib
-import hmac
 import io
 import json
 import os
@@ -16,22 +15,24 @@ import tempfile
 import threading
 import textwrap
 import time
-import uuid
-import difflib
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 import pandas as pd
 
 import psutil
 
-from database import ChatDatabase, migrate_json_to_sqlite
-from plugin_manager import PluginManager
-from mcp_manager import MCPManager
-from rag_manager import RAGManager
-from utils import app_data_path
-from memory_optimizer import MemoryOptimizer
-from metrics import get_metrics
+from app_core.activation_manager import ActivationManager
+from app_core.database import ChatDatabase, migrate_json_to_sqlite
+from app_core.plugin_manager import PluginManager
+from app_core.mcp_manager import MCPManager
+from app_core.python_analysis_workflow import PythonAnalysisWorkflowRunner
+from app_core.rag_manager import RAGManager
+from app_core.runtime_planner import RuntimePlanner, looks_incomplete
+from app_core.sql_analysis_runner import SQLAnalysisRunner
+from app_core.security_utils import validate_restricted_python_snippet
+from app_core.utils import app_data_path
+from app_core.memory_optimizer import MemoryOptimizer
+from app_core.metrics import get_metrics
 
 try:
     from llama_cpp import Llama
@@ -41,7 +42,7 @@ except ImportError:
 import requests  # For Ollama health check
 
 
-# ── Ollama HTTP backend (drop-in replacement for Llama) ─────────
+# -- Ollama HTTP backend (drop-in replacement for Llama) ---------
 class OllamaModel:
     """Wraps Ollama's REST API to match the llama_cpp.Llama interface
     so the rest of Bridge works unchanged."""
@@ -229,10 +230,9 @@ class Bridge:
 
     TRIAL_DAYS = 30
     PASSKEY_ENV = "SIMPLIAI_PASSKEY"
-    DEFAULT_PASSKEY = "SIMPLIAI-FULL-ACCESS"
 
     def __init__(self):
-        # ── State ──────────────────────────────────────────────
+        # -- State ----------------------------------------------
         # Chat state
         self.chats: dict = {}
         self.current_chat_id: str | None = None
@@ -271,7 +271,7 @@ class Bridge:
         self.app_settings: dict = {}
         self.chat_system_prompts: dict = {}
         self.web_search_enabled: bool = False
-        self._web_search_cache: dict = {}       # session cache: query → (context, sources)
+        self._web_search_cache: dict = {}       # session cache: query  -> (context, sources)
         self.current_theme: str = "Dark"
         self.attached_image: str | None = None
         self.plugin_commands: dict = {}  # '/cmd' -> {handler, plugin, description}
@@ -300,18 +300,28 @@ class Bridge:
         # Dirty flag: set True whenever chat data changes; cleared by auto-save
         self._chats_dirty: bool = False
 
-        # ── Initialize ─────────────────────────────────────────
+        # -- Initialize -----------------------------------------
         self.gpu_info = self._detect_gpu_info()
         self._build_config()
         self._load_model_configs()
         self._load_app_settings()
+        self.activation_manager = ActivationManager(
+            app_settings=self.app_settings,
+            persist_settings=lambda settings: self.chat_db.set_kv("app_settings", settings),
+            app_data_dir=app_data_path(""),
+            trial_days=self.TRIAL_DAYS,
+            passkey_env=self.PASSKEY_ENV,
+        )
+        self.sql_analysis_runner = SQLAnalysisRunner(self)
+        self.python_analysis_workflow = PythonAnalysisWorkflowRunner(self)
 
-        # ── Memory optimizer (virtual RAM + watchdog) ──────────
+        # -- Memory optimizer (virtual RAM + watchdog) ----------
         self.mem_optimizer = MemoryOptimizer(
             system_ram_gb=self.system_ram,
             gpu_info=self.gpu_info,
             emit_fn=lambda ev, d: self._emit(ev, d),
         )
+        self.runtime_planner = RuntimePlanner(self.system_ram, self.gpu_info)
         self.mem_optimizer.start_watchdog(interval=3.0)
         self._initialize_activation_state()
         self._load_chats()
@@ -321,7 +331,7 @@ class Bridge:
         self._init_tool_permission()
         self._start_auto_save_loop()
 
-    # ── JS helper: emit event to frontend ──────────────────────
+    # -- JS helper: emit event to frontend ----------------------
 
     def _emit(self, event: str, data=None):
         """Send event to JS frontend."""
@@ -345,7 +355,7 @@ class Bridge:
         """Emit app status text for top-right status bar in web UI."""
         self._emit("app_status", {"text": text})
 
-    # ── AI Tool-Calling Infrastructure ─────────────────────────
+    # -- AI Tool-Calling Infrastructure -------------------------
 
     _TOOL_CALL_RE = re.compile(
         r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -388,7 +398,7 @@ class Bridge:
             else:
                 lines = ["\n\nUPLOADED FILES INFO:"]
                 for i, uf in enumerate(self.uploaded_files):
-                    lines.append(f"  File {i+1}: {uf['name']} → {uf['path']}")
+                    lines.append(f"  File {i+1}: {uf['name']}  -> {uf['path']}")
                 lines.append(
                     "When using /code, these variables are pre-set:\n"
                     "  UPLOADED_FILE = path of first uploaded file\n"
@@ -426,13 +436,13 @@ class Bridge:
             + "\n".join(tools) + "\n\n"
             f"The current user's home directory is: {_user_home}\n\n"
             "Examples:\n"
-            f'  User: "list files in my Downloads" → <tool_call>{{"tool": "/ls", "args": "/ls {_user_home}\\\\Downloads"}}</tool_call>\n'
-            f'  User: "sort the Downloads folder" → <tool_call>{{"tool": "/sort", "args": "/sort {_user_home}\\\\Downloads"}}</tool_call>\n'
-            f'  User: "find PDFs in Documents" → <tool_call>{{"tool": "/find", "args": "/find {_user_home}\\\\Documents *.pdf"}}</tool_call>\n'
-            '  User: "how big is C drive" → <tool_call>{"tool": "/size", "args": "/size C:\\\\"}</tool_call>\n'
-            '  User: "what is 15% of 4800?" → <tool_call>{"tool": "/code", "args": "/code print(4800 * 0.15)"}</tool_call>\n'
-            '  User: "generate fibonacci up to 100" → <tool_call>{"tool": "/code", "args": "/code\\na, b = 0, 1\\nwhile a <= 100:\\n    print(a)\\n    a, b = b, a + b"}</tool_call>\n'
-            '  User: "extract this PDF to CSV" → <tool_call>{"tool": "/code", "args": "/code\\nimport pandas as pd\\ntext = open(UPLOADED_TEXT).read()\\nlines = [l.strip() for l in text.splitlines() if l.strip()]\\n# parse lines into structured data...\\ndf = pd.DataFrame(data)\\ndf.to_csv(\'extracted.csv\', index=False)\\nprint(df.to_string())"}</tool_call>\n\n'
+            f'  User: "list files in my Downloads"  -> <tool_call>{{"tool": "/ls", "args": "/ls {_user_home}\\\\Downloads"}}</tool_call>\n'
+            f'  User: "sort the Downloads folder"  -> <tool_call>{{"tool": "/sort", "args": "/sort {_user_home}\\\\Downloads"}}</tool_call>\n'
+            f'  User: "find PDFs in Documents"  -> <tool_call>{{"tool": "/find", "args": "/find {_user_home}\\\\Documents *.pdf"}}</tool_call>\n'
+            '  User: "how big is C drive"  -> <tool_call>{"tool": "/size", "args": "/size C:\\\\"}</tool_call>\n'
+            '  User: "what is 15% of 4800?"  -> <tool_call>{"tool": "/code", "args": "/code print(4800 * 0.15)"}</tool_call>\n'
+            '  User: "generate fibonacci up to 100"  -> <tool_call>{"tool": "/code", "args": "/code\\na, b = 0, 1\\nwhile a <= 100:\\n    print(a)\\n    a, b = b, a + b"}</tool_call>\n'
+            '  User: "extract this PDF to CSV"  -> <tool_call>{"tool": "/code", "args": "/code\\nimport pandas as pd\\ntext = open(UPLOADED_TEXT).read()\\nlines = [l.strip() for l in text.splitlines() if l.strip()]\\n# parse lines into structured data...\\ndf = pd.DataFrame(data)\\ndf.to_csv(\'extracted.csv\', index=False)\\nprint(df.to_string())"}</tool_call>\n\n'
             "Rules:\n"
             "- ONLY use <tool_call> when the user clearly wants a computation, file/system action, or data task.\n"
             "- For normal questions, just answer directly without tool calls.\n"
@@ -562,11 +572,11 @@ class Bridge:
         context = "\n".join(lines) if lines else "No results found."
         return context, sources
 
-    # ── Web search helpers ────────────────────────────────────
+    # -- Web search helpers ------------------------------------
 
     @staticmethod
     def _is_safe_url(url: str) -> bool:
-        """SSRF protection — block internal / private network URLs."""
+        """SSRF protection - block internal / private network URLs."""
         try:
             import ipaddress
             from urllib.parse import urlparse as _up
@@ -589,7 +599,7 @@ class Bridge:
                     if ip.is_private or ip.is_loopback or ip.is_reserved:
                         return False
             except (socket.gaierror, ValueError):
-                pass  # DNS failure — allow, will fail on actual request
+                pass  # DNS failure - allow, will fail on actual request
             return True
         except Exception:
             return False
@@ -608,7 +618,7 @@ class Bridge:
         # Fallback: break at last space to avoid mid-word cut
         last_space = truncated.rfind(" ", max(0, len(truncated) - 60))
         if last_space > 0:
-            return truncated[:last_space] + "…"
+            return truncated[:last_space] + "..."
         return truncated
 
     def _fetch_web_excerpt(self, url: str, query: str, max_chars: int = 800) -> str:
@@ -645,7 +655,7 @@ class Bridge:
 
             query_terms = [t.lower() for t in re.findall(r"\b\w{3,}\b", query)]
 
-            # Score candidates — paragraphs, list items, table rows, headings
+            # Score candidates - paragraphs, list items, table rows, headings
             candidates = []
             for block in soup.find_all(["p", "li", "td", "th", "article",
                                         "main", "section", "h1", "h2", "h3",
@@ -686,7 +696,7 @@ class Bridge:
             print(f"[WEB] Excerpt error for {url}: {type(e).__name__}")
             return ""
 
-    # ── URL scraping for Agent mode ────────────────────────────
+    # -- URL scraping for Agent mode ----------------------------
 
     _URL_PATTERN = re.compile(
         r'https?://[^\s<>"\')\]]+', re.IGNORECASE)
@@ -708,7 +718,7 @@ class Bridge:
             return {"error": f"Scraping failed: {type(e).__name__}: {e}"}
 
     def _scrape_page(self, url: str, max_chars: int = 0) -> dict:
-        """Full page scraper — extracts text, tables, and metadata.
+        """Full page scraper - extracts text, tables, and metadata.
         If max_chars is 0, uses a dynamic limit based on context window."""
         import requests
         from bs4 import BeautifulSoup
@@ -743,7 +753,7 @@ class Bridge:
                          "button", "input"]):
             tag.decompose()
 
-        # ── Extract tables ──
+        # -- Extract tables --
         tables_md = []
         for table in soup.find_all("table"):
             rows = []
@@ -768,7 +778,7 @@ class Bridge:
             # Remove table from soup so it doesn't appear in body text too
             table.decompose()
 
-        # ── Extract main body text ──
+        # -- Extract main body text --
         body_parts = []
         for block in soup.find_all(["p", "li", "h1", "h2", "h3", "h4",
                                      "h5", "h6", "blockquote", "pre",
@@ -781,12 +791,12 @@ class Bridge:
                     level = int(tag_name[1])
                     text = "#" * level + " " + text
                 elif tag_name == "li":
-                    text = "• " + text
+                    text = "* " + text
                 body_parts.append(text)
 
         body_text = "\n".join(body_parts)
 
-        # ── Combine tables + body text within budget ──
+        # -- Combine tables + body text within budget --
         tables_text = ""
         if tables_md:
             tables_text = "\n\n### Extracted Tables\n\n" + "\n\n".join(tables_md)
@@ -830,7 +840,7 @@ class Bridge:
         cleaned = Bridge._URL_PATTERN.sub("", text)
         return " ".join(cleaned.split()).strip()
 
-    # ── System detection ───────────────────────────────────────
+    # -- System detection ---------------------------------------
 
     def _get_torch_module(self):
         if self._torch_unavailable:
@@ -925,7 +935,7 @@ class Bridge:
                            "n_threads": max(10, (os.cpu_count() or 10) - 2),
                            "max_tokens": 2048}
 
-    # ── Data loading ───────────────────────────────────────────
+    # -- Data loading -------------------------------------------
 
     def _load_model_configs(self):
         self.model_configs = self.chat_db.get_kv("model_configs", {})
@@ -970,153 +980,44 @@ class Bridge:
         except Exception as dbg_err:
             print(f"[AI-DEBUG] {stage}: <debug log error: {dbg_err}>")
 
-    def _utc_now_iso(self) -> str:
-        return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-    def _parse_iso_datetime(self, value):
-        try:
-            raw = str(value or "").strip()
-            if not raw:
-                return None
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
     def _activation_secret(self) -> str:
-        return str(os.environ.get(self.PASSKEY_ENV, self.DEFAULT_PASSKEY)).strip()
+        return self.activation_manager.activation_secret()
 
     def _activation_machine_hint(self) -> str:
-        return f"{uuid.getnode()}:{os.environ.get('COMPUTERNAME', '')}"
+        return self.activation_manager.activation_machine_hint()
 
     def _activation_system_code(self) -> str:
         """Short stable code derived from local machine identity."""
-        raw = self._activation_machine_hint().encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()[:12].upper()
+        return self.activation_manager.activation_system_code()
 
     def _build_machine_bound_key(self, system_code: str) -> str:
-        secret = self._activation_secret().encode("utf-8")
-        msg = str(system_code or "").strip().upper().encode("utf-8")
-        digest = hmac.new(secret, msg, hashlib.sha256).hexdigest()[:24].upper()
-        return f"{str(system_code).strip().upper()}-{digest}"
+        return self.activation_manager.build_machine_bound_key(system_code)
 
     def _is_valid_activation_key(self, entered_key: str) -> bool:
-        expected = self._build_machine_bound_key(self._activation_system_code())
-        provided = str(entered_key or "").strip().upper()
-        return bool(provided and hmac.compare_digest(provided, expected))
+        return self.activation_manager.is_valid_activation_key(entered_key)
 
     def _activation_signature(self, first_opened_at: str, activated_at: str) -> str:
-        payload = f"{first_opened_at}|{activated_at}|{self._activation_machine_hint()}|{self._activation_secret()}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return self.activation_manager.activation_signature(first_opened_at, activated_at)
 
     def _activation_store_path(self) -> str:
         """Persistent activation file in user profile (survives app folder delete)."""
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        folder = os.path.join(base, "SIMPLIAI")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "activation_state.json")
+        return self.activation_manager.activation_store_path()
 
     def _load_activation_store(self) -> dict:
-        path = self._activation_store_path()
-        try:
-            if not os.path.exists(path):
-                return {}
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        return self.activation_manager.load_activation_store()
 
     def _save_activation_store(self, payload: dict):
-        path = self._activation_store_path()
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload or {}, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[ACTIVATION] Could not write activation store: {e}")
+        self.activation_manager.save_activation_store(payload)
 
     def _initialize_activation_state(self):
         """Persist first-open timestamp and validate existing activation record."""
-        changed = False
-        if not isinstance(self.app_settings, dict):
-            self.app_settings = {}
-            changed = True
-
-        # Prefer user-profile activation state so deleting app folder won't reset trial.
-        persisted = self._load_activation_store()
-
-        first_opened_at = str(persisted.get("trial_first_opened_at", "")).strip()
-        if not first_opened_at:
-            first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip()
-        if not first_opened_at:
-            first_opened_at = self._utc_now_iso()
-            changed = True
-        self.app_settings["trial_first_opened_at"] = first_opened_at
-
-        activation = persisted.get("activation", {}) if isinstance(persisted.get("activation", {}), dict) else {}
-        if not activation:
-            activation = self.app_settings.get("activation", {})
-        if not isinstance(activation, dict):
-            activation = {"activated": False}
-            changed = True
-        elif activation.get("activated"):
-            first_opened = first_opened_at
-            activated_at = str(activation.get("activated_at", "")).strip()
-            sig = str(activation.get("sig", "")).strip()
-            expected = self._activation_signature(first_opened, activated_at) if first_opened and activated_at else ""
-            if not expected or not sig or not hmac.compare_digest(sig, expected):
-                activation = {"activated": False}
-                changed = True
-
-        self.app_settings["activation"] = activation
-
-        persisted_payload = {
-            "trial_first_opened_at": first_opened_at,
-            "activation": activation,
-        }
-        if persisted_payload != persisted:
-            self._save_activation_store(persisted_payload)
-
-        if changed:
-            self.chat_db.set_kv("app_settings", self.app_settings)
+        self.activation_manager.initialize()
 
     def _get_activation_status(self) -> dict:
-        first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip()
-        first_dt = self._parse_iso_datetime(first_opened_at)
-        if not first_dt:
-            first_opened_at = self._utc_now_iso()
-            self.app_settings["trial_first_opened_at"] = first_opened_at
-            self.chat_db.set_kv("app_settings", self.app_settings)
-            first_dt = self._parse_iso_datetime(first_opened_at)
-
-        now_dt = datetime.now(timezone.utc)
-        days_used = max(0, (now_dt - first_dt).days) if first_dt else 0
-        is_trial_active = days_used < self.TRIAL_DAYS
-        days_left = max(0, self.TRIAL_DAYS - days_used)
-
-        activation = self.app_settings.get("activation", {})
-        is_activated = False
-        activated_at = ""
-        if isinstance(activation, dict) and activation.get("activated"):
-            activated_at = str(activation.get("activated_at", "")).strip()
-            sig = str(activation.get("sig", "")).strip()
-            expected = self._activation_signature(first_opened_at, activated_at) if first_opened_at and activated_at else ""
-            is_activated = bool(expected and sig and hmac.compare_digest(sig, expected))
-
-        return {
-            "trial_days_total": self.TRIAL_DAYS,
-            "first_opened_at": first_opened_at,
-            "days_used": days_used,
-            "days_left": days_left,
-            "is_trial_active": is_trial_active,
-            "is_activated": is_activated,
-            "activated_at": activated_at,
-            "requires_passkey": (not is_activated and not is_trial_active),
-            "system_code": self._activation_system_code(),
-        }
+        return self.activation_manager.status()
 
     def _has_full_access(self) -> bool:
-        status = self._get_activation_status()
-        return bool(status.get("is_trial_active") or status.get("is_activated"))
+        return self.activation_manager.has_full_access()
 
     def get_activation_status(self):
         """Return current trial/license status for frontend activation UI."""
@@ -1124,26 +1025,7 @@ class Bridge:
 
     def activate_full_access(self, passkey: str):
         """Activate full access after trial expiration using passkey."""
-        provided = str(passkey or "").strip().upper()
-        if not provided:
-            return {"ok": False, "error": "Passkey is required"}
-        if not self._is_valid_activation_key(provided):
-            return {"ok": False, "error": "Invalid passkey"}
-
-        first_opened_at = str(self.app_settings.get("trial_first_opened_at", "")).strip() or self._utc_now_iso()
-        activated_at = self._utc_now_iso()
-        self.app_settings["trial_first_opened_at"] = first_opened_at
-        self.app_settings["activation"] = {
-            "activated": True,
-            "activated_at": activated_at,
-            "sig": self._activation_signature(first_opened_at, activated_at),
-        }
-        self.chat_db.set_kv("app_settings", self.app_settings)
-        self._save_activation_store({
-            "trial_first_opened_at": first_opened_at,
-            "activation": self.app_settings["activation"],
-        })
-        return {"ok": True, "status": self._get_activation_status()}
+        return self.activation_manager.activate_full_access(passkey)
 
     def _load_chats(self):
         self.chats = self.chat_db.load_all_chats()
@@ -1283,6 +1165,9 @@ class Bridge:
 
         whitelist = allowed_imports or ["math", "statistics", "random", "re", "json"]
         safe_imports = [str(x).strip() for x in whitelist if str(x).strip()]
+        policy_error = validate_restricted_python_snippet(snippet, safe_imports)
+        if policy_error:
+            return {"error": f"Unsafe code blocked by policy: {policy_error}"}
 
         runner = r'''
 import json
@@ -1384,7 +1269,7 @@ except Exception:
 
         threading.Thread(target=_loop, daemon=True).start()
 
-    # ── Model scanning ─────────────────────────────────────────
+    # -- Model scanning -----------------------------------------
 
     def get_models(self):
         """Return list of available models (local GGUF + Ollama)."""
@@ -1401,7 +1286,7 @@ except Exception:
                 size_gb = round(f.stat().st_size / (1024 ** 3), 1)
             except Exception:
                 size_gb = 0
-            label = f"{name} ({quant} · {size_gb}GB)" if quant else f"{name} ({size_gb}GB)"
+            label = f"{name} ({quant} * {size_gb}GB)" if quant else f"{name} ({size_gb}GB)"
             self.model_map[label] = str(f)
             result.append({"label": label, "path": str(f),
                            "quant": quant, "size_gb": size_gb,
@@ -1426,7 +1311,7 @@ except Exception:
             self._status(f"Selected model: {Path(self.model_path).name}")
         return {"ok": True, "path": self.model_path}
 
-    # ── Model loading ──────────────────────────────────────────
+    # -- Model loading ------------------------------------------
 
     def load_model(self, *_args, **_kwargs):
         """Load the selected model. Returns immediately; sends events."""
@@ -1444,7 +1329,7 @@ except Exception:
         """Load model in background thread.
         
         Context Window Control:
-        - User controls n_ctx via UI: Model Settings → Context Window selector
+        - User controls n_ctx via UI: Model Settings  -> Context Window selector
         - Options: default, 1024, 2048, 4096, 8192, 16384, 32768, 65536, or "Max"
         - Default values based on available RAM (65536 for 32GB+, down to 8192 for <8GB)
         - "Max" (-1) uses model's native trained context (auto-detected)
@@ -1461,7 +1346,7 @@ except Exception:
                                             "progress": p})
                 time.sleep(0.2)
 
-            # ── Ollama backend ──
+            # -- Ollama backend --
             if self.model_path.startswith("ollama://"):
                 ollama_name = self.model_path.replace("ollama://", "")
                 if not OllamaModel.is_available():
@@ -1474,7 +1359,7 @@ except Exception:
                     self._active_backend = "ollama"
                     print(f"[MODEL] Loaded Ollama model: {ollama_name}, n_ctx={n_ctx}")
 
-            # ── Local GGUF backend ──
+            # -- Local GGUF backend --
             else:
                 if Llama is None:
                     raise RuntimeError("llama-cpp-python not installed")
@@ -1497,12 +1382,12 @@ except Exception:
                 else:
                     n_ctx = 8192     # 8K minimum for constrained systems (was 2048)
                 
-                # User can override via UI → Model Settings → Context Window
+                # User can override via UI  -> Model Settings  -> Context Window
                 user_n_ctx = per_model.get("n_ctx", None)
                 if user_n_ctx == -1:
-                    # "Max" — use model's native context limit (0 = auto-detect in llama.cpp)
+                    # "Max" - use model's native context limit (0 = auto-detect in llama.cpp)
                     n_ctx = 0
-                    print(f"[MODEL] User selected 'Max' context — using model's native limit (auto-detect)")
+                    print(f"[MODEL] User selected 'Max' context - using model's native limit (auto-detect)")
                 elif user_n_ctx and int(user_n_ctx) > 0:
                     n_ctx = int(user_n_ctx)
                     print(f"[MODEL] User selected n_ctx={n_ctx} from UI settings")
@@ -1520,7 +1405,7 @@ except Exception:
                 except Exception:
                     pass
 
-                # ── Memory-optimised params (mmap + n_batch only) ──
+                # -- Memory-optimised params (mmap + n_batch only) --
                 opt = self.mem_optimizer.optimal_llama_params(
                     base_n_ctx=n_ctx,
                     base_n_threads=n_threads,
@@ -1614,7 +1499,7 @@ except Exception:
                 "n_ctx": self.actual_n_ctx,
                 "backend": getattr(self, '_active_backend', 'llama_cpp')}
 
-    # ── Chat CRUD ──────────────────────────────────────────────
+    # -- Chat CRUD ----------------------------------------------
 
     def get_chats(self):
         """Return sorted list of chat ids."""
@@ -1658,7 +1543,7 @@ except Exception:
         if self.uploaded_file_path and os.path.isfile(self.uploaded_file_path):
             ext = os.path.splitext(self.uploaded_file_path)[1].lower()
             if ext == ".pdf":
-                # Async extraction — don't block chat switch for large PDFs
+                # Async extraction - don't block chat switch for large PDFs
                 threading.Thread(
                     target=self._load_pdf_background,
                     args=(self.uploaded_file_path,),
@@ -1671,7 +1556,7 @@ except Exception:
                 self.uploaded_content = self._extract_text_from_file(
                     self.uploaded_file_path)
         elif self.uploaded_file_name:
-            # File path gone — clear stale reference
+            # File path gone - clear stale reference
             self.uploaded_file_name = None
             self.uploaded_file_path = None
 
@@ -1950,7 +1835,7 @@ except Exception:
             headers = rows[0]
             data_rows = rows[2:]
         else:
-            # No separator row — first row is still the header
+            # No separator row - first row is still the header
             headers = rows[0]
             data_rows = rows[1:]
 
@@ -2197,7 +2082,7 @@ except Exception:
         # 2) Bullet / numbered list items
         list_items = []
         for line in lines:
-            clean = re.sub(r"^[\-\*•]\s*", "", line)
+            clean = re.sub(r"^[\-\**]\s*", "", line)
             clean = re.sub(r"^\d+[.)]+\s*", "", clean)
             if clean != line:  # line had a list prefix
                 list_items.append(clean)
@@ -2221,7 +2106,7 @@ except Exception:
                         writer.writerow(parsed_h)
                         writer.writerows(parsed_r)
                         return
-            # Final fallback — export as role/content
+            # Final fallback - export as role/content
             writer.writerow(["role", "content"])
             for row in rows:
                 writer.writerow([row.get('role', ''), row.get('content', '')])
@@ -2338,14 +2223,14 @@ except Exception:
         ext = os.path.splitext(self.uploaded_file_name or "")[1].lower()
         df = None
 
-        # Tabular files → read directly
+        # Tabular files  -> read directly
         if ext in (".csv", ".xlsx", ".xls", ".tsv"):
             try:
                 df = self._load_tabular_df(src)
             except Exception:
                 pass
 
-        # PDF → use PyMuPDF table extraction for structured data
+        # PDF  -> use PyMuPDF table extraction for structured data
         if df is None and ext == ".pdf":
             try:
                 import fitz
@@ -2371,7 +2256,7 @@ except Exception:
             except Exception:
                 pass
 
-        # PDF / text fallback → parse from extracted text
+        # PDF / text fallback  -> parse from extracted text
         if df is None:
             raw = None
             # 1) Pre-extracted text file (set during upload flow)
@@ -2383,7 +2268,7 @@ except Exception:
             elif ext in (".txt", ".md", ".log"):
                 with open(src, "r", encoding="utf-8", errors="replace") as fh:
                     raw = fh.read()
-            # 3) Other formats — extract text directly
+            # 3) Other formats - extract text directly
             else:
                 try:
                     raw = self._extract_text_from_file(src)
@@ -2507,7 +2392,7 @@ except Exception:
             traceback.print_exc()
             return {"error": str(e)}
 
-    # ── Instruction Templates ──────────────────────────────────
+    # -- Instruction Templates ----------------------------------
 
     def get_instruction_templates(self):
         """Return saved instruction templates."""
@@ -2572,8 +2457,8 @@ except Exception:
                     out.append(f"{section_idx}. {section}")
                     continue
 
-                if ln.startswith(("*", "-", "•")):
-                    out.append(f"* {ln.lstrip('*-• ').strip()}")
+                if ln.startswith(("*", "-", "*")):
+                    out.append(f"* {ln.lstrip('*-* ').strip()}")
                     continue
 
                 if section_idx == 0:
@@ -2777,7 +2662,7 @@ except Exception:
                 except Exception:
                     pass
 
-            # ── Auto-detect and scrape URLs in user message ──
+            # -- Auto-detect and scrape URLs in user message --
             scraped_context = ""
             urls_in_text = self._extract_urls_from_text(text)
             if urls_in_text:
@@ -2842,7 +2727,7 @@ except Exception:
                 )
                 web_system = "\n".join(system_parts)
 
-                # Dynamic context cap — leave room for system + user + response
+                # Dynamic context cap - leave room for system + user + response
                 max_web_chars = max(2000, int(self.actual_n_ctx * 3.5 * 0.40))
                 web_ctx = (context or "")[:max_web_chars]
                 prompt = self._build_chat_prompt(
@@ -2861,9 +2746,9 @@ except Exception:
                 print(f"[AGENT-WEB] prompt_tokens={prompt_tokens}, "
                       f"avail={avail_tokens}, gen_tokens={gen_tokens}")
                 if prompt_tokens >= self.actual_n_ctx - 32:
-                    # Prompt overflows — trim web context and retry
+                    # Prompt overflows - trim web context and retry
                     overflow = prompt_tokens - (self.actual_n_ctx - 256)
-                    trim_chars = overflow * 4  # rough token→char
+                    trim_chars = overflow * 4  # rough token -> char
                     web_ctx = web_ctx[:max(500, len(web_ctx) - trim_chars)]
                     prompt = self._build_chat_prompt(
                         system=web_system,
@@ -2906,7 +2791,7 @@ except Exception:
             system_parts.append("\nAnswer directly and concisely. Do NOT write code unless explicitly asked. Provide actual answers, facts, and analysis.")
             system_msg = "\n".join(system_parts)
 
-            # ── Determine if knowledge base is too large for a single pass ──
+            # -- Determine if knowledge base is too large for a single pass --
             # Floor of 6000 chars ensures small-context models can still process
             # a reasonable number of documents per batch.
             max_rag_chars = max(6000, int(self.actual_n_ctx * 3.5 * 0.6))
@@ -2914,7 +2799,7 @@ except Exception:
             # Split knowledge.md by source document
             doc_sections = self._split_knowledge_by_source(knowledge_md) if knowledge_md else []
 
-            # ── Inject uploaded PDF/document if attached via Chat 📎 button ──
+            # -- Inject uploaded PDF/document if attached via Chat [image] button --
             # Always inject even when a RAG knowledge base is also active so the
             # model can reason over both the reference KB and the uploaded file.
             uploaded_doc_pages = self.uploaded_pages  # page-level chunks
@@ -3013,7 +2898,7 @@ except Exception:
                   f"budget={max_rag_chars} chars")
 
             if not needs_batching:
-                # ── Single-pass mode (small knowledge base or no RAG) ──
+                # -- Single-pass mode (small knowledge base or no RAG) --
                 rag_context = ""
                 if agent_rag_database and knowledge_md:
                     # #2 Two-stage retrieval: vector search narrows context
@@ -3056,7 +2941,7 @@ except Exception:
                 if self.stop_generation_flag:
                     return {"error": "Generation stopped by user", "stopped": True}
             else:
-                # ── Batched extraction mode (large knowledge base) ──
+                # -- Batched extraction mode (large knowledge base) --
                 # Process documents in batches that fit within context,
                 # accumulate partial results, then combine.
                 print(f"[AGENT] Batched RAG extraction: {len(doc_sections)} documents, {total_chars} chars total")
@@ -3115,7 +3000,7 @@ except Exception:
                     )
                 }
 
-            # ── Schema-first path for csv_json format ──
+            # -- Schema-first path for csv_json format --
             _schema_parsed_json: dict | list | None = None
             # Generic schema works for any table-like task.
             # Templates can supply a precise schema via the json_schema field;
@@ -3161,7 +3046,7 @@ except Exception:
                 if self.stop_generation_flag:
                     return {"error": "Generation stopped by user", "stopped": True}
 
-            # ── Create output file if requested ──
+            # -- Create output file if requested --
             result = {"text": ai_text, "context_trimmed": bool(self._agent_context_trimmed)}
             print(f"[AGENT] output_format={output_format!r}, creating file: {output_format not in ('none', '', None)}")
             if output_format and output_format not in ("none", ""):
@@ -3194,7 +3079,7 @@ except Exception:
             self.generation_in_progress = False
             self.stop_generation_flag = False  # Reset stop flag for next run
 
-    # ── Helpers for batched agent RAG extraction ──────────────────
+    # -- Helpers for batched agent RAG extraction ------------------
 
     @staticmethod
     def _split_knowledge_by_source(knowledge_md: str) -> list:
@@ -3521,7 +3406,7 @@ except Exception:
         print("[AGENT] Using direct concatenation (preserve all rows)")
         return "\n\n".join(batch_results)
 
-    # ── Schema-first output helpers ────────────────────────────────────────────
+    # -- Schema-first output helpers --------------------------------------------
 
     @staticmethod
     def _extract_json_from_response(text: str) -> dict | None:
@@ -3692,18 +3577,18 @@ except Exception:
         # Return the first raw attempt for fallback text-based CSV creation
         return raw, None
 
-    # ── #2 Two-stage RAG retrieval ──────────────────────────────────────────
+    # -- #2 Two-stage RAG retrieval ------------------------------------------
 
     def _retrieve_rag_context(self, rag_database: str, query: str,
                               knowledge_md: str, max_chars: int) -> str:
         """Two-stage RAG retrieval for agent_chat.
 
-        Stage 1 — vector retrieval (TF-IDF + BM25 + keyword):
+        Stage 1 - vector retrieval (TF-IDF + BM25 + keyword):
             If the RAG database is indexed, use ``rag_manager.retrieve()`` to
             find the top-K most relevant chunks for the current query.  This
             avoids dumping the entire knowledge.md into the prompt.
 
-        Stage 2 — fallback:
+        Stage 2 - fallback:
             If the database is not loaded / indexed yet (e.g. first run) or
             retrieval returns nothing, fall back to the full knowledge.md
             text truncated to ``max_chars``.
@@ -3713,10 +3598,25 @@ except Exception:
         retrieved_chunks: list = []
         if self.rag_manager and rag_database:
             try:
-                # How many chunks to retrieve — scale with context window
+                # How many chunks to retrieve - scale with context window
                 k = min(12, max(4, self.actual_n_ctx // 512))
-                raw = self.rag_manager.retrieve(rag_database, query, k=k)
-                retrieved_chunks = [c for c, _score in raw if c.strip()]
+                if hasattr(self.rag_manager, "retrieve_detailed"):
+                    raw = self.rag_manager.retrieve_detailed(rag_database, query, k=k)
+                    retrieved_chunks = []
+                    for item in raw:
+                        chunk = str(item.get("chunk", "") or "").strip()
+                        if not chunk:
+                            continue
+                        source = str(item.get("source", "") or "").strip()
+                        source_idx = item.get("source_chunk_index")
+                        cite = f"[Source: {source}" if source else "[Source: unknown"
+                        if source_idx is not None:
+                            cite += f", chunk {source_idx}"
+                        cite += f", score {float(item.get('score', 0.0)):.3f}]"
+                        retrieved_chunks.append(cite + "\n" + chunk)
+                else:
+                    raw = self.rag_manager.retrieve(rag_database, query, k=k)
+                    retrieved_chunks = [c for c, _score in raw if c.strip()]
                 print(f"[AGENT-RAG] Two-stage retrieval: {len(retrieved_chunks)} "
                       f"chunks retrieved for query ({len(query)} chars)")
             except Exception as e:
@@ -3740,7 +3640,7 @@ except Exception:
         return ("=== KNOWLEDGE BASE ===\n" + ctx
                 + suffix + "\n=== END KNOWLEDGE BASE ===")
 
-    # ── #3 Map-reduce PDF extraction ─────────────────────────────────────
+    # -- #3 Map-reduce PDF extraction -------------------------------------
 
     def _agent_mapreduce_extract(self, system_msg: str, user_text: str,
                                  page_chunks: list, schema_hint: str,
@@ -3759,7 +3659,7 @@ except Exception:
         """
         map_instruction = (
             "Extract ALL data rows visible in the document excerpt below that "
-            "match the required schema.  Output ONLY valid JSON — no prose, no "
+            "match the required schema.  Output ONLY valid JSON - no prose, no "
             "markdown fences.  If no matching rows are present in this excerpt, "
             f"output an empty array: [].\nSchema: {schema_hint}"
         )
@@ -3840,7 +3740,7 @@ except Exception:
             print("[MAP-REDUCE] Map phase returned no records")
             return "", None
 
-        # ── REDUCE: keep all extracted rows (no aggressive dedup) ──
+        # -- REDUCE: keep all extracted rows (no aggressive dedup) --
         # Prior logic deduped by the first two field values, which can collapse
         # valid transactions when those fields repeat (for example same date).
         # Keep all model-extracted rows and only normalize row numbering below.
@@ -3875,7 +3775,7 @@ except Exception:
               f"(from {len(all_records)} raw)")
         return summary, merged
 
-    # ── #8 Automatic fallback strategy ────────────────────────────────────────
+    # -- #8 Automatic fallback strategy ----------------------------------------
 
     def _agent_with_fallback(self, system_msg: str, user_text: str,
                              extra_context: str,
@@ -3883,22 +3783,22 @@ except Exception:
                              temperature: float = 0.3) -> tuple[str, bool]:
         """Run agent completion with a 3-tier automatic fallback strategy.
 
-        Tier 1 — Full context:
+        Tier 1 - Full context:
             Attempt with the full extra_context (already auto-trimmed by
             _agent_create_completion_safely).
 
-        Tier 2 — Reduced context (50%):
+        Tier 2 - Reduced context (50%):
             If tier 1 returns an empty string, trim extra_context to 50% and
             retry.  Marks fallback=True.
 
-        Tier 3 — Minimal context (task only):
+        Tier 3 - Minimal context (task only):
             If tier 2 also fails, use only the system_msg + user_text with no
             extra_context.  Marks fallback=True.
 
         Returns (result_text, fallback_was_used).
         Guarantees a non-empty string unless the model is not loaded.
         """
-        # Tier 1 — full
+        # Tier 1 - full
         result = self._agent_create_completion_safely(
             system_msg=system_msg,
             user_text=user_text,
@@ -3909,7 +3809,7 @@ except Exception:
         if result:
             return result, False
 
-        # Tier 2 — 50% context
+        # Tier 2 - 50% context
         print("[FALLBACK] Tier 1 returned empty, trying 50% context")
         half_ctx = extra_context[:max(500, len(extra_context) // 2)]
         result = self._agent_create_completion_safely(
@@ -3922,7 +3822,7 @@ except Exception:
         if result:
             return result, True
 
-        # Tier 3 — no context
+        # Tier 3 - no context
         print("[FALLBACK] Tier 2 returned empty, trying minimal context")
         result = self._agent_create_completion_safely(
             system_msg=system_msg,
@@ -3933,9 +3833,9 @@ except Exception:
         )
         return result, True
 
-    # ── End pipeline helpers ─────────────────────────────────────────────────────
+    # -- End pipeline helpers -----------------------------------------------------
 
-    # ── End schema-first helpers ───────────────────────────────────────────────
+    # -- End schema-first helpers -----------------------------------------------
 
     def _agent_chat_create_output(self, ai_text: str, output_format: str,
                                   _parsed_json: dict | list | None = None) -> str:
@@ -4041,7 +3941,7 @@ except Exception:
             instructions, mentioned_rag = self._resolve_rag_mention(instructions)
             agent_rag_database = mentioned_rag
 
-            # File size guard — reject files > 5GB to prevent memory spikes
+            # File size guard - reject files > 5GB to prevent memory spikes
             MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
             for f in files:
                 fsize = f.get("size", 0)
@@ -4106,7 +4006,7 @@ except Exception:
                 if content:
                     pages = f.get("_pages")  # populated by _extract_agent_file_content for PDFs
                     if pages and len(pages) > 1:
-                        # PDF with page-level chunks → use batching pipeline
+                        # PDF with page-level chunks  -> use batching pipeline
                         for pg in pages:
                             pdf_page_sections.append(f"--- FILE: {name} ---\n{pg}\n--- END FILE ---")
                         total_chars = sum(len(p) for p in pages)
@@ -4170,7 +4070,7 @@ except Exception:
                 # Chat-completion layout for instruction-tuned models.
                 # System message = role + rules (from instructions template).
                 # User message  = plain document data + task request.
-                # No bracket markers — prevents model confusing them with template placeholders.
+                # No bracket markers - prevents model confusing them with template placeholders.
                 import re as _re_src
                 _doc_num = [0]
                 def _tag_doc(m):
@@ -4194,12 +4094,12 @@ except Exception:
                 # Keep a plain-text prompt for token-count estimation only
                 prompt = f"{_chat_system}\n\n{_chat_user}"
             else:
-                # Data analysis / structured output — role/task already defined in instructions template
+                # Data analysis / structured output - role/task already defined in instructions template
                 prompt = f"""Follow the instructions below and provide ACTUAL RESULTS directly from the uploaded files.
 
 RULES:
 - Do NOT write code, scripts, or programming examples
-- Do NOT suggest how to analyze — actually DO the analysis
+- Do NOT suggest how to analyze - actually DO the analysis
 - Provide real computed numbers, totals, comparisons, and findings
 - **MUST format all results as markdown tables** (| Header | Header |)
 - Show actual data rows, not placeholder examples
@@ -4212,7 +4112,7 @@ Instructions: {instructions}
 
 {self._get_prompt_ending(output_format)}"""
 
-            # ── Batched PDF processing (large multi-page PDFs) ──
+            # -- Batched PDF processing (large multi-page PDFs) --
             if pdf_page_sections:
                 max_batch_chars = max(6000, int(self.actual_n_ctx * 3.5 * 0.6))
                 total_pdf_chars = sum(len(s) for s in pdf_page_sections)
@@ -4390,7 +4290,7 @@ Validation rules:
                             f"Here are the source documents:\n\n"
                             f"{_clean_file_data}\n\n"
                             f"{rag_section}"
-                            f"IMPORTANT — previous attempt failed. Fix ALL issues:\n{fix_block}\n\n"
+                            f"IMPORTANT - previous attempt failed. Fix ALL issues:\n{fix_block}\n\n"
                             f"{self._get_prompt_ending(output_format)}"
                         )
                         _chat_messages = [
@@ -4545,10 +4445,10 @@ Validation rules:
                     _uniq = set(_words)
                     _most_common_word, _wc = _Counter(_words).most_common(1)[0]
                     if _wc / len(_words) > 0.6 and len(_most_common_word) > 3:
-                        print(f"[PROCESS] Heading-repeat loop on attempt {attempt} — "
+                        print(f"[PROCESS] Heading-repeat loop on attempt {attempt} - "
                               f"{_most_common_word!r} appears {_wc}/{len(_words)} times, retrying")
                         review_reason = ("Response is a repeated heading/word loop. "
-                                         "Generate actual content — letter text, table rows, or analysis.")
+                                         "Generate actual content - letter text, table rows, or analysis.")
                         review_missing = ["Actual output content (not a repeated word or heading)"]
                         ai_response = ""
                         continue
@@ -4562,7 +4462,7 @@ Validation rules:
                 # Detect prompt echo loop: model repeated the format instruction
                 _ECHO_PHRASE = "Provide the complete analysis results below as structured markdown tables"
                 if ai_response.count(_ECHO_PHRASE) > 3:
-                    print(f"[PROCESS] Echo loop detected on attempt {attempt} — response is prompt repetition, retrying")
+                    print(f"[PROCESS] Echo loop detected on attempt {attempt} - response is prompt repetition, retrying")
                     review_reason = "Response is a repetition of the format instruction. Generate actual analysis data."
                     review_missing = ["Actual analysis content (tables with real data, not repeated instructions)"]
                     ai_response = ""
@@ -4590,10 +4490,10 @@ Validation rules:
                         print(f"[PROCESS] Stripped FILE markers from response, salvaged {len(_cleaned)} chars")
                         ai_response = _cleaned
                     elif _resp_file_count > 1:
-                        print(f"[PROCESS] File-context echo on attempt {attempt} — "
+                        print(f"[PROCESS] File-context echo on attempt {attempt} - "
                               f"response has {_resp_file_count} FILE markers and nothing useful after strip, retrying")
                         review_reason = ("Response echoes raw file markers (--- FILE: ...) instead of analysing. "
-                                         "Output ONLY the analysis result — do NOT repeat file names, markers, or raw input.")
+                                         "Output ONLY the analysis result - do NOT repeat file names, markers, or raw input.")
                         review_missing = ["Pure analysis output with no --- FILE: markers or repeated raw input"]
                         ai_response = ""
                         continue
@@ -4606,7 +4506,7 @@ Validation rules:
                     _seen_paras[_p] = _seen_paras.get(_p, 0) + 1
                     if _seen_paras[_p] >= 3:
                         _has_para_repeat = True
-                        print(f"[PROCESS] Paragraph repetition on attempt {attempt} — "
+                        print(f"[PROCESS] Paragraph repetition on attempt {attempt} - "
                               f"block repeated {_seen_paras[_p]}x: {_p[:80]!r}")
                         break
                 if _has_para_repeat:
@@ -4634,12 +4534,12 @@ Validation rules:
                                   f"deduped to {len(ai_response)} chars")
                         else:
                             review_reason = "Response contains identical repeated paragraphs. Each section must appear exactly once."
-                            review_missing = ["Non-repeated content — every compliance note or section appears only once"]
+                            review_missing = ["Non-repeated content - every compliance note or section appears only once"]
                             ai_response = ""
                             continue
                     else:
                         review_reason = "Response contains identical repeated paragraphs. Each section must appear exactly once."
-                        review_missing = ["Non-repeated content — every compliance note or section appears only once"]
+                        review_missing = ["Non-repeated content - every compliance note or section appears only once"]
                         ai_response = ""
                         continue
 
@@ -4664,7 +4564,7 @@ Validation rules:
                         _low_quality = True
 
                     if _low_quality:
-                        print(f"[PROCESS] Low-quality PDF/DOCX draft on attempt {attempt} — retrying")
+                        print(f"[PROCESS] Low-quality PDF/DOCX draft on attempt {attempt} - retrying")
                         review_reason = (
                             "Draft is incomplete or meta-instruction text. "
                             "Produce a complete formal letter only."
@@ -4676,10 +4576,10 @@ Validation rules:
                         ai_response = ""
                         continue
 
-                # Skip compliance review for pdf/docx (letter/document drafting) —
+                # Skip compliance review for pdf/docx (letter/document drafting)  - 
                 # no JSON to validate, review call wastes a full model inference for free-text output
                 if (output_format or "").lower() in ("pdf", "docx"):
-                    print("[PROCESS] PDF/DOCX format — skipping compliance review, accepting output")
+                    print("[PROCESS] PDF/DOCX format - skipping compliance review, accepting output")
                     break
                 ok, review_reason, review_missing = _review_instruction_compliance(instructions, file_data, ai_response)
                 if ok:
@@ -4689,7 +4589,7 @@ Validation rules:
                 # #8 Automatic fallback: if validation keeps failing, degrade
                 # gracefully rather than returning a hard error.
                 print(f"[PROCESS] Compliance validation failed after {MAX_DOC_ATTEMPTS} attempts "
-                      f"— returning best effort result with warning")
+                      f" -  returning best effort result with warning")
                 if not ai_response:
                     # Log all relevant state info to help diagnose the issue
                     print(f"[PROCESS] ERROR DIAGNOSTIC: ai_response is empty after {MAX_DOC_ATTEMPTS} attempts")
@@ -4921,7 +4821,7 @@ Validation rules:
             def _normalize_df(df: "pd.DataFrame", label: str) -> "pd.DataFrame":
                 """Clean common real-world file messiness before SQL ingestion:
                 - Strip whitespace from column names
-                - Rename Unnamed: X columns that have data → col_X
+                - Rename Unnamed: X columns that have data  -> col_X
                 - Drop Unnamed: X columns that are entirely NaN (trailing blank columns)
                 - Drop rows that are entirely NaN (trailing blank rows from Excel)
                 - Normalize all column names to SQL-safe snake_case
@@ -4950,7 +4850,7 @@ Validation rules:
                             num = _re.search(r'\d+', col)
                             safe = f"col_{num.group()}" if num else f"col_{len(new_cols)}"
                             new_cols.append(safe)
-                            cols_renamed.append(f"{col} → {safe}")
+                            cols_renamed.append(f"{col}  -> {safe}")
                     else:
                         new_cols.append(col)
 
@@ -5057,9 +4957,9 @@ Validation rules:
                             except Exception as e:
                                 print(f"[CODE_EXEC] Failed to decode base64 for {name}: {e}")
 
-                    # ── Multi-sheet Excel: register each sheet as a separate DuckDB table ──
+                    # -- Multi-sheet Excel: register each sheet as a separate DuckDB table --
                     if loaded_sheets:
-                        msg = f"[CODE_EXEC] Multi-sheet Excel '{name}': {len(loaded_sheets)} sheets → {', '.join(loaded_sheets.keys())}"
+                        msg = f"[CODE_EXEC] Multi-sheet Excel '{name}': {len(loaded_sheets)} sheets  -> {', '.join(loaded_sheets.keys())}"
                         pipeline_status_messages.append(msg)
                         print(msg)
                         for tname, sdf in loaded_sheets.items():
@@ -5074,7 +4974,7 @@ Validation rules:
                                     sdf[col] = coerced
                             # Size check per sheet
                             if len(sdf) > 100000 or len(sdf.columns) > 100:
-                                msg = f"[CODE_EXEC] Sheet '{tname}' too large ({len(sdf)} rows, {len(sdf.columns)} cols) — skipping"
+                                msg = f"[CODE_EXEC] Sheet '{tname}' too large ({len(sdf)} rows, {len(sdf.columns)} cols) - skipping"
                                 pipeline_status_messages.append(msg)
                                 print(msg)
                                 continue
@@ -5173,9 +5073,9 @@ Validation rules:
             if not files:
                 return {"error": "No files provided for batch processing"}
 
-            # ── Load ALL files into DuckDB tables (just like normal pipeline) ──
+            # -- Load ALL files into DuckDB tables (just like normal pipeline) --
             conn = duckdb.connect(":memory:")
-            dataframes: dict = {}  # table_name → sample DataFrame (for schema)
+            dataframes: dict = {}  # table_name  -> sample DataFrame (for schema)
             duckdb_tables: list = []  # track tables created directly in DuckDB
 
             for f in files:
@@ -5237,7 +5137,7 @@ Validation rules:
                     conn.close()
                     return {"error": f"Failed to load {name}: {str(e)}"}
 
-            # ── Use the same SQL analysis pipeline but with our pre-loaded DuckDB connection ──
+            # -- Use the same SQL analysis pipeline but with our pre-loaded DuckDB connection --
             # _execute_sql_analysis creates its own connection, but since our tables are in
             # `conn`, we pass the sample DataFrames for schema and let SQL gen create queries.
             # Then we execute those queries on our connection with ALL the data.
@@ -5257,1228 +5157,13 @@ Validation rules:
 
     def _execute_sql_analysis(self, dataframes: dict, instructions: str, output_format: str, pipeline_status_messages: list = None, context_block: str = "") -> dict:
         """Generate and execute SQL analysis using DuckDB."""
-        try:
-            import duckdb
-            import pandas as pd
-            from difflib import get_close_matches
-            
-            status_messages = pipeline_status_messages if pipeline_status_messages else []
-            def _debug_status(text: str):
-                status_messages.append(text)
-                print(text)
-
-            def _clean_summary(msgs: list, suffix: str = "") -> str:
-                """Build a user-friendly summary from status_messages.
-                
-                Strips debug/internal tags and keeps only meaningful lines.
-                """
-                clean = []
-                for m in msgs:
-                    # Skip internal debug lines entirely
-                    if any(tag in m for tag in (
-                        "[SQL-DEBUG]", "[CODE_EXEC]", "[DEBUG]",
-                        "clean_sql input", "clean_sql output",
-                        "clean_sql:", "VERIFY COLUMN", "VERIFY TABLE",
-                        "repair_sql", "semantic_review",
-                    )):
-                        continue
-                    # Strip tag prefixes for user-facing lines
-                    line = re.sub(r'^\[(SQL|PYTHON|AGENT)\]\s*', '', m).strip()
-                    if line:
-                        clean.append(line)
-                result = "\n".join(clean) if clean else "Analysis completed."
-                if suffix:
-                    result += "\n\n" + suffix
-                return result
-
-            def _stopped_result() -> dict:
-                _debug_status("[SQL] Stopped by user")
-                return {"error": "Generation stopped by user", "stopped": True}
-
-            msg = "[SQL] Executing SQL-based analysis..."
-            status_messages.append(msg)
-            print(msg)
-
-            if self.stop_generation_flag:
-                return _stopped_result()
-
-            # Final safety normalization: enforce SQL-safe column names for every dataframe
-            # right before DuckDB registration (covers any loader path).
-            normalized_dataframes = {}
-            for table_name, df in dataframes.items():
-                working = df.copy()
-                old_cols = [str(c) for c in working.columns]
-                safe_cols = self._normalize_column_names(old_cols)
-                if old_cols != safe_cols:
-                    working.columns = safe_cols
-                    preview = ", ".join(
-                        f"{o}->{n}" for o, n in list(zip(old_cols, safe_cols))[:8] if o != n
-                    )
-                    if preview:
-                        _debug_status(f"[SQL] Normalized columns in {table_name}: {preview}")
-                normalized_dataframes[table_name] = working
-            dataframes = normalized_dataframes
-            
-            # Create DuckDB connection
-            conn = duckdb.connect(":memory:")
-            
-            # Register dataframes as tables
-            for table_name, df in dataframes.items():
-                conn.register(table_name, df)
-                msg = f"[SQL] Registered table: {table_name}"
-                status_messages.append(msg)
-                print(msg)
-            
-            # Generate SQL code via AI - with FULL schema so AI understands all columns
-            msg = "[SQL] Building complete schema for AI code generation..."
-            status_messages.append(msg)
-            print(msg)
-            # Build schema using actual DuckDB column types (not pandas dtypes)
-            # so the model knows which columns are numeric vs text
-            schema_desc = self._create_duckdb_schema(conn, dataframes)
-            
-            # Extract exact column names for explicit instruction to AI
-            exact_columns = {}
-            for table_name, df in dataframes.items():
-                exact_columns[table_name] = list(df.columns)
-            
-            # Build column list with DuckDB types (accurate types after registration)
-            column_list = "Table columns (name: DuckDB_type):\n"
-            for table_name in exact_columns:
-                column_list += f"  {table_name}:\n"
-                try:
-                    describe_rows = conn.execute(f"DESCRIBE {table_name}").fetchall()
-                    for row in describe_rows:
-                        col_name, col_type = row[0], row[1]
-                        column_list += f"    - {col_name}: {col_type}\n"
-                except Exception:
-                    for col in exact_columns[table_name]:
-                        column_list += f"    - {col}\n"
-            
-            # Minimal flags for output-format decisions only (not for SQL generation)
-            instr_lower = instructions.lower()
-            is_reconciliation = any(kw in instr_lower for kw in ["reconcil", "mismatch", "difference", "compare", "find diff"])
-
-            # Keep full steps context for SQL generation
-            instr_short = instructions[:6000] if len(instructions) > 6000 else instructions
-
-            # Build a mapping hint so model understands user's file aliases
-            # e.g. "Report_A", "first file", "file 1" → actual DuckDB table name
-            table_names_list = list(dataframes.keys())
-
-            def _normalize_table_token(name: str) -> str:
-                return re.sub(r"[^a-z0-9]", "", (name or "").lower())
-
-            def _extract_direct_sql(text: str) -> str:
-                raw = (text or "").strip()
-                if not raw:
-                    return ""
-
-                fence = re.search(r"```(?:sql)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
-                if fence:
-                    candidate = fence.group(1).strip()
-                    if re.match(r"^(select|with)\b", candidate, re.IGNORECASE) and re.search(r"\bfrom\b", candidate, re.IGNORECASE):
-                        return candidate
-
-                m = re.search(r"\b(select|with)\b[\s\S]*", raw, flags=re.IGNORECASE)
-                if m:
-                    candidate = m.group(0).strip()
-                    if re.match(r"^(select|with)\b", candidate, re.IGNORECASE) and re.search(r"\bfrom\b", candidate, re.IGNORECASE):
-                        return candidate
-
-                return ""
-
-            def _apply_fuzzy_table_mapping(sql_text: str) -> tuple[str, dict]:
-                """Map table tokens in FROM/JOIN to loaded DuckDB table names (exact -> normalized -> fuzzy)."""
-                if not sql_text:
-                    return sql_text, {}
-
-                available = list(dataframes.keys())
-                available_lower = {t.lower(): t for t in available}
-                available_norm = {_normalize_table_token(t): t for t in available}
-                ordinals = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
-
-                def _build_alias_map() -> dict[str, str]:
-                    alias_map = {}
-                    generic_noise = {"df", "data", "dataset", "table", "records", "record", "sheet", "file"}
-                    for i, tbl in enumerate(available):
-                        candidates = set()
-                        raw = str(tbl)
-                        friendly = raw[3:] if raw.lower().startswith("df_") else raw
-                        friendly_parts = [p for p in re.split(r"[^a-z0-9]+", friendly.lower()) if p]
-
-                        candidates.add(raw)
-                        candidates.add(friendly)
-                        if i < len(ordinals):
-                            candidates.add(ordinals[i])
-                            candidates.add(f"file{i+1}")
-                            candidates.add(f"report{chr(ord('a') + i)}")
-
-                        if friendly_parts:
-                            candidates.add(friendly_parts[0])
-                            candidates.add(friendly_parts[-1])
-                            for part in friendly_parts:
-                                # Keep short domain tokens like '2a' in addition to regular words.
-                                if (len(part) >= 3 or re.fullmatch(r"\d+[a-z]?", part)) and part not in generic_noise:
-                                    candidates.add(part)
-                            filtered = [p for p in friendly_parts if p not in generic_noise]
-                            if filtered:
-                                candidates.add("_".join(filtered))
-                                candidates.add("".join(filtered))
-
-                        # Deterministic reconciliation aliases.
-                        norm_tbl = _normalize_table_token(friendly)
-                        if "books" in norm_tbl:
-                            candidates.update({"books", "book"})
-                        if "2a" in norm_tbl or "gstr2a" in norm_tbl:
-                            candidates.update({"2a", "gstr2a"})
-
-                        for cand in candidates:
-                            norm = _normalize_table_token(cand)
-                            if norm and norm not in alias_map:
-                                alias_map[norm] = tbl
-                    return alias_map
-
-                alias_norm_map = _build_alias_map()
-
-                # Collect CTE names declared in WITH clause so we never remap them as physical tables.
-                cte_names = {
-                    m.group(1).strip().lower()
-                    for m in re.finditer(r"\b(?:with|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+as\s*\(", sql_text, flags=re.IGNORECASE)
-                }
-
-                # Deterministic shortcuts for common reconciliation aliases.
-                books_table = next((t for t in available if "books" in _normalize_table_token(t)), None)
-                twoa_table = next((t for t in available if "2a" in _normalize_table_token(t) or "gstr2a" in _normalize_table_token(t)), None)
-                replacements = {}
-
-                # Capture table references in FROM/JOIN clauses.
-                refs = re.findall(r"\b(?:from|join)\s+([A-Za-z0-9_]+|\"[^\"]+\")", sql_text, flags=re.IGNORECASE)
-                for ref in refs:
-                    token = ref.strip().strip('"')
-                    if token.lower() in cte_names:
-                        # Example: FROM Aggregated_2A AS JD (CTE), should not be remapped.
-                        continue
-                    mapped = None
-
-                    token_norm = _normalize_table_token(token)
-                    if token_norm in {"books", "book"} and books_table:
-                        mapped = books_table
-                    elif token_norm in {"2a", "gstr2a"} and twoa_table:
-                        mapped = twoa_table
-
-                    # Exact case-insensitive
-                    if mapped is None and token.lower() in available_lower:
-                        mapped = available_lower[token.lower()]
-                    elif mapped is None:
-                        # Normalized form (remove non-alnum)
-                        n = token_norm
-                        if n in available_norm:
-                            mapped = available_norm[n]
-                        elif n in alias_norm_map:
-                            mapped = alias_norm_map[n]
-                        else:
-                            # Fuzzy match against normalized table names and aliases
-                            norm_space = list(set(list(available_norm.keys()) + list(alias_norm_map.keys())))
-                            best = get_close_matches(n, norm_space, n=1, cutoff=0.55)
-                            if best:
-                                mapped = available_norm.get(best[0]) or alias_norm_map.get(best[0])
-
-                    if mapped and mapped != token:
-                        replacements[token] = mapped
-
-                remapped = sql_text
-                for src, dst in replacements.items():
-                    # Replace only table token after FROM/JOIN to avoid touching aliases/columns.
-                    remapped = re.sub(
-                        rf"(\b(?:from|join)\s+)(?:\"?{re.escape(src)}\"?)\b",
-                        rf"\1{dst}",
-                        remapped,
-                        flags=re.IGNORECASE,
-                    )
-                return remapped, replacements
-
-            def _repair_missing_table_errors(sql_text: str, error_text: str) -> tuple[str, dict]:
-                """When DuckDB reports missing table names, try alias/fuzzy remap and return updated SQL."""
-                if not sql_text or not error_text:
-                    return sql_text, {}
-
-                missing_names = re.findall(r"Table with name\s+([A-Za-z_][A-Za-z0-9_]*)\s+does not exist", error_text, flags=re.IGNORECASE)
-                if not missing_names:
-                    return sql_text, {}
-
-                patched_sql = sql_text
-                replacements = {}
-                for missing in missing_names:
-                    probe_sql = re.sub(
-                        rf"(\b(?:from|join)\s+)(?:\"?{re.escape(missing)}\"?)\b",
-                        rf"\1{missing}",
-                        patched_sql,
-                        flags=re.IGNORECASE,
-                    )
-                    remapped, rep = _apply_fuzzy_table_mapping(probe_sql)
-                    if rep:
-                        patched_sql = remapped
-                        replacements.update(rep)
-                return patched_sql, replacements
-            mapping_lines = []
-            ordinals = ["first", "second", "third", "fourth"]
-            for i, tname in enumerate(table_names_list):
-                # original filename (strip df_ prefix and replace _ with space)
-                friendly = tname[3:].replace('_', ' ') if tname.startswith('df_') else tname
-                ordinal = ordinals[i] if i < len(ordinals) else str(i + 1)
-                mapping_lines.append(
-                    f"  '{tname}' — {ordinal} file, also known as: \"{friendly}\", "
-                    f"\"Report_{'ABCDEFGH'[i]}\", \"{ordinal} file\", \"file {i+1}\""
-                )
-            table_alias_hint = "TABLE ALIASES (user may refer to tables by these names):\n" + "\n".join(mapping_lines) + "\n"
-
-            context_section = f"\n\nADDITIONAL CONTEXT FILES (read-only reference, not in SQL tables):\n{context_block}" if context_block else ""
-
-            sql_prompt = f"""Generate a single DuckDB SQL query for the task below.
-
-USER TASK:
-{instr_short}{context_section}
-
-{table_alias_hint}
-AVAILABLE TABLES AND COLUMN TYPES:
-{column_list}
-RULES:
-- Follow the USER TASK steps exactly. The user's instructions are the highest priority.
-- Output ONLY the SQL query. No explanation, no code fence, no comments.
-- Use column names EXACTLY as listed above (do not correct spelling).
-- If a column name contains spaces/special chars or starts with a digit, reference it with double quotes (e.g., T."Vendor name", T."2A Value").
-- Table aliases must start with a letter or underscore (do NOT use aliases like 2A). Prefer aliases like A, B, T1, T2.
-- If user says ignore/exclude/remove a column, that column must NOT appear from the Steps mentioned.
-- If user asks to rename a column, return only the renamed alias from the Steps mentioned.
-- If user asks aggregation/grouping, query MUST include corresponding GROUP BY and aggregate functions.
-- Use CAST(col AS DOUBLE) or TRY_CAST(col AS DOUBLE) before aggregating numeric columns when the type is VARCHAR.
-- For key comparisons/joins where NULLs may appear, prefer IS NOT DISTINCT FROM or COALESCE normalization.
-- For text filters, account for NULL safely (e.g., COALESCE(col, '') before LIKE/ILIKE when needed).
-- Handle NULLs explicitly in join keys/comparisons.
-- if its a multi step request use WITH statement only else Select Statement only.
-- Do NOT add WHERE filters on columns that the user did not ask to filter. Only filter on conditions explicitly stated in the task.
-- If a computation applies conditionally (e.g. 12% of Basic where PF=Yes), use CASE WHEN in the SELECT, not a WHERE clause that removes rows.
-- CRITICAL: Only reference columns that are explicitly listed in AVAILABLE TABLES AND COLUMN TYPES above. NEVER write a column name that does not appear in that list (e.g. do not write A.gross if "gross" is not listed — instead write the arithmetic expression: A.basic + A.hra + A.conveyance + A.special_allowance AS gross).
-- CRITICAL: Do NOT reference SELECT-level aliases inside the same SELECT or in WHERE/expressions. DuckDB does not allow this. Re-compute the expression inline or use a WITH clause."""
-
-            def clean_sql(raw_sql: str) -> str:
-                _debug_status(f"[SQL-DEBUG] clean_sql input (len={len(raw_sql)}):\n{raw_sql!r}")
-                if not raw_sql:
-                    _debug_status("[SQL-DEBUG] clean_sql: input is empty, returning ''")
-                    return ""
-                text = raw_sql.strip()
-
-                # Prefer fenced sql blocks when present
-                fence_match = re.search(r"```(?:sql)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-                if fence_match:
-                    text = fence_match.group(1).strip()
-                    _debug_status(f"[SQL-DEBUG] clean_sql: extracted from fence block: {text[:200]!r}")
-
-                # Remove accidental fence remnants
-                lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
-                text = "\n".join(lines).strip()
-                _debug_status(f"[SQL-DEBUG] clean_sql output (len={len(text)}): {text[:200]!r}")
-                return text
-
-            def repair_sql_identifiers(sql_text: str) -> str:
-                """Best-effort SQL repair for common LLM identifier mistakes.
-
-                Fixes:
-                - aliases that start with digits (e.g., 2A -> T2A)
-                - alias.column references where column names require quoting
-                - near-miss alias.column typos (e.g., dedector_tan -> deductor_tan)
-                """
-                if not sql_text:
-                    return sql_text
-
-                repaired = sql_text
-                alias_map = {}  # old_alias -> (new_alias, source_table)
-
-                # Capture aliases from FROM/JOIN clauses and rename invalid aliases.
-                alias_pattern = re.compile(
-                    r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:as\s+)?([A-Za-z0-9_]+)\b",
-                    re.IGNORECASE,
-                )
-                for m in alias_pattern.finditer(repaired):
-                    source_table = m.group(1)
-                    alias = m.group(2)
-                    if re.match(r"^[0-9]", alias):
-                        new_alias = f"T{alias}"
-                        alias_map[alias] = (new_alias, source_table)
-                    else:
-                        alias_map[alias] = (alias, source_table)
-
-                # Apply alias renames globally (word-boundary safe).
-                for old_alias, (new_alias, _tbl) in alias_map.items():
-                    if old_alias != new_alias:
-                        repaired = re.sub(rf"\b{re.escape(old_alias)}\b", new_alias, repaired)
-                        _debug_status(f"[SQL-DEBUG] repair_sql_identifiers: alias '{old_alias}' -> '{new_alias}'")
-
-                # Quote problematic columns in alias-qualified references.
-                # Build from known dataframe columns so we only patch valid names.
-                for _old_alias, (alias, source_table) in alias_map.items():
-                    if source_table not in dataframes:
-                        continue
-                    cols = list(dataframes[source_table].columns)
-                    for col in cols:
-                        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(col)):
-                            continue
-                        quoted = '"' + str(col).replace('"', '""') + '"'
-                        before = f"{alias}.{col}"
-                        after = f"{alias}.{quoted}"
-                        if before in repaired:
-                            repaired = repaired.replace(before, after)
-                            _debug_status(
-                                f"[SQL-DEBUG] repair_sql_identifiers: quoted column ref {before!r} -> {after!r}"
-                            )
-
-                # Correct near-miss alias.column typos using known columns per table.
-                # Example: T1.dedector_tan -> T1.deductor_tan
-                for _old_alias, (alias, source_table) in alias_map.items():
-                    if source_table not in dataframes:
-                        continue
-                    known_cols = [str(c) for c in dataframes[source_table].columns]
-                    known_set = set(known_cols)
-                    pattern = re.compile(rf"\b{re.escape(alias)}\.([A-Za-z_][A-Za-z0-9_]*)\b")
-
-                    def _fix_col(m):
-                        col = m.group(1)
-                        if col in known_set:
-                            return m.group(0)
-                        match = difflib.get_close_matches(col, known_cols, n=1, cutoff=0.82)
-                        if match:
-                            fixed = f"{alias}.{match[0]}"
-                            _debug_status(
-                                f"[SQL-DEBUG] repair_sql_identifiers: corrected {alias}.{col} -> {fixed}"
-                            )
-                            return fixed
-                        return m.group(0)
-
-                    repaired = pattern.sub(_fix_col, repaired)
-
-                return repaired
-
-            def repair_sql_join_predicates(sql_text: str) -> str:
-                """Repair common invalid JOIN ON patterns produced by LLMs."""
-                if not sql_text:
-                    return sql_text
-
-                repaired = sql_text
-
-                # Pattern: ON COALESCE(T1.col, T2.col)  ->  ON T1.col IS NOT DISTINCT FROM T2.col
-                repaired2 = re.sub(
-                    r"\bON\s+COALESCE\s*\(\s*([^,\)]+?)\s*,\s*([^\)]+?)\s*\)",
-                    r"ON \1 IS NOT DISTINCT FROM \2",
-                    repaired,
-                    flags=re.IGNORECASE,
-                )
-                if repaired2 != repaired:
-                    _debug_status("[SQL-DEBUG] repair_sql_join_predicates: fixed ON COALESCE(...) to IS NOT DISTINCT FROM")
-                    repaired = repaired2
-
-                return repaired
-
-            def semantic_review_sql(task_text: str, sql_text: str) -> tuple[bool, str]:
-                """Dynamically validate SQL against user task using the model itself.
-
-                Returns (ok, reason). If reviewer fails, default to pass to avoid blocking.
-                """
-                if not self.model:
-                    return True, ""
-
-                # ── Keyword pre-screen (no model call needed) ──────────────────────────
-                # Extract numbers and bare words from the task, check they appear in SQL.
-                # This catches obvious cases where a small model wrongly flags a valid SQL.
-                sql_lower = sql_text.lower()
-                task_lower = task_text.lower()
-                # Collect all numbers mentioned in the task (e.g. 0.12, 12%, 200)
-                task_numbers = re.findall(r'\d+\.?\d*', task_lower)
-                # Collect key column-like words from the task (>= 4 chars, not SQL keywords)
-                _SQL_KW = {'from', 'join', 'where', 'group', 'order', 'having', 'select',
-                           'with', 'case', 'when', 'then', 'else', 'end', 'and', 'not',
-                           'null', 'like', 'cast', 'coalesce', 'apply', 'each', 'employee',
-                           'output', 'compute', 'calculate', 'generate', 'produce', 'using'}
-                task_words = [w for w in re.findall(r'[a-z_]{4,}', task_lower)
-                              if w not in _SQL_KW]
-                # Check: at least 80% of task numbers appear in SQL (as substrings)
-                nums_found = sum(1 for n in task_numbers if n in sql_lower)
-                nums_ok = (not task_numbers) or (nums_found / len(task_numbers) >= 0.8)
-                # Check: at least 60% of task keywords appear in SQL
-                words_found = sum(1 for w in task_words if w in sql_lower)
-                words_ok = (not task_words) or (words_found / len(task_words) >= 0.6)
-                if nums_ok and words_ok:
-                    _debug_status(f"[SQL-DEBUG] semantic_review_sql: keyword pre-screen PASS "
-                                  f"(nums {nums_found}/{len(task_numbers)}, "
-                                  f"words {words_found}/{len(task_words)}) — skipping model call")
-                    return True, ""
-                # ── End pre-screen ─────────────────────────────────────────────────────
-                review_user = f"""Review whether the SQL fully satisfies the USER TASK.
-
-USER TASK:
-{task_text}
-
-SQL TO REVIEW:
-{sql_text}
-
-Return ONLY strict JSON with keys:
-- ok: true or false
-- reason: short string
-- missing_requirements: array of short strings
-
-Rules:
-- Mark ok=false if SQL misses any explicit task step.
-- Mark ok=false if SQL uses only one table when task requires reconciling two files.
-- Mark ok=false if SQL compares only missing rows but task asks value comparisons on matched rows.
-- Mark ok=false if task asks summarize/aggregate/group and SQL does not aggregate accordingly.
-- Mark ok=false if user says ignore/exclude/remove a column but SQL still includes it in final output.
-- Mark ok=false if user asks renaming but SQL returns old column name instead of requested alias.
-"""
-                try:
-                    review_prompt = self._build_chat_prompt(
-                        system="You are a strict SQL task compliance checker. Return JSON only.",
-                        messages=[],
-                        user_text=review_user,
-                        extra_context="",
-                    )
-                    with self.model_lock:
-                        review_resp = self.model.create_completion(
-                            review_prompt,
-                            max_tokens=400,
-                            temperature=0.0,
-                            stop=self._get_stop_tokens(),
-                        )
-                    raw = review_resp.get("choices", [{}])[0].get("text", "").strip()
-                    raw = _RE_THINK.sub("", raw).strip()
-                    raw = _RE_THINK_INCOMPLETE.sub("", raw).strip()
-                    fence_match = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
-                    if fence_match:
-                        raw = fence_match.group(1).strip()
-                    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-                    if json_match:
-                        raw = json_match.group(0).strip()
-                    payload = json.loads(raw)
-                    ok = bool(payload.get("ok", True))
-                    reason = str(payload.get("reason", "")).strip()
-                    missing = payload.get("missing_requirements", [])
-                    if isinstance(missing, list) and missing:
-                        # Keep full missing requirements list; truncation loses actionable constraints.
-                        reason = (reason + " | Missing: " + "; ".join(str(x) for x in missing)).strip(" |")
-                    return ok, reason
-                except Exception as e:
-                    _debug_status(f"[SQL-DEBUG] semantic_review_sql skipped due to reviewer error: {e}")
-                    return True, ""
-
-            def _split_sql_statements(text: str) -> list[str]:
-                """Split SQL by ';' while ignoring semicolons in comments/quoted strings."""
-                parts = []
-                buff = []
-                i = 0
-                n = len(text)
-                state = "normal"  # normal, s_quote, d_quote, line_comment, block_comment
-
-                while i < n:
-                    ch = text[i]
-                    nxt = text[i + 1] if i + 1 < n else ""
-
-                    if state == "line_comment":
-                        if ch == "\n":
-                            state = "normal"
-                            buff.append(ch)
-                        i += 1
-                        continue
-
-                    if state == "block_comment":
-                        if ch == "*" and nxt == "/":
-                            state = "normal"
-                            i += 2
-                            continue
-                        i += 1
-                        continue
-
-                    if state == "s_quote":
-                        buff.append(ch)
-                        if ch == "'":
-                            # Handle escaped single quote ''
-                            if nxt == "'":
-                                buff.append(nxt)
-                                i += 2
-                                continue
-                            state = "normal"
-                        i += 1
-                        continue
-
-                    if state == "d_quote":
-                        buff.append(ch)
-                        if ch == '"':
-                            # Handle escaped double quote ""
-                            if nxt == '"':
-                                buff.append(nxt)
-                                i += 2
-                                continue
-                            state = "normal"
-                        i += 1
-                        continue
-
-                    # normal state
-                    if ch == "-" and nxt == "-":
-                        state = "line_comment"
-                        i += 2
-                        continue
-                    if ch == "/" and nxt == "*":
-                        state = "block_comment"
-                        i += 2
-                        continue
-                    if ch == "'":
-                        state = "s_quote"
-                        buff.append(ch)
-                        i += 1
-                        continue
-                    if ch == '"':
-                        state = "d_quote"
-                        buff.append(ch)
-                        i += 1
-                        continue
-                    if ch == ";":
-                        stmt = "".join(buff).strip()
-                        if stmt:
-                            parts.append(stmt)
-                        buff = []
-                        i += 1
-                        continue
-
-                    buff.append(ch)
-                    i += 1
-
-                tail = "".join(buff).strip()
-                if tail:
-                    parts.append(tail)
-                return parts
-
-            def _strip_non_sql_prefix(text: str) -> str:
-                """Remove human labels/preamble before actual SQL, e.g. 'Query-2:' lines."""
-                raw = (text or "").strip()
-                if not raw:
-                    return ""
-
-                # Common heading patterns: Query 1:, Query-2:, Query_3:
-                raw = re.sub(r"^\s*query\s*[-_ ]*\d+\s*:\s*", "", raw, flags=re.IGNORECASE)
-
-                # Generic fallback: keep content from first SELECT/WITH keyword.
-                m = re.search(r"\b(select|with)\b", raw, flags=re.IGNORECASE)
-                if m and m.start() > 0:
-                    raw = raw[m.start():]
-                return raw.strip()
-
-            def validate_sql(sql_text: str, semantic: bool = True) -> tuple[str | None, str]:
-                """Validate SQL in cost-ordered phases: structural → EXPLAIN → tables → semantic."""
-                _debug_status(f"[SQL-DEBUG] validate_sql input (len={len(sql_text) if sql_text else 0}): {(sql_text or '')[:200]!r}")
-                if not sql_text or not sql_text.strip():
-                    _debug_status("[SQL-DEBUG] validate_sql: FAIL - empty input")
-                    return "Empty SQL generated", ""
-
-                normalized = _strip_non_sql_prefix(sql_text.strip())
-
-                statements = _split_sql_statements(normalized)
-                if not statements:
-                    return "Empty SQL generated", ""
-                if len(statements) > 1:
-                    _debug_status("[SQL-DEBUG] validate_sql: FAIL - multiple SQL statements detected")
-                    return "Multiple SQL statements detected; expected exactly one", normalized
-                normalized = statements[0]
-                if sql_text.strip().endswith(";"):
-                    _debug_status(f"[SQL-DEBUG] validate_sql: stripped trailing semicolon")
-
-                # ── Phase 1: Deterministic structural checks (free) ──
-                if re.search(r"\b(insert|update|delete|drop|alter|create|replace|truncate|attach|pragma|copy)\b", normalized, re.IGNORECASE):
-                    _debug_status(f"[SQL-DEBUG] validate_sql: FAIL - non-read-only keyword found")
-                    return "Non-read-only SQL detected", normalized
-
-                if not re.match(r"^(select|with)\b", normalized, re.IGNORECASE):
-                    _debug_status(f"[SQL-DEBUG] validate_sql: FAIL - doesn't start with SELECT/WITH (starts with: {normalized[:30]!r})")
-                    return "SQL must start with SELECT or WITH", normalized
-
-                if not any(tbl in normalized for tbl in dataframes.keys()):
-                    return "SQL does not reference available tables", normalized
-
-                # ── Phase 2: DuckDB EXPLAIN plan (catches syntax errors before model calls) ──
-                try:
-                    conn.execute(f"EXPLAIN {normalized}").fetchall()
-                    _debug_status(f"[SQL-DEBUG] validate_sql: EXPLAIN plan OK")
-                except Exception as e:
-                    _debug_status(f"[SQL-DEBUG] validate_sql: FAIL - EXPLAIN plan error: {e}")
-                    return f"SQL parse/plan failed: {e}", normalized
-
-                # ── Phase 3: Table reference checks (free) ──
-                referenced_tables = [
-                    tbl for tbl in dataframes.keys()
-                    if re.search(rf"\b{re.escape(tbl)}\b", normalized, re.IGNORECASE)
-                ]
-                if is_reconciliation and len(dataframes) >= 2 and len(referenced_tables) < 2:
-                    return "Reconciliation requires using both input tables", normalized
-
-                join_match = re.search(
-                    r"\bfrom\s+([A-Za-z_][A-Za-z0-9_]*)\b[\s\S]*?\bjoin\s+([A-Za-z_][A-Za-z0-9_]*)\b",
-                    normalized,
-                    re.IGNORECASE,
-                )
-                if is_reconciliation and len(dataframes) >= 2 and join_match:
-                    left_tbl = join_match.group(1)
-                    right_tbl = join_match.group(2)
-                    if left_tbl.lower() == right_tbl.lower():
-                        return "Join uses the same table on both sides; use both input files", normalized
-
-                # Ensure JOIN ON clauses are boolean predicates (not scalar expressions).
-                on_clauses = re.findall(
-                    r"\bON\s+([\s\S]*?)(?=\b(?:JOIN|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|UNION|EXCEPT|INTERSECT)\b|$)",
-                    normalized,
-                    flags=re.IGNORECASE,
-                )
-                comparator_re = re.compile(
-                    r"(=|<>|!=|<=|>=|<|>|\bIS\s+NOT\s+DISTINCT\s+FROM\b|\bIS\s+DISTINCT\s+FROM\b|\bLIKE\b|\bILIKE\b|\bIN\b|\bBETWEEN\b)",
-                    flags=re.IGNORECASE,
-                )
-                for cond in on_clauses:
-                    cond_text = cond.strip()
-                    if cond_text and not comparator_re.search(cond_text):
-                        return f"Invalid JOIN ON condition (must be boolean): {cond_text[:120]}", normalized
-
-                # ── Phase 4: Semantic review via model (optional) ──
-                if semantic:
-                    sem_ok, sem_reason = semantic_review_sql(instr_short, normalized)
-                    if not sem_ok:
-                        # Add machine-readable payload for repair prompt consumption.
-                        missing_items = []
-                        m = re.search(r"\|\s*Missing:\s*(.+)$", sem_reason or "", re.IGNORECASE)
-                        if m:
-                            missing_items = [x.strip().rstrip(".") for x in m.group(1).split(";") if x.strip()]
-                        missing_json = json.dumps(missing_items, ensure_ascii=True)
-                        return f"SQL does not satisfy task: {sem_reason or 'semantic mismatch'} | MISSING_REQ_JSON: {missing_json}", normalized
-
-                _debug_status(f"[SQL-DEBUG] validate_sql: PASS - SQL looks valid")
-                return None, normalized
-
-            # ── Direct SQL path: if user already supplied SQL, skip AI generation ──
-            direct_sql = _extract_direct_sql(instructions)
-            if direct_sql:
-                _debug_status("[SQL] Direct SQL detected in instructions; skipping AI SQL generation")
-                sql_code = clean_sql(direct_sql)
-                sql_code, table_replacements = _apply_fuzzy_table_mapping(sql_code)
-                if table_replacements:
-                    _debug_status(f"[SQL] Fuzzy table mapping applied: {table_replacements}")
-                sql_code = repair_sql_identifiers(sql_code)
-                sql_code = repair_sql_join_predicates(sql_code)
-
-                direct_statements = _split_sql_statements(sql_code)
-                if len(direct_statements) > 1:
-                    _debug_status(f"[SQL] Detected {len(direct_statements)} direct SQL statements; executing each query separately")
-                    output_dir = os.path.join(app_data_path(), "processed_files")
-                    os.makedirs(output_dir, exist_ok=True)
-                    timestamp = int(time.time())
-                    ext_map = {"excel": "xlsx", "csv": "csv", "pdf": "pdf", "txt": "txt"}
-                    ext = ext_map.get(output_format, "xlsx")
-                    saved_paths = []
-                    total_rows = 0
-
-                    for idx, statement in enumerate(direct_statements, start=1):
-                        if self.stop_generation_flag:
-                            conn.close()
-                            return _stopped_result()
-
-                        statement = _strip_non_sql_prefix(statement)
-
-                        validation_error, statement = validate_sql(statement, semantic=False)
-                        if validation_error:
-                            conn.close()
-                            return {"error": f"Direct SQL validation failed (Query {idx}): {validation_error}"}
-
-                        result_df = conn.execute(statement).fetchdf()
-                        row_count = len(result_df)
-                        total_rows += row_count
-
-                        output_file = os.path.join(output_dir, f"analysis_{timestamp}_q{idx}.{ext}")
-                        if ext == "xlsx":
-                            result_df.to_excel(output_file, index=False)
-                        elif ext == "csv":
-                            result_df.to_csv(output_file, index=False)
-                        elif ext == "pdf":
-                            result_df.to_csv(output_file, index=False)  # PDF fallback for now
-                        else:
-                            result_df.to_csv(output_file, sep='\t', index=False)
-
-                        saved_paths.append(output_file)
-                        _debug_status(f"[SQL] Query {idx} executed successfully: {row_count} rows -> {output_file}")
-
-                    summary = _clean_summary(status_messages, f"Total queries: {len(direct_statements)} | Total rows: {total_rows}")
-                    conn.close()
-                    return {
-                        "ok": True,
-                        "response_text": summary,
-                        "file_path": saved_paths[0] if saved_paths else None,
-                        "file_paths": saved_paths,
-                    }
-
-                validation_error, sql_code = validate_sql(sql_code, semantic=False)
-                if validation_error:
-                    if "Table with name" in validation_error and "does not exist" in validation_error:
-                        repaired_sql, missing_replacements = _repair_missing_table_errors(sql_code, validation_error)
-                        if missing_replacements:
-                            _debug_status(f"[SQL] Missing-table recovery mapping applied: {missing_replacements}")
-                            validation_error, sql_code = validate_sql(repaired_sql, semantic=False)
-                    if validation_error:
-                        return {"error": f"Direct SQL validation failed: {validation_error}"}
-
-                _debug_status("[SQL] Direct SQL validation passed; executing query on DuckDB")
-            else:
-                sql_code = ""
-
-            # ── Generate → Validate → Repair loop (retry until success or stuck) ──
-            MAX_SQL_ATTEMPTS = 15  # safety ceiling
-
-            if not direct_sql:
-                msg = "[SQL] Generating SQL query..."
-                status_messages.append(msg)
-                print(msg)
-                if not self.model:
-                    return {"error": "No model loaded"}
-
-                # Print full sql_prompt so it can be verified in logs
-                _debug_status(f"[SQL-DEBUG] Full sql_prompt ({len(sql_prompt)} chars):\n{'='*60}\n{sql_prompt}\n{'='*60}")
-
-                stop_tokens = self._get_stop_tokens()
-                errors_so_far = []  # tracks {"attempt": N, "sql": str, "error": str}
-                _consecutive_same_error = 0  # detect when model is stuck
-                validation_error = None
-                retry_exhausted = False
-                model_stuck = False
-
-                for attempt in range(MAX_SQL_ATTEMPTS):
-                    if self.stop_generation_flag:
-                        return _stopped_result()
-                    _debug_status(f"[SQL-DEBUG] ── Attempt {attempt + 1}/{MAX_SQL_ATTEMPTS} ──")
-
-                    if attempt == 0:
-                        # First attempt: generate from original prompt
-                        gen_prompt = self._build_chat_prompt(
-                            system="You are a SQL expert. Output ONLY a single DuckDB SELECT query with no explanation.",
-                            messages=[],
-                            user_text=sql_prompt,
-                            extra_context="",
-                        )
-                    else:
-                        # Repair: include the failed SQL + specific fix instructions
-                        prev = errors_so_far[-1]
-                        # Extract actionable fixes from error messages
-                        fix_items = []
-                        for e in errors_so_far:
-                            err = e["error"]
-                            # Prefer machine-readable missing requirements if present.
-                            json_match = re.search(r"MISSING_REQ_JSON:\s*(\[[\s\S]*\])", err)
-                            if json_match:
-                                try:
-                                    parsed = json.loads(json_match.group(1))
-                                    if isinstance(parsed, list):
-                                        for item in parsed:
-                                            item = str(item).strip().rstrip(".")
-                                            if item:
-                                                fix_items.append(f"- {item}")
-                                        continue
-                                except Exception:
-                                    pass
-                            # Pull out "Missing: ..." items from semantic reviewer
-                            missing_match = re.search(r"Missing:\s*(.+)", err)
-                            if missing_match:
-                                for item in missing_match.group(1).split(";"):
-                                    item = item.strip().rstrip(".")
-                                    if item:
-                                        fix_items.append(f"- {item}")
-                            else:
-                                fix_items.append(f"- Fix: {err}")
-
-                        # Deduplicate fix items
-                        fix_items = list(dict.fromkeys(fix_items))
-                        fix_block = "\n".join(fix_items) if fix_items else f"- {prev['error']}"
-                        # Truncate failed SQL to 600 chars — model only needs to see the
-                        # structure that failed, not fill the entire context window with garbage.
-                        prev_sql_snippet = prev['sql'][:600] + ("..." if len(prev['sql']) > 600 else "")
-                        repair_user = (
-                            sql_prompt
-                            + f"\n\nYOUR PREVIOUS SQL (which failed validation):\n{prev_sql_snippet}"
-                            + f"\n\nREQUIRED FIXES (apply ALL of these):\n{fix_block}"
-                            + "\n\nRewrite the SQL to fix ALL issues above. Return exactly ONE read-only DuckDB SQL query starting with SELECT or WITH."
-                        )
-                        gen_prompt = self._build_chat_prompt(
-                            system="You are a SQL expert. Output ONLY a single DuckDB SELECT query with no explanation.",
-                            messages=[],
-                            user_text=repair_user,
-                            extra_context="",
-                        )
-                        _debug_status(f"[SQL-DEBUG] Repair prompt length: {len(gen_prompt)} chars")
-
-                    try:
-                        if self.stop_generation_flag:
-                            return _stopped_result()
-                        raw_sql = ""
-                        with self.model_lock:
-                            if self.model is None:
-                                return {"error": "No model loaded"}
-
-                            # Stream tokens so stop_generation can interrupt mid-attempt.
-                            # Cap at 700 tokens — SQL queries don't need more, and higher limits
-                            # let small models fill context with infinite nested SELECT loops.
-                            stream = self.model(
-                                gen_prompt,
-                                max_tokens=700,
-                                temperature=min(0.1 + (attempt * 0.08), 0.9),  # ramp up creativity on retries
-                                stream=True,
-                                stop=stop_tokens,
-                            )
-
-                            for chunk in stream:
-                                if self.stop_generation_flag:
-                                    return _stopped_result()
-                                raw_sql += chunk.get("choices", [{}])[0].get("text", "")
-
-                        if self.stop_generation_flag:
-                            return _stopped_result()
-                    except Exception as model_err:
-                        _debug_status(f"[SQL-DEBUG] model.create_completion RAISED on attempt {attempt+1}: {model_err}")
-                        import traceback; traceback.print_exc()
-                        return {"error": f"Model inference failed: {model_err}"}
-
-                    _debug_status(f"[SQL-DEBUG] Attempt {attempt+1} raw output (len={len(raw_sql)}):\n{'='*60}\n{raw_sql}\n{'='*60}")
-
-                    raw_sql = raw_sql.strip()
-
-                    # Detect "SELECT bomb": model stuck in infinite nested SELECT loop.
-                    # Count FROM ( occurrences — more than 6 deep means garbage output.
-                    if raw_sql.upper().count("FROM (") > 6:
-                        _debug_status(f"[SQL-DEBUG] SELECT bomb detected ({raw_sql.upper().count('FROM (')} nesting levels) — discarding output")
-                        errors_so_far.append({"attempt": attempt, "sql": "", "error": "Output contained infinitely nested SELECT subqueries — rewrite as a flat JOIN or simple WITH clause"})
-                        continue
-
-                    sql_code = clean_sql(raw_sql)
-                    sql_code = repair_sql_identifiers(sql_code)
-                    sql_code = repair_sql_join_predicates(sql_code)
-
-                    # ── Build real-column sets (global + per alias) ──
-                    all_real_cols = set()
-                    for _df in dataframes.values():
-                        all_real_cols.update(c.lower() for c in _df.columns)
-                    # Map table alias → set of real column names for that table
-                    _alias_to_cols: dict = {}
-                    for _m in re.finditer(r'\b(df_\w+)\s+([A-Za-z_]\w*)\b', sql_code, re.IGNORECASE):
-                        _tbl, _alias = _m.group(1), _m.group(2).upper()
-                        for _df_name, _df in dataframes.items():
-                            if _df_name.lower() == _tbl.lower():
-                                _alias_to_cols[_alias] = {c.lower() for c in _df.columns}
-                                break
-
-                    def _col_ref_valid(alias: str, col: str) -> bool:
-                        """Return True if alias.col is a valid reference."""
-                        a = alias.upper()
-                        c = col.lower()
-                        if c in ('null', 'not', 'true', 'false'):
-                            return True
-                        if a in _alias_to_cols:
-                            return c in _alias_to_cols[a]
-                        return c in all_real_cols  # unqualified / unknown alias
-
-                    # ── Strip WHERE conditions that reference non-existent columns ──
-                    # Also drops any surviving WHERE conditions when the task contains no
-                    # explicit row-filtering language — making the fix generic, not
-                    # tied to specific values like 'Yes'/'No' or IS NOT NULL patterns.
-                    def _strip_bad_where_conditions(sql_text: str) -> str:
-                        where_match = re.search(r'\bWHERE\b([\s\S]*?)(?=\b(?:GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|UNION|EXCEPT|INTERSECT)\b|$)', sql_text, re.IGNORECASE)
-                        if not where_match:
-                            return sql_text
-                        where_body = where_match.group(1)
-                        # If more closing parens than opening, this WHERE is inside a
-                        # subquery and our regex has captured the closing ')' of that
-                        # subquery plus JOIN clauses. Do not touch it — we'd corrupt the SQL.
-                        if where_body.count(')') > where_body.count('('):
-                            _debug_status("[SQL-DEBUG] WHERE spans subquery boundary — skipping sanitizer")
-                            return sql_text
-                        conditions = re.split(r'\bAND\b', where_body, flags=re.IGNORECASE)
-                        good = []
-                        for cond in conditions:
-                            cond_s = cond.strip()
-                            if not cond_s:
-                                continue
-                            # Strip conditions with non-existent alias.col refs (schema check)
-                            aliased = re.findall(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b', cond_s)
-                            bad = [(a, c) for a, c in aliased if not _col_ref_valid(a, c)]
-                            if bad:
-                                _debug_status(f"[SQL-DEBUG] Stripped invalid WHERE condition "
-                                              f"(bad refs: {bad}): {cond_s[:100]}")
-                                continue
-                            good.append(cond_s)
-                        if not good:
-                            return sql_text[:where_match.start()].rstrip() + sql_text[where_match.end():]
-                        # If valid conditions survived, check whether the task actually
-                        # asked for row filtering. Small models add defensive WHERE
-                        # conditions that were never requested.
-                        # Explicit filter intent: comparison with a literal value/number,
-                        # or filter/exclude/only keywords in a filtering context.
-                        _filter_intent = bool(re.search(
-                            r'\b(?:filter|exclude|only\s+(?:include|show|rows?|records?))\b'
-                            r'|(?:>|<|>=|<=|!=|<>)\s*[\d\'""]',
-                            instructions, re.IGNORECASE))
-                        if not _filter_intent:
-                            _debug_status(f"[SQL-DEBUG] Task has no row-filtering intent — "
-                                          f"dropped {len(good)} surviving WHERE condition(s)")
-                            # Use a space separator to avoid joining last token with next keyword
-                            return sql_text[:where_match.start()].rstrip() + " " + sql_text[where_match.end():]
-                        return (sql_text[:where_match.start()] +
-                                " WHERE\n  " + "\n  AND ".join(good) +
-                                sql_text[where_match.end():])
-                    sql_code = _strip_bad_where_conditions(sql_code)
-
-                    # ── Fix bad alias.col refs: correct alias if possible, else NULL ──
-                    # Only apply on flat JOINs (no subqueries). When a model generates
-                    # FROM (...) A subqueries, alias 'A' refers to the subquery result —
-                    # not directly to the base table — so column-level validation is
-                    # unreliable and replacing valid refs with NULL corrupts the SQL.
-                    _has_subquery = bool(re.search(r'FROM\s*\(', sql_code, re.IGNORECASE))
-                    if _alias_to_cols and not _has_subquery:
-                        def _fix_col_ref(m: re.Match) -> str:
-                            alias, col = m.group(1), m.group(2)
-                            if _col_ref_valid(alias, col):
-                                return m.group(0)  # already valid
-                            col_lower = col.lower()
-                            # Try to correct to the right table alias
-                            for other_alias, other_cols in _alias_to_cols.items():
-                                if col_lower in other_cols:
-                                    correct = f"{other_alias.lower()}.{col}"
-                                    _debug_status(f"[SQL-DEBUG] Corrected wrong-alias '{alias}.{col}' → '{correct}'")
-                                    return correct
-                            # Not in any table — replace with NULL
-                            _debug_status(f"[SQL-DEBUG] Replaced non-existent column '{alias}.{col}' with NULL")
-                            return 'NULL'
-                        sql_code = re.sub(r'\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b',
-                                          _fix_col_ref, sql_code)
-
-                    _debug_status(f"[SQL-DEBUG] After clean_sql (len={len(sql_code)}): {sql_code[:300]!r}")
-
-                    validation_error, sql_code = validate_sql(sql_code)
-
-                    if not validation_error:
-                        _debug_status(f"[SQL-DEBUG] Attempt {attempt+1}: PASSED validation")
-                        break
-
-                    msg = f"[SQL] Attempt {attempt+1} failed: {validation_error}"
-                    status_messages.append(msg)
-                    print(msg)
-                    errors_so_far.append({"attempt": attempt, "sql": sql_code, "error": validation_error})
-
-                    # Detect if model is stuck: same error 3 times in a row → give up
-                    if len(errors_so_far) >= 3:
-                        last_3 = [e["error"] for e in errors_so_far[-3:]]
-                        if last_3[0] == last_3[1] == last_3[2]:
-                            _debug_status(f"[SQL-DEBUG] Model stuck: same error 3 times in a row, stopping.")
-                            model_stuck = True
-                            break
-
-                else:
-                    # Safety ceiling reached
-                    last_err = errors_so_far[-1]["error"] if errors_so_far else "Unknown"
-                    _debug_status(f"[SQL-DEBUG] Safety ceiling ({MAX_SQL_ATTEMPTS}) reached. Last error: {last_err}")
-                    retry_exhausted = True
-
-                # Check if we broke out of the loop due to retries/stuck (not success)
-                if validation_error:
-                    last_err = errors_so_far[-1]["error"] if errors_so_far else "Unknown"
-                    _debug_status(
-                        f"[SQL-DEBUG] Retry limit reached (stuck={model_stuck}, exhausted={retry_exhausted}). "
-                        "Attempting fallback with last generated SQL and structural validation only."
-                    )
-                    fallback_sql = errors_so_far[-1]["sql"] if errors_so_far else sql_code
-                    fb_err, fb_sql = validate_sql(fallback_sql, semantic=False)
-
-                    if fb_err and "Table with name" in fb_err and "does not exist" in fb_err:
-                        repaired_sql, missing_replacements = _repair_missing_table_errors(fallback_sql, fb_err)
-                        if missing_replacements:
-                            _debug_status(f"[SQL] Fallback missing-table recovery mapping applied: {missing_replacements}")
-                            fb_err, fb_sql = validate_sql(repaired_sql, semantic=False)
-
-                    if fb_err:
-                        return {
-                            "error": (
-                                f"SQL generation failed after {len(errors_so_far)} attempts; "
-                                f"fallback validation also failed: {fb_err}"
-                            )
-                        }
-
-                    sql_code = fb_sql
-                    validation_error = None
-                    msg = "[SQL] Fallback enabled: executing last generated query after retry limit"
-                    status_messages.append(msg)
-                    print(msg)
-
-            msg = f"[SQL] Generated query: {sql_code[:200]}..."
-            status_messages.append(msg)
-            print(msg)
-
-            if self.stop_generation_flag:
-                return _stopped_result()
-            
-            # Print full SQL query to terminal before execution
-            print("\n" + "="*80)
-            print("[SQL] FULL QUERY TO BE EXECUTED:")
-            print("="*80)
-            print(sql_code)
-            print("="*80 + "\n")
-            
-            # Also add to UI
-            status_messages.append("\n" + "="*80)
-            status_messages.append("[SQL] FULL QUERY TO BE EXECUTED:")
-            status_messages.append("="*80)
-            status_messages.append(sql_code)
-            status_messages.append("="*80 + "\n")
-            
-            # Execute SQL query
-            try:
-                if self.stop_generation_flag:
-                    conn.close()
-                    return _stopped_result()
-                msg = "[SQL] Executing query..."
-                status_messages.append(msg)
-                print(msg)
-                
-                result_df = conn.execute(sql_code).fetchdf()
-                row_count = len(result_df)
-                msg = f"[SQL] ✓ Query executed successfully: {row_count} rows returned"
-                status_messages.append(msg)
-                print(msg)
-                
-                # Save SQL result in requested format
-                import pandas as pd
-                msg = "[SQL] Converting to DataFrame..."
-                status_messages.append(msg)
-                print(msg)
-                
-                output_dir = os.path.join(app_data_path(), "processed_files")
-                os.makedirs(output_dir, exist_ok=True)
-                timestamp = int(time.time())
-
-                def _extract_recon_splits(frame: "pd.DataFrame") -> dict[str, "pd.DataFrame"]:
-                    """Return deterministic reconciliation buckets when recognizable."""
-                    splits = {"All_Results": frame}
-                    cols = {str(c).strip().lower(): c for c in frame.columns}
-
-                    # Preferred split key: _merge from outer joins
-                    if "_merge" in cols:
-                        merge_col = cols["_merge"]
-                        merge_norm = frame[merge_col].astype(str).str.strip().str.lower()
-                        splits["Matched"] = frame[merge_norm == "both"]
-                        splits["Missing_From_Second"] = frame[merge_norm.str.contains("left", na=False)]
-                        splits["Missing_From_First"] = frame[merge_norm.str.contains("right", na=False)]
-                        return splits
-
-                    # Fallback split key: status-like category columns
-                    for candidate in ("recon_status", "comparison_status", "status", "match_status"):
-                        if candidate in cols:
-                            status_col = cols[candidate]
-                            status_norm = frame[status_col].astype(str).str.strip().str.lower()
-                            splits["Matched"] = frame[status_norm.str.contains("match", na=False)]
-                            splits["Mismatched"] = frame[status_norm.str.contains("mismatch|diff|different", regex=True, na=False)]
-                            return splits
-
-                    return splits
-
-                wants_multi_excel = (
-                    output_format == "excel"
-                    and is_reconciliation
-                    and any(k in instr_lower for k in ["multiple sheet", "multi sheet", "multi-sheet", "single excel", "one excel"])
-                )
-                wants_multi_csv = (
-                    output_format == "csv"
-                    and is_reconciliation
-                    and any(k in instr_lower for k in ["multiple csv", "multi csv", "separate csv", "multiple output", "multi output", "multiple outputs"])
-                )
-
-                # Determine file extension based on output_format
-                ext_map = {"none": "", "excel": "xlsx", "csv": "csv", "pdf": "pdf", "txt": "txt"}
-                ext = ext_map.get(output_format, "xlsx")
-                output_file = os.path.join(output_dir, f"analysis_{timestamp}.{ext}") if ext else ""
-
-                if ext:
-                    msg = f"[SQL] Saving to {ext.upper()} file..."
-                    status_messages.append(msg)
-                    print(msg)
-                else:
-                    msg = "[SQL] UI-only mode: no file export requested."
-                    status_messages.append(msg)
-                    print(msg)
-
-                saved_paths = []
-                if wants_multi_excel:
-                    split_frames = _extract_recon_splits(result_df)
-                    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-                        for sname, sdf in split_frames.items():
-                            if sdf is None:
-                                continue
-                            safe_sheet = re.sub(r"[^A-Za-z0-9_ ]", "_", sname)[:31] or "Sheet1"
-                            sdf.to_excel(writer, sheet_name=safe_sheet, index=False)
-                    saved_paths.append(output_file)
-                    msg = f"[SQL] ✓ Saved multi-sheet Excel ({len(split_frames)} sheets): {output_file}"
-                    status_messages.append(msg)
-                    print(msg)
-                elif wants_multi_csv:
-                    split_frames = _extract_recon_splits(result_df)
-                    csv_dir = os.path.join(output_dir, f"analysis_{timestamp}_csv_parts")
-                    os.makedirs(csv_dir, exist_ok=True)
-                    for sname, sdf in split_frames.items():
-                        if sdf is None:
-                            continue
-                        fname = re.sub(r"[^A-Za-z0-9_\-]", "_", sname).strip("_") or "part"
-                        fpath = os.path.join(csv_dir, f"{fname}.csv")
-                        sdf.to_csv(fpath, index=False)
-                        saved_paths.append(fpath)
-                    output_file = csv_dir
-                    msg = f"[SQL] ✓ Saved multi-CSV output ({len(saved_paths)} files): {csv_dir}"
-                    status_messages.append(msg)
-                    print(msg)
-                elif ext == "":
-                    # UI-only mode: skip file generation.
-                    saved_paths = []
-                elif ext == "xlsx":
-                    result_df.to_excel(output_file, index=False)
-                    saved_paths.append(output_file)
-                elif ext == "csv":
-                    result_df.to_csv(output_file, index=False)
-                    saved_paths.append(output_file)
-                elif ext == "pdf":
-                    result_df.to_csv(output_file, index=False)  # PDF requires reportlab, fallback to CSV for now
-                    saved_paths.append(output_file)
-                else:  # txt
-                    result_df.to_csv(output_file, sep='\t', index=False)
-                    saved_paths.append(output_file)
-
-                if ext and not wants_multi_excel and not wants_multi_csv:
-                    msg = f"[SQL] ✓ Saved results to: {output_file}"
-                    status_messages.append(msg)
-                    print(msg)
-                
-                # Return status messages with count and file path
-                summary = _clean_summary(status_messages, f"Total rows: {row_count}")
-                
-                conn.close()
-                return {
-                    "ok": True,
-                    "response_text": summary,
-                    "file_path": output_file if ext else None,
-                    "file_paths": saved_paths,
-                }
-            except Exception as e:
-                conn.close()
-                return {"error": f"SQL execution failed: {str(e)}"}
-            
-        except Exception as e:
-            print(f"[SQL] Error: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"error": f"SQL analysis failed: {str(e)}"}
+        return self.sql_analysis_runner.execute(
+            dataframes,
+            instructions,
+            output_format,
+            pipeline_status_messages=pipeline_status_messages,
+            context_block=context_block,
+        )
 
     def _execute_python_analysis(
         self,
@@ -6488,450 +5173,12 @@ Rules:
         pipeline_status_messages: list = None
     ) -> dict:
         """Generate and execute Python code for smaller file analysis."""
-        try:
-            import pandas as pd
-            import time
-            import os
-            import re
-
-            status_messages = pipeline_status_messages if pipeline_status_messages else []
-
-            def log(msg: str) -> None:
-                status_messages.append(msg)
-                print(msg)
-
-            def is_valid_python(code: str) -> bool:
-                if not code or not code.strip():
-                    return False
-
-                banned_fragments = [
-                    "read_csv",
-                    "path_to_",
-                    "import pandas",
-                    "import os",
-                    "import sys",
-                    "import subprocess",
-                    "exec(",
-                    "eval(",
-                    "__import__",
-                    "open(",
-                    "os.",
-                    "system(",
-                    "popen(",
-                    "print(",
-                ]
-                lowered = code.lower()
-                if any(fragment.lower() in lowered for fragment in banned_fragments):
-                    return False
-
-                if "result_df" not in code:
-                    return False
-
-                try:
-                    compile(code, "<generated_code>", "exec")
-                    return True
-                except SyntaxError:
-                    return False
-
-            def _clean_summary(msgs: list, suffix: str = "") -> str:
-                clean = []
-                for m in msgs:
-                    if any(tag in m for tag in (
-                        "[SQL-DEBUG]", "[CODE_EXEC]", "[DEBUG]",
-                        "clean_sql input", "clean_sql output",
-                        "clean_sql:", "VERIFY COLUMN", "VERIFY TABLE",
-                        "repair_sql", "semantic_review",
-                    )):
-                        continue
-                    line = re.sub(r'^\[(SQL|PYTHON|AGENT)\]\s*', '', m).strip()
-                    if line:
-                        clean.append(line)
-                result = "\n".join(clean) if clean else "Analysis completed."
-                if suffix:
-                    result += "\n\n" + suffix
-                return result
-
-            log("[PYTHON] Executing Python-based analysis...")
-            log("[PYTHON] Building schema for AI...")
-
-            schema_desc = self._create_enhanced_schema(dataframes)
-            
-            # Extract exact column names for explicit instruction to AI
-            exact_columns = {}
-            for table_name, df in dataframes.items():
-                exact_columns[table_name] = list(df.columns)
-
-            instr_short = instructions[:6000] if len(instructions) > 6000 else instructions
-
-            dataframe_names = ", ".join(list(dataframes.keys()))
-            
-            # Build explicit column list for the prompt
-            column_list = "EXACT COLUMN NAMES (use exactly as shown, do not correct spelling):\n"
-            for table_name, cols in exact_columns.items():
-                col_str = ", ".join([f"'{c}'" for c in cols])
-                column_list += f"  {table_name}: [{col_str}]\n"
-            
-            multi_file_hint = ""
-            if len(dataframes) > 1:
-                multi_file_hint = (
-                    "MULTI-FILE RULE:\n"
-                    "- More than one dataframe is provided.\n"
-                    "- You MUST use ALL dataframes.\n"
-                    "- Do NOT ignore any dataframe.\n"
-                    "- Do NOT overwrite result_df multiple times.\n"
-                    "- Follow the USER TASK steps exactly to decide how to join/merge/compare.\n"
-                    "- Handle NULLs, duplicates, and type mismatches as needed."
-                )
-
-            python_prompt = f"""
-    You are an expert Python data analyst.
-
-    TASK:
-    {instr_short}
-
-    IMPORTANT CONTEXT:
-    - Data is ALREADY LOADED into pandas DataFrames.
-    - DO NOT use pd.read_csv().
-    - DO NOT use file paths.
-    - DO NOT redefine dataframes.
-    - Use ONLY the existing DataFrames directly.
-
-    AVAILABLE DATAFRAMES:
-    {dataframe_names}
-
-    {column_list}
-
-    SCHEMA (columns + sample values):
-    {schema_desc}
-
-    {multi_file_hint}
-
-    STEP-INTERPRETATION PRIORITY:
-    - Follow the user's Steps section literally when present.
-    - If steps ask for unique_key, create unique_key.
-    - If steps say "all columns", derive columns dynamically from dataframe columns.
-    - Do not hardcode guessed column names when steps require all columns.
-    - If steps ask to delete/remove, perform those operations before final result.
-    - If steps ask arithmetic comparisons, compute numeric deltas/ratios/tolerance checks.
-    - If steps ask exact/fuzzy filtering (single or list), apply those filters explicitly.
-
-        ADVANCED RECONCILIATION POLICIES:
-        - Numeric tolerance policy:
-            - If user gives tolerance, use it.
-            - Otherwise default ABS tolerance=0 and PCT tolerance=0.
-        - Date normalization policy:
-            - Normalize dates to comparable format before joins/comparisons when needed.
-            - Safely handle mixed date formats.
-        - Text normalization policy:
-            - Apply trim/case normalization for comparison keys when appropriate.
-            - Remove obvious punctuation/spacing noise for fuzzy matching requests.
-        - Duplicate handling policy:
-            - If user specifies duplicate strategy, follow it.
-            - Otherwise preserve all rows unless task explicitly asks deduplication.
-        - Null handling policy:
-            - If user specifies null behavior, follow it.
-            - Otherwise use safe normalized blanks only for key-building steps.
-        - Fuzzy matching policy:
-            - If fuzzy matching is requested, use deterministic logic and include threshold in result.
-            - If threshold is not provided, use conservative default and report it.
-        - Output contract:
-            - Provide summary counts: matched, missing_left, missing_right, mismatched.
-            - Provide detailed mismatch rows.
-            - Add reason/category column for mismatch cause when possible.
-        - Performance policy:
-            - Prefer vectorized/set operations over row-wise loops when possible.
-            - For very large data, avoid expensive cartesian logic and use key-based compare.
-
-    STRICT RULES:
-    - Return ONLY valid Python code.
-    - Do NOT include explanations.
-    - Do NOT include markdown.
-    - Do NOT include comments.
-    - Do NOT include numbered steps.
-    - Do NOT include any text before or after the code.
-    - Do NOT import anything.
-    - Do NOT use read_csv.
-    - Do NOT use print().
-    - Do NOT create fake/sample data.
-    - Do NOT redefine dataframe variables.
-    - Assign final output ONLY ONCE to: result_df
-    - result_df must be a pandas DataFrame.
-    - CRITICAL: Use column names EXACTLY as shown above, even if they look misspelled.
-    - CRITICAL: Do NOT "correct" column names to match proper English spelling.
-
-    CODE REQUIREMENTS:
-    - Use only the provided DataFrames.
-    - Use column names EXACTLY as provided (do not fix perceived typos).
-    - Handle missing columns safely.
-    - If a column may not exist, check with: if 'col' in df.columns:
-    - For unique_key/all-columns reconciliation, generate dynamic column logic from df.columns.
-    - When filtering with list inputs, support both exact IN-style and fuzzy list matching behavior.
-    - When comparing arithmetic across files, include computed difference columns in result_df when relevant.
-    - Ensure the code is executable as-is.
-    - Avoid indentation errors.
-
-    EXAMPLE:
-    result_df = df_1000_BT_Records.groupby("Date").sum().reset_index()
-
-    Return ONLY clean Python code inside a single fenced block:
-    ```python
-    result_df = ...
-    """
-
-            log("[PYTHON] Generating Python code...")
-
-            if not self.model:
-                return {"error": "No model loaded"}
-
-            response = self.model.create_completion(
-                python_prompt,
-                max_tokens=384,
-                temperature=0.1,
-            )
-
-            python_code = response.get("choices", [{}])[0].get("text", "").strip()
-            log(f"[DEBUG] Raw LLM output:\n{python_code[:500]}")
-
-            # 🔹 CLEAN CODE
-            def clean_code(code: str) -> str:
-                lines = code.split("\n")
-                clean_lines = []
-
-                for line in lines:
-                    s = line.strip()
-
-                    # Skip obvious junk
-                    if not s:
-                        continue
-
-                    if s.startswith("```"):
-                        continue
-
-                    # Skip numbered steps
-                    if s[0].isdigit() and "." in s[:3]:
-                        continue
-
-                    # Skip explanation lines
-                    if s.lower().startswith(("here", "to ", "this ", "step")):
-                        continue
-
-                    # 🚨 KEEP actual python lines
-                    clean_lines.append(line)
-
-                return "\n".join(clean_lines)
-
-            python_code = clean_code(python_code)
-
-            log("[PYTHON] Code generated successfully.")
-            log(f"[PYTHON] Code preview:\n{python_code[:300]}")
-
-            # 🔒 Validation checks
-            if "result_df" not in python_code:
-                return {"error": "Invalid code: result_df not found"}
-
-            if "read_csv" in python_code:
-                return {"error": "Invalid code: read_csv not allowed"}
-
-            # 🔹 Prepare safe execution environment
-            allowed_builtins = {"len": len, "range": range}
-            namespace = {
-                "__builtins__": allowed_builtins,
-                "pd": pd,
-                "result_df": None
-            }
-
-            namespace.update(dataframes)
-
-            unsafe_keywords = ["__import__", "exec", "eval", "open", "system", "popen", "os."]
-            if any(kw in python_code for kw in unsafe_keywords):
-                return {"error": "Unsafe code detected"}
-
-            # 🔁 Retry mechanism
-            for attempt in range(2):
-                try:
-                    # Print full code to terminal before execution
-                    if attempt == 0:  # Only print on first attempt
-                        print("\n" + "="*80)
-                        print("[PYTHON] FULL CODE TO BE EXECUTED:")
-                        print("="*80)
-                        print(python_code)
-                        print("="*80 + "\n")
-                        
-                        # Also add to UI
-                        log("\n" + "="*80)
-                        log("[PYTHON] FULL CODE TO BE EXECUTED:")
-                        log("="*80)
-                        log(python_code)
-                        log("="*80 + "\n")
-                    
-                    # DEBUG: Show namespace before execution
-                    log("[DEBUG] Namespace keys before exec:")
-                    for key in list(namespace.keys())[:10]:
-                        log(f"  - {key}: {type(namespace.get(key)).__name__}")
-                    
-                    log("[PYTHON] Running generated code...")
-                    
-                    # Time the execution with detailed steps
-                    start_time = time.time()
-                    log(f"[DEBUG] Start time: {start_time}")
-                    
-                    exec(python_code, namespace)
-                    
-                    exec_end = time.time()
-                    execution_time = round(exec_end - start_time, 2)
-                    log(f"[DEBUG] Exec completed after {execution_time}s")
-                    log(f"[PYTHON] ✓ Code executed successfully in {execution_time}s")
-                    
-                    # DEBUG: Check namespace after execution
-                    log("[DEBUG] Checking namespace after exec...")
-                    if "result_df" in namespace:
-                        result_obj = namespace["result_df"]
-                        log(f"[DEBUG] result_df exists: {type(result_obj).__name__}")
-                        if result_obj is not None:
-                            log(f"[DEBUG] result_df is NOT None")
-                        else:
-                            log(f"[DEBUG] result_df is None (BAD)")
-                    else:
-                        log(f"[DEBUG] result_df NOT in namespace (BAD)")
-                    
-                    log("[PYTHON] Validating results...")
-
-                    break
-                    
-                except Exception as e:
-                    if attempt == 0:
-                        import traceback
-                        error_trace = traceback.format_exc()
-                        log(f"[PYTHON] Error occurred. Retrying... ({str(e)})")
-                        log(f"[DEBUG] Full traceback:\n{error_trace[:500]}")
-
-                        retry_prompt = python_prompt + f"\n\nERROR:\n{str(e)}\nFix the code."
-
-                        response = self.model.create_completion(
-                            retry_prompt,
-                            max_tokens=384,
-                            temperature=0.1,
-                        )
-
-                        python_code = clean_code(
-                            response.get("choices", [{}])[0].get("text", "").strip()
-                        )
-
-                        log("[PYTHON] Regenerated fixed code.")
-                        log(f"[PYTHON] Code preview:\n{python_code[:300]}")
-                        
-                        # Print full regenerated code to terminal
-                        print("\n" + "="*80)
-                        print("[PYTHON] FULL REGENERATED CODE TO BE EXECUTED:")
-                        print("="*80)
-                        print(python_code)
-                        print("="*80 + "\n")
-                        
-                        # Also add to UI
-                        log("\n" + "="*80)
-                        log("[PYTHON] FULL REGENERATED CODE TO BE EXECUTED:")
-                        log("="*80)
-                        log(python_code)
-                        log("="*80 + "\n")
-
-                    else:
-                        import traceback
-                        error_trace = traceback.format_exc()
-                        log(f"[PYTHON] ✗ Execution failed: {str(e)}")
-                        log(f"[DEBUG] Full traceback:\n{error_trace}")
-                        return {"error": f"Python execution failed: {str(e)}"}
-
-            # 🔹 Validate result
-            log(f"[DEBUG] Starting result validation...")
-            result_df = namespace.get("result_df")
-            log(f"[DEBUG] Retrieved result_df from namespace: {type(result_df).__name__}")
-            log(f"[PYTHON] Checking result_df...")
-
-            if result_df is None:
-                log(f"[DEBUG] ERROR: result_df is None")
-                log(f"[DEBUG] Available keys in namespace: {list(namespace.keys())}")
-                return {"error": "No result_df produced"}
-
-            log(f"[DEBUG] result_df type check: {isinstance(result_df, pd.DataFrame)}")
-            if not isinstance(result_df, pd.DataFrame):
-                log(f"[DEBUG] ERROR: result_df is {type(result_df).__name__}, not DataFrame")
-                return {"error": f"result_df is not a DataFrame (got {type(result_df).__name__})"}
-
-            log(f"[DEBUG] Getting row count...")
-            row_count = len(result_df)
-            col_count = len(result_df.columns)
-            log(f"[DEBUG] Row count: {row_count}, Column count: {col_count}")
-            
-            log(f"[PYTHON] ✓ Valid DataFrame with {row_count} rows, {col_count} columns")
-            log(f"[PYTHON] Execution completed in {execution_time}s")  
-            log(f"[PYTHON] Saving results to file...")
-
-            # 🔹 Save output
-            log(f"[DEBUG] Creating output directory...")
-            output_dir = os.path.join(app_data_path(), "processed_files")
-            os.makedirs(output_dir, exist_ok=True)
-            log(f"[DEBUG] Output dir exists: {output_dir}")
-
-            log(f"[DEBUG] Getting timestamp...")
-            timestamp = int(time.time())
-            log(f"[DEBUG] Timestamp: {timestamp}")
-            
-            ext_map = {"excel": "xlsx", "csv": "csv", "pdf": "pdf", "txt": "txt"}
-            ext = ext_map.get(output_format, "xlsx")
-            log(f"[DEBUG] Output format: {output_format} -> extension: {ext}")
-
-            output_file = os.path.join(output_dir, f"analysis_{timestamp}.{ext}")
-            log(f"[DEBUG] Output file path: {output_file}")
-
-            try:
-                if ext == "xlsx":
-                    log(f"[PYTHON] Writing to Excel file...")
-                    log(f"[DEBUG] Calling result_df.to_excel()...")
-                    result_df.to_excel(output_file, index=False)
-                    log(f"[DEBUG] Excel write completed")
-                elif ext == "csv":
-                    log(f"[PYTHON] Writing to CSV file...")
-                    log(f"[DEBUG] Calling result_df.to_csv()...")
-                    result_df.to_csv(output_file, index=False)
-                    log(f"[DEBUG] CSV write completed")
-                elif ext == "pdf":
-                    log(f"[PYTHON] Writing to CSV (PDF fallback)...")
-                    log(f"[DEBUG] Calling result_df.to_csv()...")
-                    result_df.to_csv(output_file, index=False)  # fallback
-                    log(f"[DEBUG] CSV write completed")
-                else:
-                    log(f"[PYTHON] Writing to TSV file...")
-                    log(f"[DEBUG] Calling result_df.to_csv() with TSV format...")
-                    result_df.to_csv(output_file, sep="\t", index=False)
-                    log(f"[DEBUG] TSV write completed")
-                
-                log(f"[DEBUG] Verifying file exists: {os.path.exists(output_file)}")
-                log(f"[PYTHON] ✓ Saved results to: {output_file}")
-            except Exception as save_error:
-                import traceback
-                error_trace = traceback.format_exc()
-                log(f"[PYTHON] ✗ Error saving file: {save_error}")
-                log(f"[DEBUG] Save error traceback:\n{error_trace}")
-                raise
-
-            summary = _clean_summary(status_messages, f"Total rows: {row_count}")
-
-            log(f"[DEBUG] Building response...")
-            log(f"[DEBUG] Summary length: {len(summary)} chars")
-            log(f"[DEBUG] File path: {output_file}")
-            log(f"[PYTHON] ✓✓✓ ANALYSIS COMPLETE ✓✓✓")
-
-            return {
-                "ok": True,
-                "response_text": summary,
-                "file_path": output_file
-            }
-
-        except Exception as e:
-            import traceback
-            print(f"[PYTHON] Error: {e}")
-            traceback.print_exc()
-            return {"error": f"Python analysis failed: {str(e)}"}
+        return self.python_analysis_workflow.execute(
+            dataframes,
+            instructions,
+            output_format,
+            pipeline_status_messages=pipeline_status_messages,
+        )
 
     def _create_duckdb_schema(self, conn, dataframes: dict) -> str:
         """Build schema description using actual DuckDB column types (post-registration).
@@ -7186,7 +5433,7 @@ Rules:
                 print(f"[AGENT-PDF] {name}: {len(page_list)} pages, "
                       f"{len(text)} chars extracted")
             if not text:
-                print(f"[AGENT-PDF] {name}: extraction failed — no readable text")
+                print(f"[AGENT-PDF] {name}: extraction failed - no readable text")
             return text or ""
 
         extracted = self._extract_text_from_bytes(ext, raw, mime_type)
@@ -7227,13 +5474,13 @@ Rules:
 
     def _extract_pdf_text_with_ocr(self, raw_pdf: bytes) -> tuple:
         """Extract text from PDF bytes using the unified _extract_pdf_full pipeline.
-        Returns (full_text, page_list) — same as _extract_pdf_full.
+        Returns (full_text, page_list) - same as _extract_pdf_full.
         Uses parallel OCR, page-level chunking, and progress status."""
         return self._extract_pdf_full(raw_bytes=raw_pdf)
 
     def _ensure_tesseract(self):
         """Find Tesseract OCR binary. Checks bundled location first (PyInstaller),
-        then PATH, then common system install paths. No auto-install — everything
+        then PATH, then common system install paths. No auto-install - everything
         needed should be bundled in the final app."""
         if getattr(self, '_tesseract_resolved', False):
             return not getattr(self, '_tesseract_missing', False)
@@ -7246,7 +5493,7 @@ Rules:
         try:
             importlib.import_module("pytesseract")
         except ImportError:
-            print("[OCR] pytesseract not bundled — OCR disabled.")
+            print("[OCR] pytesseract not bundled - OCR disabled.")
             self._tesseract_missing = True
             return False
 
@@ -7259,7 +5506,7 @@ Rules:
         else:
             app_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # 3. Search order: bundled → PATH → common system paths
+        # 3. Search order: bundled  -> PATH  -> common system paths
         candidates = []
         if system == "Windows":
             candidates = [
@@ -7309,7 +5556,7 @@ Rules:
             return True
         else:
             self._tesseract_missing = True
-            print("[OCR] Tesseract not found — scanned/image OCR disabled. Text-based PDFs still work.")
+            print("[OCR] Tesseract not found - scanned/image OCR disabled. Text-based PDFs still work.")
             return False
 
     def _ocr_image_bytes(self, raw_image: bytes) -> str:
@@ -7428,13 +5675,13 @@ Rules:
             # This anchors small models to letter output rather than echoing sources.
             return "Write the complete formal letter. Begin directly with the date:"
         elif fmt in ("csv_json", "json"):
-            # Structured JSON expected — prime the JSON object
+            # Structured JSON expected - prime the JSON object
             return '## Output\n\n```json\n{"rows": [\n'
         elif fmt in ("excel", "xlsx", "csv"):
-            # Table output — prime the first pipe to start a markdown table
+            # Table output - prime the first pipe to start a markdown table
             return "## Output\n\n| "
         else:
-            # Default (txt) — neutral heading with blank line
+            # Default (txt) - neutral heading with blank line
             return "## Output\n\n"
 
     def _estimate_max_tokens_dynamic(self, prompt_chars: int, output_format: str) -> int:
@@ -8472,7 +6719,7 @@ Rules:
             except Exception:
                 pass
 
-    # ── DuckDB-powered universal tabular query engine ──────────────
+    # -- DuckDB-powered universal tabular query engine --------------
 
     def _load_tabular_df(self, path: str):
         """Load a CSV/Excel file into a pandas DataFrame (all rows)."""
@@ -8493,8 +6740,8 @@ Rules:
 
     def _col_expand(self, col_name: str) -> list[str]:
         """Return all plausible lowercase forms of a column name.
-        E.g. 'CustomerName' → ['customername', 'customer name', 'customer_name']
-             'Unit_Price'   → ['unit_price', 'unit price', 'unitprice']
+        E.g. 'CustomerName'  -> ['customername', 'customer name', 'customer_name']
+             'Unit_Price'    -> ['unit_price', 'unit price', 'unitprice']
         """
         import re as _re
         forms = set()
@@ -8502,7 +6749,7 @@ Rules:
         forms.add(cl)
         forms.add(cl.replace('_', ' '))
         forms.add(cl.replace('_', ''))
-        # CamelCase split: "CustomerName" → "customer name"
+        # CamelCase split: "CustomerName"  -> "customer name"
         camel = _re.sub(r'([a-z])([A-Z])', r'\1 \2', col_name).lower()
         forms.add(camel)
         forms.add(camel.replace(' ', '_'))
@@ -8516,7 +6763,7 @@ Rules:
         'order' in 'in order to' or 'status' in 'what is the status'.
         """
         import re as _re
-        # Common English words that happen to be column names — skip them
+        # Common English words that happen to be column names - skip them
         _common_words = {
             'id', 'name', 'type', 'date', 'time', 'status', 'state',
             'order', 'product', 'item', 'price', 'amount', 'value',
@@ -8526,7 +6773,7 @@ Rules:
         for form in self._col_expand(col_name):
             if len(form) < 3:
                 continue
-            # Single common word → require strong data context nearby
+            # Single common word  -> require strong data context nearby
             if form in _common_words:
                 ctx_pat = (
                     r'(?:the file|this file|the data|this data|uploaded|csv|excel|'
@@ -8539,7 +6786,7 @@ Rules:
                 if _re.search(ctx_pat, query_lower):
                     return True
                 continue
-            # Multi-word or uncommon column name — word boundary match
+            # Multi-word or uncommon column name - word boundary match
             if _re.search(r'\b' + _re.escape(form) + r'\b', query_lower):
                 return True
         return False
@@ -8679,7 +6926,7 @@ Rules:
             return None
 
     def _precompute_tabular_answer(self, path: str, question: str) -> str:
-        """Universal DuckDB query engine — always returns computed results."""
+        """Universal DuckDB query engine - always returns computed results."""
         try:
             import importlib
             import re as _re
@@ -8697,7 +6944,7 @@ Rules:
             all_cols = list(df.columns)
             lines: list[str] = []
 
-            # ── 1) Schema / describe / structure ──────────────────────
+            # -- 1) Schema / describe / structure ----------------------
             _has_schema_kw = _re.search(r'\b(schema|describe|structure|columns?|fields?|info|dtype|dtypes|head|preview)\b', q)
             _has_transform_kw = _re.search(
                 r'\b(add|create|calculat|comput|deriv|new\s+column|multiply|divide|subtract|'
@@ -8721,7 +6968,7 @@ Rules:
                 conn.close()
                 return "\n".join(lines)
 
-            # ── 1b) Direct computed-column patterns (regex, no model needed) ──
+            # -- 1b) Direct computed-column patterns (regex, no model needed) --
             # "add 10% to Total_Amount as/called/new Net_Amount"
             _pct_match = _re.search(
                 r'(?:add|apply|calculat\w*|comput\w*)\s+'
@@ -8750,7 +6997,7 @@ Rules:
                     if not alias_match:
                         alias_match = _re.search(r'(?:new|as|called|named|into|column)\s+(\w+)', q)
                     alias = alias_match.group(1) if alias_match else f"{src_col}_plus_{int(pct_val)}pct"
-                    # Clean alias — don't use 'column' as the alias
+                    # Clean alias - don't use 'column' as the alias
                     if alias.lower() == 'column':
                         alias = f"{src_col}_plus_{int(pct_val)}pct"
                     multiplier = 1.0 + pct_val / 100.0
@@ -8772,7 +7019,7 @@ Rules:
             )
             if not _arith_match:
                 _arith_match = _re.search(
-                    r'(\w+)\s*[\*x×]\s*(\d+(?:\.\d+)?)', q
+                    r'(\w+)\s*[\*x]\s*(\d+(?:\.\d+)?)', q
                 )
             if _arith_match:
                 col_token = _arith_match.group(1)
@@ -8800,7 +7047,7 @@ Rules:
                         print(f"[TABULAR] Regex-arith SQL failed: {e}")
                         lines.clear()
 
-            # ── 1c) Dynamic / transformation requests → model SQL ─────
+            # -- 1c) Dynamic / transformation requests  -> model SQL -----
             _transform_kw = _re.search(
                 r'\b(add|create|calculat|comput|deriv|new\s+column|rename|'
                 r'multiply|divide|subtract|percentage|percent|%|ratio|'
@@ -8819,7 +7066,7 @@ Rules:
                     conn.close()
                     return sql_result
 
-            # ── Detect referenced columns ─────────────────────────────
+            # -- Detect referenced columns -----------------------------
             group_col = None
             agg_col = None
             filter_col = None
@@ -8854,7 +7101,7 @@ Rules:
                 target = grp_match.group(1).strip()
                 group_col = _find_col(text_cols + all_cols, target)
 
-            # If "total of X of Y" pattern — X likely agg, Y likely group
+            # If "total of X of Y" pattern - X likely agg, Y likely group
             of_of_match = _re.search(
                 r'\b(?:total|sum|average|avg|mean)\s+(?:of\s+)?(\w[\w\s]*?)\s+(?:of|by|per|for)\s+(\w[\w\s]*?)(?:\s|$)',
                 q,
@@ -8885,7 +7132,7 @@ Rules:
             if not agg_col and numeric_cols:
                 agg_col = numeric_cols[0]
 
-            # ── 2) Filter / where / find ──────────────────────────────
+            # -- 2) Filter / where / find ------------------------------
             filter_match = _re.search(r'\b(?:where|filter|find|show|for|with)\s+(\w[\w\s]*?)\s*(?:=|==|is|equals?|like)\s*["\']?(\w[\w\s]*?)["\']?\s*$', q)
             if filter_match:
                 fcol_search = filter_match.group(1).strip()
@@ -8904,7 +7151,7 @@ Rules:
                     print(f"[TABULAR] Branch 2 failed: {_e}, falling through to model SQL")
                     lines.clear()
 
-            # ── 3) Top-N / bottom-N ───────────────────────────────────
+            # -- 3) Top-N / bottom-N -----------------------------------
             top_match = _re.search(r'\b(top|bottom|best|worst|highest|lowest|largest|smallest)\s*(\d+)?\b', q)
             if top_match:
                 direction = top_match.group(1).lower()
@@ -8933,7 +7180,7 @@ Rules:
                     print(f"[TABULAR] Branch 3 failed: {_e}, falling through to model SQL")
                     lines.clear()
 
-            # ── 4) Correlation / relationship ─────────────────────────
+            # -- 4) Correlation / relationship -------------------------
             if _re.search(r'\b(correlat|relationship|relation)\b', q) and len(numeric_cols) >= 2:
                 try:
                     import pandas as pd
@@ -8946,7 +7193,7 @@ Rules:
                     print(f"[TABULAR] Branch 4 failed: {_e}, falling through to model SQL")
                     lines.clear()
 
-            # ── 5) Distinct / unique values ───────────────────────────
+            # -- 5) Distinct / unique values ---------------------------
             if _re.search(r'\b(distinct|unique|categories|values)\b', q):
                 target_col = group_col or (text_cols[0] if text_cols else all_cols[0])
                 sql = f'SELECT DISTINCT \"{target_col}\" AS value, COUNT(*) AS count FROM data_table GROUP BY \"{target_col}\" ORDER BY count DESC LIMIT 100'
@@ -8960,7 +7207,7 @@ Rules:
                     print(f"[TABULAR] Branch 5 failed: {_e}, falling through to model SQL")
                     lines.clear()
 
-            # ── 6) Count / how many ───────────────────────────────────
+            # -- 6) Count / how many -----------------------------------
             if _re.search(r'\b(count|how many|number of|total\s+(?:rows?|records?|entries|items?))\b', q) and not _re.search(r'\b(sum|average|avg|mean|total\s+(?:amount|price|sales|revenue|value|quantity))\b', q):
                 try:
                     if group_col:
@@ -8977,7 +7224,7 @@ Rules:
                     print(f"[TABULAR] Branch 6 failed: {_e}, falling through to model SQL")
                     lines.clear()
 
-            # ── 7) Group-by aggregation (sum/avg/min/max) ─────────────
+            # -- 7) Group-by aggregation (sum/avg/min/max) -------------
             if group_col and agg_col:
                 try:
                     agg_type = "SUM"
@@ -9005,14 +7252,14 @@ Rules:
                     print(f"[TABULAR] Branch 7 failed: {_e}, falling through to model SQL")
                     lines.clear()
 
-            # ── 8) Model-generated SQL (handles any question) ─────────
+            # -- 8) Model-generated SQL (handles any question) ---------
             if self.model is not None:
                 sql_result = self._model_generate_sql(conn, df, question, all_cols, total_rows)
                 if sql_result:
                     conn.close()
                     return sql_result
 
-            # ── 9) General numeric summary (last resort) ──────────────
+            # -- 9) General numeric summary (last resort) --------------
             if numeric_cols:
                 import pandas as pd
                 parts = []
@@ -9078,10 +7325,10 @@ Rules:
             precomputed = self._precompute_tabular_answer(self.uploaded_file_path, text)
 
             if precomputed:
-                # DuckDB produced correct data — this is the ONLY source of truth.
+                # DuckDB produced correct data - this is the ONLY source of truth.
                 display = precomputed
             else:
-                # DuckDB returned nothing — run structural analysis as fallback
+                # DuckDB returned nothing - run structural analysis as fallback
                 analysis = self._analyze_tabular_files(
                     [{"name": self.uploaded_file_name, "path": self.uploaded_file_path}],
                     text,
@@ -9180,7 +7427,7 @@ Rules:
             interval = 0.1
             while elapsed < duration_sec + 2.0:
                 if self._tts_stop_event.wait(timeout=interval):
-                    # Stop requested — kill playback
+                    # Stop requested - kill playback
                     winsound.PlaySound(None, winsound.SND_PURGE)
                     return
                 elapsed += interval
@@ -9213,7 +7460,7 @@ Rules:
         selected = str((self.app_settings or {}).get("tts_voice_id", "")).strip()
         payload = []
 
-        # ── System (pyttsx3 / SAPI) voices ──────────────────────
+        # -- System (pyttsx3 / SAPI) voices ----------------------
         try:
             import pyttsx3
             engine = pyttsx3.init()
@@ -9240,7 +7487,7 @@ Rules:
         except Exception:
             pass
 
-        # ── Downloaded Piper voices (models/voices/piper/*/*.onnx) ──
+        # -- Downloaded Piper voices (models/voices/piper/*/*.onnx) --
         try:
             piper_dir = app_data_path(os.path.join("models", "voices", "piper"))
             if os.path.isdir(piper_dir):
@@ -9254,9 +7501,9 @@ Rules:
                         continue
                     onnx_path = os.path.join(voice_folder, onnx_files[0])
                     vid = f"piper:{folder_name}"
-                    # Derive friendly name from folder:  en_US-lessac-medium → English US - Lessac (Piper)
+                    # Derive friendly name from folder:  en_US-lessac-medium  -> English US - Lessac (Piper)
                     pretty = folder_name.replace("-", " ").replace("_", " ").title()
-                    label = f"🔊 {pretty} (Piper)"
+                    label = f"[tool]  {pretty} (Piper)"
                     payload.append({
                         "id": vid,
                         "name": folder_name,
@@ -9279,7 +7526,7 @@ Rules:
                     "onnx_url": f"{_B}/{prefix}.onnx?download=true",
                     "json_url": f"{_B}/{prefix}.onnx.json?download=true"}
         return [
-            # ── English US ─────────────────────────────────
+            # -- English US ---------------------------------
             _v("en_US-lessac-medium",   "English US - Lessac",        "en", "en_US", "lessac"),
             _v("en_US-amy-medium",      "English US - Amy",           "en", "en_US", "amy"),
             _v("en_US-bryce-medium",    "English US - Bryce",         "en", "en_US", "bryce"),
@@ -9294,7 +7541,7 @@ Rules:
             _v("en_US-ljspeech-medium", "English US - LJSpeech",      "en", "en_US", "ljspeech"),
             _v("en_US-norman-medium",   "English US - Norman",        "en", "en_US", "norman"),
             _v("en_US-ryan-medium",     "English US - Ryan",          "en", "en_US", "ryan"),
-            # ── English UK ─────────────────────────────────
+            # -- English UK ---------------------------------
             _v("en_GB-alan-medium",     "English UK - Alan",          "en", "en_GB", "alan"),
             _v("en_GB-alba-medium",     "English UK - Alba",          "en", "en_GB", "alba"),
             _v("en_GB-aru-medium",      "English UK - Aru",           "en", "en_GB", "aru"),
@@ -9302,7 +7549,7 @@ Rules:
             _v("en_GB-jenny_dioco-medium","English UK - Jenny Dioco", "en", "en_GB", "jenny_dioco"),
             _v("en_GB-northern_english_male-medium","English UK - Northern Male","en","en_GB","northern_english_male"),
             _v("en_GB-southern_english_female-medium","English UK - Southern Female","en","en_GB","southern_english_female"),
-            # ── German ─────────────────────────────────────
+            # -- German -------------------------------------
             _v("de_DE-thorsten-medium", "German - Thorsten",          "de", "de_DE", "thorsten"),
             _v("de_DE-thorsten_emotional-medium","German - Thorsten Emotional","de","de_DE","thorsten_emotional"),
             _v("de_DE-eva_k-medium",    "German - Eva K",             "de", "de_DE", "eva_k"),
@@ -9310,17 +7557,17 @@ Rules:
             _v("de_DE-kerstin-low",     "German - Kerstin (low)",     "de", "de_DE", "kerstin", "low"),
             _v("de_DE-ramona-low",      "German - Ramona (low)",      "de", "de_DE", "ramona", "low"),
             _v("de_DE-pavoque-low",     "German - Pavoque (low)",     "de", "de_DE", "pavoque", "low"),
-            # ── French ─────────────────────────────────────
+            # -- French -------------------------------------
             _v("fr_FR-siwis-medium",    "French - Siwis",             "fr", "fr_FR", "siwis"),
             _v("fr_FR-gilles-low",      "French - Gilles (low)",      "fr", "fr_FR", "gilles", "low"),
             _v("fr_FR-tom-medium",      "French - Tom",               "fr", "fr_FR", "tom"),
-            # ── Spanish ────────────────────────────────────
+            # -- Spanish ------------------------------------
             _v("es_ES-carlfm-medium",   "Spanish - Carlfm",           "es", "es_ES", "carlfm"),
             _v("es_ES-davefx-medium",   "Spanish - Davefx",           "es", "es_ES", "davefx"),
             _v("es_ES-sharvard-medium", "Spanish - Sharvard",         "es", "es_ES", "sharvard"),
-            # ── Hindi ──────────────────────────────────────
+            # -- Hindi --------------------------------------
             _v("hi_IN-pratham-medium",  "Hindi India - Pratham",       "hi", "hi_IN", "pratham"),
-            # ── Tamil ──────────────────────────────────────
+            # -- Tamil --------------------------------------
             _v("ta_IN-kani-medium",     "Tamil India - Kani",          "ta", "ta_IN", "kani"),
         ]
 
@@ -9497,7 +7744,7 @@ Rules:
         except Exception as e:
             return {"error": f"WAV export failed: {e}"}
 
-    # ── Generation ─────────────────────────────────────────────
+    # -- Generation ---------------------------------------------
 
     def send_message(self, text: str):
         """Process user message. Returns immediately; streams via events."""
@@ -9507,7 +7754,7 @@ Rules:
         if not text:
             return {"error": "Empty message"}
 
-        # Parse @rag_name mention → activate that RAG database for this message
+        # Parse @rag_name mention  -> activate that RAG database for this message
         text, mentioned_rag = self._resolve_rag_mention(text)
         if mentioned_rag:
             self.current_rag_database = mentioned_rag
@@ -9532,7 +7779,7 @@ Rules:
         if plugin_out.get("handled"):
             return {"ok": True, "plugin_command": True, "plugin_result": plugin_out.get("result")}
 
-        # ── Direct file-export short-circuit ──────────────────────
+        # -- Direct file-export short-circuit ----------------------
         # When the user has a file uploaded and the intent is purely
         # "export this to csv/excel/docx", skip the LLM entirely and
         # produce the file immediately.
@@ -9544,7 +7791,7 @@ Rules:
                     path = self._export_uploaded_file_as(export_fmt, self.current_chat_id or "export")
                     if path:
                         fname = os.path.basename(path)
-                        reply = f"✅ Exported to **{export_fmt.upper()}**: `{fname}`\n\nFile saved at: `{path}`"
+                        reply = f"x Exported to **{export_fmt.upper()}**: `{fname}`\n\nFile saved at: `{path}`"
                         self._emit("message_added", {"role": "assistant", "content": reply})
                         self.message_history.append({"role": "assistant", "content": reply})
                         self.chats[self.current_chat_id] = self.message_history
@@ -9553,7 +7800,7 @@ Rules:
                                                      "chat_id": self.current_chat_id})
                         self._status(f"Exported to {path}")
                     else:
-                        # Could not export directly — fall back to normal LLM flow
+                        # Could not export directly - fall back to normal LLM flow
                         self._generate(text, request_options)
                 except Exception as exc:
                     self._emit("generation_error", {"error": str(exc)})
@@ -9583,7 +7830,7 @@ Rules:
         else:
             self._emit("message_added",
                        {"role": "assistant",
-                        "content": "⚠ No model loaded. Load a model or enable Web Search."})
+                        "content": "Warning  No model loaded. Load a model or enable Web Search."})
             self._status("No model loaded")
         return {"ok": True}
 
@@ -9640,7 +7887,7 @@ Rules:
         else:
             assistant_msg = {
                 "role": "assistant",
-                "content": "⚠ No model loaded. Load a model or enable Web Search.",
+                "content": "Warning  No model loaded. Load a model or enable Web Search.",
             }
             self.message_history.append(assistant_msg)
             self.chats[self.current_chat_id] = self.message_history
@@ -9660,24 +7907,69 @@ Rules:
         self._status("AI is thinking...")
 
         try:
-            # ── 1) Gather context ─────────────────────────────────────
+            # -- 1) Gather context -------------------------------------
             user_system = self.chat_system_prompts.get(self.current_chat_id, "")
             system_prompt = user_system if user_system else self._DEFAULT_SYSTEM
+
+            # Use the model-enforced context when available. This avoids
+            # over-budget prompts if self.actual_n_ctx is stale/high.
+            effective_n_ctx = int(getattr(self, "actual_n_ctx", 4096) or 4096)
+            try:
+                model_ctx_getter = getattr(self.model, "n_ctx", None)
+                model_ctx = 0
+                if callable(model_ctx_getter):
+                    model_ctx = int(model_ctx_getter() or 0)
+                elif isinstance(model_ctx_getter, (int, float)):
+                    model_ctx = int(model_ctx_getter)
+                if model_ctx > 0:
+                    effective_n_ctx = min(effective_n_ctx, model_ctx) if effective_n_ctx > 0 else model_ctx
+            except Exception:
+                pass
+            effective_n_ctx = max(256, int(effective_n_ctx))
+            runtime_plan = self.runtime_planner.plan(effective_n_ctx)
 
             conversation_msgs = self._get_conversation_messages()
             rag_context = ""
             rag_sources = []
-            file_context = self._get_relevant_uploaded_chunk(text)
+            file_context = self._get_relevant_uploaded_chunk(text, max_chars=runtime_plan.file_budget_chars())
 
             # RAG retrieval
             if self.current_rag_database and self.rag_manager:
                 try:
-                    results = self.rag_manager.retrieve(
-                        self.current_rag_database, text, k=5)
+                    if hasattr(self.rag_manager, "retrieve_detailed"):
+                        results = self.rag_manager.retrieve_detailed(
+                            self.current_rag_database, text, k=runtime_plan.rag_top_k)
+                    else:
+                        results = [
+                            {"chunk": chunk, "score": score, "source": ""}
+                            for chunk, score in self.rag_manager.retrieve(self.current_rag_database, text, k=runtime_plan.rag_top_k)
+                        ]
                     if results:
-                        chunks = [r[0] for r in results]
+                        chunks = []
+                        for item in results:
+                            chunk = str(item.get("chunk", "") or "").strip()
+                            if not chunk:
+                                continue
+                            source = str(item.get("source", "") or "").strip()
+                            label = f"[Source: {source}, score {float(item.get('score', 0.0)):.3f}]\n" if source else ""
+                            chunks.append(label + chunk)
                         rag_sources = self._extract_rag_sources(chunks)
-                        rag_context = "Reference context:\n" + "\n---\n".join(chunks)
+                        # Keep RAG context bounded for chat; very large chunks can overflow
+                        # small-context models even when user input is short.
+                        rag_budget = runtime_plan.rag_budget_chars()
+                        per_chunk_cap = max(450, rag_budget // max(1, len(chunks)))
+                        bounded_chunks = []
+                        used = 0
+                        for ch in chunks:
+                            piece = ch[:per_chunk_cap]
+                            if used + len(piece) > rag_budget:
+                                remain = rag_budget - used
+                                if remain > 220:
+                                    bounded_chunks.append(piece[:remain])
+                                break
+                            bounded_chunks.append(piece)
+                            used += len(piece)
+                        rag_context = "Reference context:\n" + "\n---\n".join(bounded_chunks)
                 except Exception:
                     pass
 
@@ -9690,14 +7982,14 @@ Rules:
                 r"\b(export|save|convert|extract|download)\b.{0,20}\b(csv|xlsx|excel|file|pdf)\b",
                 text, re.IGNORECASE,
             )
-            if self.actual_n_ctx >= 2048 and (
+            if effective_n_ctx >= 2048 and (
                 not rag_context or user_wants_action
             ):
                 tool_defs = self._build_tool_definitions()
                 if tool_defs:
                     system_prompt = system_prompt + "\n\n" + tool_defs
 
-            # ── 2) Build extra context block ──────────────────────────
+            # -- 2) Build extra context block --------------------------
             extra_parts = []
             if rag_context:
                 extra_parts.append(rag_context)
@@ -9717,7 +8009,7 @@ Rules:
                 extra_parts.append(f"Execution guidance:\n{workflow_guidance}")
             extra_context = "\n\n".join(extra_parts)
 
-            # ── 3) Build prompt with proper chat template ─────────────
+            # -- 3) Build prompt with proper chat template -------------
             prompt = self._build_chat_prompt(
                 system=system_prompt,
                 messages=conversation_msgs,
@@ -9725,29 +8017,85 @@ Rules:
                 extra_context=extra_context,
             )
 
-            # ── 4) Token budget ───────────────────────────────────────
-            try:
-                prompt_tokens = len(self.model.tokenize(prompt.encode("utf-8")))
-            except Exception:
-                prompt_tokens = len(prompt) // 4
-            available = max(64, self.actual_n_ctx - prompt_tokens - 64)
-            max_tokens = available
+            # -- 4) Token budget ---------------------------------------
+            def _count_prompt_tokens(s: str) -> int:
+                try:
+                    return len(self.model.tokenize(s.encode("utf-8")))
+                except Exception:
+                    return max(1, len(s) // 4)
+
+            prompt_tokens = _count_prompt_tokens(prompt)
+
+            # Keep a safety margin so stop tokens and reply generation fit.
+            hard_prompt_limit = max(256, int(effective_n_ctx) - 96)
+            trim_round = 0
+            context_trimmed = False
+
+            while prompt_tokens > hard_prompt_limit and trim_round < 12:
+                trim_round += 1
+                trimmed_this_round = False
+
+                # 1) Trim auxiliary context first (RAG/file/web guidance).
+                if extra_context and len(extra_context) > 1200:
+                    keep = max(1200, int(len(extra_context) * 0.72))
+                    extra_context = extra_context[:keep]
+                    trimmed_this_round = True
+
+                # 2) Then trim oldest conversation turns.
+                elif len(conversation_msgs) > 2:
+                    drop = max(1, len(conversation_msgs) // 3)
+                    conversation_msgs = conversation_msgs[drop:]
+                    trimmed_this_round = True
+                elif len(conversation_msgs) > 0:
+                    conversation_msgs = conversation_msgs[1:]
+                    trimmed_this_round = True
+
+                # 3) Last resort: trim system prompt.
+                elif len(system_prompt) > 700:
+                    keep = max(700, int(len(system_prompt) * 0.88))
+                    system_prompt = system_prompt[:keep]
+                    trimmed_this_round = True
+
+                if not trimmed_this_round:
+                    break
+
+                context_trimmed = True
+                prompt = self._build_chat_prompt(
+                    system=system_prompt,
+                    messages=conversation_msgs,
+                    user_text=text,
+                    extra_context=extra_context,
+                )
+                prompt_tokens = _count_prompt_tokens(prompt)
+
+            if prompt_tokens > hard_prompt_limit:
+                self._emit("generation_error", {
+                    "error": (
+                        f"Prompt too large for model context ({prompt_tokens} > {effective_n_ctx}). "
+                        "Please start a new chat or reduce attached context."
+                    )
+                })
+                self._status("Context window exceeded")
+                return
+
+            available = max(64, effective_n_ctx - prompt_tokens - 64)
+            user_max_tokens = None
 
             # Respect user-set max response tokens limit
-            # -1 = "Max" (use full available context), 0 = Auto, >0 = fixed cap
+            # -1 = "Max" (planner uses resumable per-pass budget), 0 = Auto, >0 = fixed cap
             user_max = self.app_settings.get("max_response_tokens")
-            if user_max and int(user_max) == -1:
-                pass  # Max — use all available tokens
-            elif user_max and int(user_max) > 0:
-                max_tokens = min(max_tokens, int(user_max))
+            if user_max and int(user_max) > 0:
+                user_max_tokens = int(user_max)
+            max_tokens = runtime_plan.response_budget(available, user_max_tokens)
 
             self._emit("context_usage", {
                 "prompt_tokens": prompt_tokens,
-                "effective_window": self.actual_n_ctx,
+                "effective_window": effective_n_ctx,
                 "max_tokens": max_tokens,
+                "context_trimmed": context_trimmed,
+                "runtime_tier": runtime_plan.tier,
+                "continuation_enabled": runtime_plan.continuation_enabled,
             })
-
-            # ── 5) Adaptive sampling based on task ────────────────────
             task = self._detect_task_type(text)
             params = self._get_adaptive_params(task)
             stop_tokens = self._get_stop_tokens()
@@ -9759,7 +8107,7 @@ Rules:
             token_count = 0
             was_stopped = False
 
-            # ── 6) Stream inference ───────────────────────────────────
+            # -- 6) Stream inference -----------------------------------
             with self.model_lock:
                 if self.model is None:
                     raise RuntimeError("Model not loaded")
@@ -9794,11 +8142,11 @@ Rules:
                         # Update context usage
                         self._emit("context_usage", {
                             "prompt_tokens": prompt_tokens + token_count,
-                            "effective_window": self.actual_n_ctx,
+                            "effective_window": effective_n_ctx,
                             "max_tokens": max_tokens,
                         })
 
-            # ── 7) Finalize output ────────────────────────────────────
+            # -- 7) Finalize output ------------------------------------
             think_blocks = _RE_THINK.findall(response)
             display = _RE_THINK.sub("", response).strip()
             # Strip incomplete think tags at the end
@@ -9809,20 +8157,78 @@ Rules:
             if not display:
                 display = response.strip()
 
+            pre_tool_call = self._parse_tool_call(response + "</tool_call>") if tool_defs else None
+            if not pre_tool_call and hasattr(self, 'mcp_manager') and self.mcp_manager.get_all_tools():
+                pre_tool_call = self._parse_tool_call(response + "</tool_call>")
+
+            if (
+                not was_stopped
+                and not pre_tool_call
+                and runtime_plan.continuation_enabled
+                and looks_incomplete(display, token_count, max_tokens)
+            ):
+                for _continuation_idx in range(runtime_plan.max_continuations):
+                    if self.stop_generation_flag:
+                        was_stopped = True
+                        break
+                    self._status("Continuing answer...")
+                    continuation_msgs = list(conversation_msgs)
+                    continuation_msgs.append({"role": "user", "content": text})
+                    continuation_msgs.append({"role": "assistant", "content": display})
+                    continuation_prompt = self._build_chat_prompt(
+                        system=system_prompt,
+                        messages=continuation_msgs,
+                        user_text=(
+                            "Continue the previous answer from exactly where it stopped. "
+                            "Do not restart, do not summarize, and finish the remaining answer."
+                        ),
+                        extra_context="",
+                    )
+                    continuation_available = max(64, effective_n_ctx - _count_prompt_tokens(continuation_prompt) - 64)
+                    continuation_budget = runtime_plan.response_budget(continuation_available, user_max_tokens)
+                    continuation_text = ""
+                    continuation_tokens = 0
+                    with self.model_lock:
+                        if self.model is None:
+                            break
+                        cont_stream = self.model(
+                            continuation_prompt,
+                            max_tokens=continuation_budget,
+                            temperature=params["temperature"],
+                            top_p=params["top_p"],
+                            top_k=params.get("top_k", 50),
+                            repeat_penalty=params["repeat_penalty"],
+                            stream=True,
+                            stop=stop_tokens,
+                        )
+                        for chunk in cont_stream:
+                            if self.stop_generation_flag:
+                                was_stopped = True
+                                break
+                            token = chunk["choices"][0].get("text", "")
+                            continuation_text += token
+                            continuation_tokens += 1
+                            self._emit("generation_token", {"text": (display + continuation_text).strip()})
+                    response += continuation_text
+                    display = _RE_THINK.sub("", response).strip()
+                    display = _RE_THINK_INCOMPLETE.sub("", display).strip()
+                    display = re.sub(r"</?tool_call[^>]*>", "", display).strip()
+                    if was_stopped or not looks_incomplete(display, continuation_tokens, continuation_budget):
+                        break
             if was_stopped:
                 self._emit("generation_stopped", {"text": display})
                 self._status("Generation stopped")
                 return
 
-            # ── 7b) Tool-call detection & execution ───────────────────
-            tool_call = self._parse_tool_call(response + "</tool_call>") if tool_defs else None
+            # -- 7b) Tool-call detection & execution -------------------
+            tool_call = pre_tool_call or (self._parse_tool_call(response + "</tool_call>") if tool_defs else None)
             # Also check for MCP tools even without local plugins
             if not tool_call and hasattr(self, 'mcp_manager') and self.mcp_manager.get_all_tools():
                 tool_call = self._parse_tool_call(response + "</tool_call>")
             if tool_call:
                 cmd, args_str = tool_call
 
-                # ── Permission gate for dangerous tools ────────────────
+                # -- Permission gate for dangerous tools ----------------
                 is_mcp = isinstance(cmd, str) and cmd.startswith("mcp:")
                 if is_mcp or cmd not in self._SAFE_TOOLS:
                     desc = self.plugin_commands.get(cmd, {}).get("description", cmd)
@@ -9837,7 +8243,7 @@ Rules:
                     # Wait up to 60 s for user response
                     self._tool_permission_event.wait(timeout=60)
                     if not self._tool_permission_granted:
-                        display = f"⚠️ Tool `{cmd}` was not approved. Operation cancelled."
+                        display = f"Warning  Tool `{cmd}` was not approved. Operation cancelled."
                         self._emit("generation_token", {"text": display})
                         self._emit("generation_done", {"text": display})
                         self.message_history.append({"role": "assistant", "content": display})
@@ -9846,7 +8252,7 @@ Rules:
                         return
 
                 self._status(f"Running tool: {cmd}...")
-                self._emit("generation_token", {"text": f"🔧 Running `{cmd}`..."})
+                self._emit("generation_token", {"text": f"[tool] Running `{cmd}`..."})
 
                 tool_result = self._execute_tool_call(cmd, args_str)
 
@@ -9945,7 +8351,7 @@ Rules:
 
         Sets the flag immediately so all generation loops notice it on their
         next iteration.  The ``generation_stopped`` event is emitted here ONLY
-        when nothing is actively running — streaming chat emits the event
+        when nothing is actively running - streaming chat emits the event
         itself once the token loop exits, and agent_chat is a synchronous call
         whose JS finally-block resets the UI when it returns.
         Firing the event prematurely would reset the UI while the backend
@@ -9958,7 +8364,7 @@ Rules:
             self._emit("generation_stopped", {"text": ""})
         return {"ok": True}
 
-    # ── Prompt engineering helpers ─────────────────────────────
+    # -- Prompt engineering helpers -----------------------------
 
     _DEFAULT_SYSTEM = (
         "You are a helpful, accurate, and concise AI assistant. "
@@ -10012,7 +8418,7 @@ Rules:
         """Build a properly formatted chat prompt using the right template."""
         family = self._detect_model_family()
 
-        # Clean messages — strip think tags, limit content length
+        # Clean messages - strip think tags, limit content length
         cleaned = []
         for m in messages:
             content = _RE_THINK.sub("", m["content"]).strip()
@@ -10212,7 +8618,7 @@ Rules:
                     total += len(page_text) + 2
                 return "\n\n".join(selected)
 
-            # No keyword match — return first + last pages as context
+            # No keyword match - return first + last pages as context
             first_pages = "\n\n".join(pages[:3])
             if len(first_pages) > max_chars:
                 return first_pages[:max_chars]
@@ -10243,7 +8649,7 @@ Rules:
             total += len(line) + 1
         return "\n".join(selected)
 
-    # ── Web search ─────────────────────────────────────────────
+    # -- Web search ---------------------------------------------
 
     def toggle_web_search(self):
         self.web_search_enabled = not self.web_search_enabled
@@ -10254,7 +8660,7 @@ Rules:
         self.stop_generation_flag = False
         self._emit("generation_start", None)
 
-        # Step 1 — AI query refinement
+        # Step 1 - AI query refinement
         self._status("Refining search query...")
         refined_query = self._refine_search_query(query)
         self._emit("web_search_start", {"query": refined_query})
@@ -10270,7 +8676,7 @@ Rules:
                 self._status("Generation stopped")
                 return
 
-            # Step 2 — Deepening: try original query & alternative phrasing
+            # Step 2 - Deepening: try original query & alternative phrasing
             if len(sources) < 4 and not self.stop_generation_flag:
                 self._status("Deepening research...")
                 seen_urls = {s["url"] for s in sources}
@@ -10370,7 +8776,7 @@ Rules:
     def _search_web(self, query: str, num_results: int = 8) -> tuple:
         """Return (context_str, sources_list).
 
-        Priority: Brave API (if key set) → DuckDuckGo → Bing (fallback).
+        Priority: Brave API (if key set)  -> DuckDuckGo  -> Bing (fallback).
         If primary engine returns thin results (<4), merges with next engine
         for better coverage. Results cached per-session."""
         cache_key = query.strip().lower()
@@ -10386,7 +8792,7 @@ Rules:
             if result[1]:
                 primary_sources = result[1]
 
-        # DDG — either as primary or supplementary
+        # DDG - either as primary or supplementary
         if len(primary_sources) < 4:
             ddg_result = self._search_ddg(query, num_results)
             if ddg_result[1]:
@@ -10400,7 +8806,7 @@ Rules:
                             primary_sources.append(s)
                             seen.add(s["url"])
 
-        # Bing — as final fallback or supplementary
+        # Bing - as final fallback or supplementary
         if len(primary_sources) < 4:
             bing_result = self._search_bing(query, num_results)
             if bing_result[1]:
@@ -10424,18 +8830,18 @@ Rules:
         print(f"[WEB] Search complete: {len(primary_sources)} sources for '{query[:60]}'")
         return result
 
-    # ── Individual search engine helpers ──────────────────────
+    # -- Individual search engine helpers ----------------------
 
     def _build_search_context(self, sources: list, query: str) -> tuple:
         """Fetch excerpts in parallel and build LLM context string.
         Dynamically scales excerpt size to use available context window."""
         # Dynamic excerpt limit based on model context
         n_ctx = getattr(self, "actual_n_ctx", 2048)
-        # Use ~30% of context for web content, convert tokens→chars (~3.5 chars/token)
+        # Use ~30% of context for web content, convert tokens -> chars (~3.5 chars/token)
         max_web_chars = int(n_ctx * 3.5 * 0.30)
         per_source_chars = max(400, max_web_chars // max(1, len(sources)))
 
-        # Parallel excerpt fetching — up to 8 workers
+        # Parallel excerpt fetching - up to 8 workers
         need_excerpt = [s for s in sources if not s.get("excerpt")]
         if need_excerpt:
             def _fetch(s):
@@ -10463,7 +8869,7 @@ Rules:
         return context, sources
 
     def _search_brave(self, query: str, num_results: int, api_key: str) -> tuple:
-        """Brave Search API — best quality, requires free API key."""
+        """Brave Search API - best quality, requires free API key."""
         try:
             import requests
             r = requests.get(
@@ -10498,7 +8904,7 @@ Rules:
             return "Search error.", []
 
     def _search_ddg(self, query: str, num_results: int) -> tuple:
-        """DuckDuckGo search — prefers `duckduckgo_search` library,
+        """DuckDuckGo search - prefers `duckduckgo_search` library,
         falls back to HTML scraping, then Lite page."""
         # Attempt 1: Use ddgs library (most reliable)
         try:
@@ -10530,7 +8936,7 @@ Rules:
                 print(f"[WEB] DDG library returned {len(sources)} results")
                 return self._build_search_context(sources, query)
         except ImportError:
-            pass   # Library not installed — fall through to HTML
+            pass   # Library not installed - fall through to HTML
         except Exception as e:
             print(f"[WEB] DDG library error: {type(e).__name__}: {e}")
 
@@ -10599,7 +9005,7 @@ Rules:
             return "", []
 
     def _search_bing(self, query: str, num_results: int) -> tuple:
-        """Bing HTML scraping — no API key required, used as fallback."""
+        """Bing HTML scraping - no API key required, used as fallback."""
         try:
             from bs4 import BeautifulSoup
             import requests
@@ -10666,7 +9072,7 @@ Rules:
             "Sources:\n" + src_labels +
             "Do NOT simply list the search results. Synthesize them into a coherent answer."
         )
-        # Dynamic context cap — use up to 40% of context window for web content
+        # Dynamic context cap - use up to 40% of context window for web content
         max_web_chars = int(self.actual_n_ctx * 3.5 * 0.40)
         trimmed = context[:max(4000, max_web_chars)]
         extra = f"Search results:\n{trimmed}"
@@ -10744,7 +9150,7 @@ Rules:
         )
         self._status("Ready")
 
-    # ── Compare models ────────────────────────────────────────
+    # -- Compare models ----------------------------------------
 
     def compare_models(self, model_a_label: str, model_b_label: str, prompt_text: str):
         """Run side-by-side comparison using two models."""
@@ -10788,7 +9194,7 @@ Rules:
 
         return {"ok": True, **result}
 
-    # ── Image support ─────────────────────────────────────────
+    # -- Image support -----------------------------------------
 
     def get_vision_status(self):
         """Return whether multimodal assets are available."""
@@ -10865,7 +9271,7 @@ Rules:
             if not paths:
                 return {"selected": False}
 
-            # Clear previous files — dialog upload replaces, drag-drop appends
+            # Clear previous files - dialog upload replaces, drag-drop appends
             self.uploaded_files = []
             self.uploaded_content = None
             self.uploaded_file_name = None
@@ -11089,7 +9495,7 @@ Rules:
             return {"error": str(e)}
 
     def _build_tabular_preview_fast(self, path: str) -> str:
-        """Lightweight preview — reads only a few rows for instant UI feedback."""
+        """Lightweight preview - reads only a few rows for instant UI feedback."""
         try:
             import pandas as pd
             ext = os.path.splitext(path)[1].lower()
@@ -11116,7 +9522,7 @@ Rules:
             ]
             if numeric_cols:
                 lines.append(f"Numeric columns: {', '.join(numeric_cols[:20])}")
-            lines.append(f"\nAsk me questions about this data — I'll compute accurate answers using SQL.")
+            lines.append(f"\nAsk me questions about this data - I'll compute accurate answers using SQL.")
             return "\n".join(lines)
         except Exception as e:
             return f"Tabular file attached: {os.path.basename(path)} (preview error: {e})"
@@ -11137,7 +9543,7 @@ Rules:
     def _extract_text_from_file(self, path: str) -> str:
         ext = os.path.splitext(path)[1].lower()
         try:
-            # Plain-text / code / config files — read directly
+            # Plain-text / code / config files - read directly
             if ext in (".txt", ".md", ".log", ".json", ".xml", ".html", ".htm",
                         ".yaml", ".yml", ".sql", ".py", ".js", ".css",
                         ".ini", ".cfg", ".toml", ".tsv", ".rtf"):
@@ -11174,7 +9580,7 @@ Rules:
         return ""
 
     def _extract_pdf_full(self, path: str = "", raw_bytes: bytes = b"") -> tuple:
-        """Extract ALL text from a PDF — text pages + OCR for scanned pages.
+        """Extract ALL text from a PDF - text pages + OCR for scanned pages.
         Accepts a file *path* OR *raw_bytes* (at least one required).
         Returns (full_text, page_list) so callers can use pages without
         mutating self.uploaded_pages.  The chat-mode caller still writes
@@ -11226,7 +9632,7 @@ Rules:
                 # Readable text page
                 pages.append(f"[Page {i+1}]\n{page_text}")
             else:
-                # Scanned / image-only page — queue for OCR
+                # Scanned / image-only page - queue for OCR
                 try:
                     pix = page.get_pixmap(dpi=200, alpha=False)
                     img_bytes = pix.tobytes("png")
@@ -11256,7 +9662,7 @@ Rules:
                     done_count += 1
                     idx, text = fut.result()
                     if text:
-                        pages[idx] = f"[Page {idx+1} — OCR]\n{text}"
+                        pages[idx] = f"[Page {idx+1} - OCR]\n{text}"
                     if done_count % 10 == 0:
                         self._status(f"OCR... {done_count}/{len(ocr_tasks)} pages done")
 
@@ -11303,8 +9709,8 @@ Rules:
 
                     has_ocr = bool((ocr_text or "").strip())
                     note = (
-                        f"📷 Image attached: {os.path.basename(image_path)}\n\n"
-                        "⚠ Vision chat is unavailable with current assets. "
+                        f"[image] Image attached: {os.path.basename(image_path)}\n\n"
+                        "Warning  Vision chat is unavailable with current assets. "
                         f"{vision_status.get('reason', 'Missing multimodal projector file')}\n"
                     )
                     if has_ocr:
@@ -11440,7 +9846,7 @@ Rules:
             print(f"[Vision] generation failed: {e}")
             return None
 
-    # ── RAG management ─────────────────────────────────────────
+    # -- RAG management -----------------------------------------
 
     def get_rag_databases(self):
         """Return list of RAG databases."""
@@ -11562,7 +9968,7 @@ Rules:
             self._status(f"Reindex error: {e}")
             return {"error": str(e)}
 
-    # ── Settings ───────────────────────────────────────────────
+    # -- Settings -----------------------------------------------
 
     def get_app_info(self):
         """Return system + app info for settings display."""
@@ -11607,7 +10013,7 @@ Rules:
             })
         return cmds
 
-    # ── Tool permission gate (called from JS) ─────────────────
+    # -- Tool permission gate (called from JS) -----------------
 
     def approve_tool_execution(self):
         """User approved a dangerous tool call."""
@@ -11630,7 +10036,7 @@ Rules:
         except Exception as e:
             return {"error": str(e)}
 
-    # ── Create Plugin with AI ──────────────────────────────────
+    # -- Create Plugin with AI ----------------------------------
 
     _PLUGIN_SYSTEM_PROMPT = """You are an expert Python developer writing plugins for SIMPLE_AI, \
 a local AI chat desktop application built with llama-cpp-python and pywebview.
@@ -11651,18 +10057,18 @@ def unregister(app):  # optional
 ```
 
 ## What `app` exposes
-- `app.message_history` — list[dict] like [{"role":"user","content":"..."}, ...]
-- `app.current_chat_id` — str ID of the active chat
-- `app.model` — loaded llama-cpp-python Llama model (None when no model loaded)
-- `app._emit(event_name, data)` — push event to the frontend JS; data must be JSON-serialisable
-- `app._status(text)` — update the status bar
-- `app.app_settings` — dict of user settings (keys: theme, font_size, brave_api_key, …)
-- `app.plugin_manager` — PluginManager instance
+- `app.message_history` - list[dict] like [{"role":"user","content":"..."}, ...]
+- `app.current_chat_id` - str ID of the active chat
+- `app.model` - loaded llama-cpp-python Llama model (None when no model loaded)
+- `app._emit(event_name, data)` - push event to the frontend JS; data must be JSON-serialisable
+- `app._status(text)` - update the status bar
+- `app.app_settings` - dict of user settings (keys: theme, font_size, brave_api_key, ...)
+- `app.plugin_manager` - PluginManager instance
 - `app.register_plugin_command('/name', handler, plugin_name='...', description='...')`
 - `app.unregister_plugin_command('/name')`
-- `app.execute_python_snippet(code, timeout=8)` — restricted Python runner for plugin commands
-- `app._DEFAULT_SYSTEM` — default system prompt string (can be overridden)
-- `app.send_message(text)` — send a message programmatically (wraps the full generation pipeline)
+- `app.execute_python_snippet(code, timeout=8)` - restricted Python runner for plugin commands
+- `app._DEFAULT_SYSTEM` - default system prompt string (can be overridden)
+- `app.send_message(text)` - send a message programmatically (wraps the full generation pipeline)
 
 ## Common patterns
 
@@ -11699,7 +10105,7 @@ def register(app):
     global _running; _running = True
     def tick():
         while _running:
-            app._status(time.strftime("🕐 %H:%M:%S"))
+            app._status(time.strftime(" %H:%M:%S"))
             time.sleep(1)
     threading.Thread(target=tick, daemon=True).start()
 def unregister(app):
@@ -11716,10 +10122,10 @@ def register(app):
 ## Rules
 - Always define PLUGIN_INFO as a plain string at module level
 - register(app) is required; unregister(app) is optional
-- Do NOT use blocking I/O or input() — the app is event-driven
+- Do NOT use blocking I/O or input() - the app is event-driven
 - Put all imports at the top
 - Use try/except around risky code
-- Output ONLY raw Python code — no markdown fences, no prose before or after the code
+- Output ONLY raw Python code - no markdown fences, no prose before or after the code
 
 Write a plugin that fulfils the following requirement:
 """
@@ -11981,7 +10387,7 @@ except Exception:
             self.chat_db.delete_meta(self.current_chat_id, "system_prompt")
         return {"ok": True}
 
-    # ── System monitor ─────────────────────────────────────────
+    # -- System monitor -----------------------------------------
 
     def start_monitor(self):
         """Start system monitor thread, emits 'system_stats' events."""
@@ -12010,7 +10416,7 @@ except Exception:
                 time.sleep(3)
         threading.Thread(target=loop, daemon=True).start()
 
-    # ── Persistence helpers ────────────────────────────────────
+    # -- Persistence helpers ------------------------------------
 
     def rate_message(self, chat_id: str, message_index: int, rating):
         """Store a thumbs-up/down rating for a specific message."""
@@ -12021,7 +10427,7 @@ except Exception:
             self.chat_db.set_meta(chat_id, key, "")
         return {"ok": True}
 
-    # ── MCP Server Management ──────────────────────────────────
+    # -- MCP Server Management ----------------------------------
 
     def get_mcp_servers(self):
         """Return list of configured MCP servers and their status."""
@@ -12062,7 +10468,7 @@ except Exception:
         self.chat_db.save_all_chats(self.chats)
         return {"ok": True}
 
-    # ── HuggingFace downloader ─────────────────────────────────
+    # -- HuggingFace downloader ---------------------------------
 
     def search_hf_models(self, query: str):
         """Search HuggingFace for GGUF models with accurate sizes and smart sorting."""
@@ -12186,13 +10592,13 @@ except Exception:
                 except Exception:
                     pass
 
-    # ── Per-model settings ─────────────────────────────────────
+    # -- Per-model settings -------------------------------------
 
     def get_per_model_settings(self):
         """Get per-model settings (temperature, n_ctx, n_threads, etc).
         
         These settings are user-configurable from the UI:
-        - Model Settings button (⚙) in the top panel
+        - Model Settings button in the top panel
         - Settings persist per model in chat_db
         """
         if not self.model_path:
@@ -12219,7 +10625,7 @@ except Exception:
             self.model_config["temperature"] = settings["temperature"]
         return {"ok": True, "n_ctx_changed": n_ctx_changed}
 
-    # ── JSONL Job Queue with Checkpointing ─────────────────────────────────
+    # -- JSONL Job Queue with Checkpointing ---------------------------------
 
     def run_jsonl_queue(
         self,
@@ -12231,8 +10637,8 @@ except Exception:
         """Process a JSONL job queue one task at a time, saving checkpoints.
 
         Each JSONL line must be a JSON object with at minimum:
-          - ``job_id``  (str)  — unique identifier; auto-assigned if missing.
-          - ``type``    (str)  — ``"chat"`` (default) or ``"process_files"``.
+          - ``job_id``  (str)  - unique identifier; auto-assigned if missing.
+          - ``type``    (str)  - ``"chat"`` (default) or ``"process_files"``.
 
         For ``type = "chat"``:
           - ``text``          (str)
@@ -12248,7 +10654,7 @@ except Exception:
         stores one completed-result JSON per line so the queue can resume
         after interruption without re-running finished jobs.
         """
-        # ── Resolve JSONL content ─────────────────────────────────────────
+        # -- Resolve JSONL content -----------------------------------------
         if jsonl_path:
             try:
                 with open(jsonl_path, "r", encoding="utf-8") as _f:
@@ -12259,7 +10665,7 @@ except Exception:
         if not jsonl or not jsonl.strip():
             return {"error": "No JSONL content provided"}
 
-        # ── Parse jobs ────────────────────────────────────────────────────
+        # -- Parse jobs ----------------------------------------------------
         jobs = []
         parse_errors = []
         for _i, _raw in enumerate(jsonl.splitlines(), 1):
@@ -12279,7 +10685,7 @@ except Exception:
         if not jobs:
             return {"error": "No valid jobs found in JSONL", "parse_errors": parse_errors}
 
-        # ── Checkpoint setup ──────────────────────────────────────────────
+        # -- Checkpoint setup ----------------------------------------------
         if not checkpoint_dir:
             checkpoint_dir = os.path.join(app_data_path(), "jsonl_checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -12301,7 +10707,7 @@ except Exception:
                                 completed[_entry["job_id"]] = _entry
                             except Exception:
                                 pass
-                print(f"[JSONL-QUEUE] Resuming — {len(completed)} jobs already done in checkpoint")
+                print(f"[JSONL-QUEUE] Resuming - {len(completed)} jobs already done in checkpoint")
             except Exception as exc:
                 print(f"[JSONL-QUEUE] Warning: could not read checkpoint: {exc}")
 
@@ -12312,7 +10718,7 @@ except Exception:
             except Exception as exc:
                 print(f"[JSONL-QUEUE] Warning: checkpoint write failed: {exc}")
 
-        # ── Run pending jobs ──────────────────────────────────────────────
+        # -- Run pending jobs ----------------------------------------------
         results = list(completed.values())
         newly_done = 0
         total = len(jobs)
@@ -12371,7 +10777,7 @@ except Exception:
         done_count = sum(1 for r in results if r.get("ok"))
         failed_count = sum(1 for r in results if not r.get("ok"))
 
-        print(f"[JSONL-QUEUE] Done: {done_count} succeeded, {failed_count} failed — {checkpoint_file}")
+        print(f"[JSONL-QUEUE] Done: {done_count} succeeded, {failed_count} failed - {checkpoint_file}")
         return {
             "ok": True,
             "total": total,

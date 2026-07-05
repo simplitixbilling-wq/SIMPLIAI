@@ -22,9 +22,9 @@ os.chdir(APP_DIR)
 
 import webview
 from webview.errors import JavascriptException
-from bridge import Bridge
-from local_api_server import LocalApiServer
-from utils import resource_path
+from app_core.bridge import Bridge
+from app_core.local_api_server import LocalApiServer
+from app_core.utils import resource_path
 
 
 def _install_pywebview_callback_race_guard():
@@ -59,7 +59,6 @@ def main():
     api_server = LocalApiServer(bridge)
     api_meta = api_server.start()
     print(f"[LOCAL API] http://{api_meta['host']}:{api_meta['port']}")
-    print(f"[LOCAL API] X-API-Key: {api_meta['api_key']}")
     print(f"[LOCAL API] API key file: {api_meta['api_key_file']}")
 
     # web/ is a read-only bundled resource (--add-data puts it in _MEIPASS)
@@ -86,7 +85,7 @@ def main():
 
     webview.start(
         debug=("--debug" in sys.argv),
-        private_mode=False,
+        private_mode=True,
         storage_path=storage_dir,
     )
 

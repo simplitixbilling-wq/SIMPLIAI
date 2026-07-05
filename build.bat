@@ -11,8 +11,8 @@ if exist "dist\SIMPLE_AI" rmdir /s /q "dist\SIMPLE_AI"
 if exist "build\SIMPLE_AI" rmdir /s /q "build\SIMPLE_AI"
 
 echo [2/5] Generating app icon...
-if exist create_logo.py (
-  ".\venv311_3.11\Scripts\python.exe" create_logo.py
+if exist tools\create_logo.py (
+  ".\venv311_3.11\Scripts\python.exe" tools\create_logo.py
   if errorlevel 1 (
     echo   [WARN] Logo generation failed, continuing without icon.
   )

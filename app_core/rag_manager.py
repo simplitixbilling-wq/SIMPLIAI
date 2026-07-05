@@ -432,7 +432,7 @@ class RAGDatabase:
     #  RETRIEVE: Two-pass multi-signal retrieval
     # ------------------------------------------------------------------
 
-    def retrieve(self, query: str, k: int = 5, source_filter: Optional[List[str]] = None) -> List[Tuple[str, float]]:
+    def retrieve_detailed(self, query: str, k: int = 5, source_filter: Optional[List[str]] = None) -> List[Dict]:
         """
         Two-pass multi-signal retrieval (inspired by NotebookLM).
 
@@ -452,7 +452,8 @@ class RAGDatabase:
             • Neighbor context boost (±1 chunks)
             • Deduplication
 
-        Returns list of (chunk, score) tuples.
+        Returns result dictionaries with chunk text, score, source, metadata,
+        and light neighbor context for citation-aware prompts.
         """
         if self.vectorizer is None or not self.chunks:
             return []
@@ -564,12 +565,35 @@ class RAGDatabase:
                 sig = chunk[:120]
                 if sig not in seen:
                     seen.add(sig)
-                    results.append((chunk, float(final_scores[idx])))
+                    meta = self.metadata[idx] if idx < len(self.metadata) else {}
+                    neighbors = []
+                    for nb in (idx - 1, idx + 1):
+                        if 0 <= nb < len(self.chunks):
+                            nb_meta = self.metadata[nb] if nb < len(self.metadata) else {}
+                            if nb_meta.get("source") == meta.get("source"):
+                                neighbors.append({
+                                    "chunk_index": nb,
+                                    "text": self.chunks[nb],
+                                    "score": float(final_scores.get(nb, 0.0)),
+                                })
+                    results.append({
+                        "chunk": chunk,
+                        "score": float(final_scores[idx]),
+                        "source": self.get_chunk_source(idx),
+                        "chunk_index": idx,
+                        "source_chunk_index": meta.get("chunk_index"),
+                        "metadata": dict(meta),
+                        "neighbors": neighbors,
+                    })
 
             return results
         except Exception as _exc:
             print(f"[RAG] Retrieve error in '{self.name}': {_exc}")
             return []
+
+    def retrieve(self, query: str, k: int = 5, source_filter: Optional[List[str]] = None) -> List[Tuple[str, float]]:
+        """Backward-compatible tuple retrieval API."""
+        return [(item["chunk"], item["score"]) for item in self.retrieve_detailed(query, k, source_filter)]
     
     def get_chunk_source(self, chunk_idx: int) -> str:
         """Get the source file for a given chunk index by tracing --- File: markers"""
@@ -1888,6 +1912,51 @@ class RAGManager:
                 merged[key] = (chunk, md_weighted)
 
         ranked = sorted(merged.values(), key=lambda x: x[1], reverse=True)
+        return ranked[:k]
+
+    def retrieve_detailed(self, rag_name: str, query: str, k: int = 5, source_filter: Optional[List[str]] = None) -> List[Dict]:
+        """Hybrid retrieval with citation metadata for prompt construction and UI sources."""
+        if rag_name not in self.databases:
+            return []
+
+        db = self.databases[rag_name]
+        vec_items = db.retrieve_detailed(query, max(k * 3, 8), source_filter=source_filter)
+        md_candidates = self._search_markdown_snapshot(rag_name, query, top_n=max(k * 2, 6))
+
+        merged: Dict[str, Dict] = {}
+
+        def _key(text: str) -> str:
+            return re.sub(r"\s+", " ", text.strip().lower())[:500]
+
+        for item in vec_items:
+            key = _key(item.get("chunk", ""))
+            if key:
+                merged[key] = dict(item)
+
+        for chunk, score in md_candidates:
+            key = _key(chunk)
+            if not key:
+                continue
+            source_match = re.search(r"---\s*File:\s*(.+?)\s*---", chunk)
+            source = source_match.group(1).strip() if source_match else ""
+            md_weighted = 0.25 + float(score) * 0.35
+            if key in merged:
+                if md_weighted > float(merged[key].get("score", 0.0)):
+                    merged[key]["score"] = md_weighted
+                merged[key]["signals"] = sorted(set(merged[key].get("signals", []) + ["markdown"]))
+            else:
+                merged[key] = {
+                    "chunk": chunk,
+                    "score": md_weighted,
+                    "source": source,
+                    "chunk_index": None,
+                    "source_chunk_index": None,
+                    "metadata": {"source": source, "retrieval": "markdown_snapshot"},
+                    "neighbors": [],
+                    "signals": ["markdown"],
+                }
+
+        ranked = sorted(merged.values(), key=lambda item: float(item.get("score", 0.0)), reverse=True)
         return ranked[:k]
     
     def get_database_info(self, rag_name: str) -> Dict:

@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QCursor
 
-from utils import app_data_path
+from app_core.utils import app_data_path
 
 
 class ChatManagerMixin:

@@ -8,7 +8,7 @@ def resource_path(relative_path: str) -> str:
     """Path to bundled read-only resources inside the PyInstaller package."""
     base_path = getattr(sys, "_MEIPASS", None)
     if base_path is None:
-        base_path = os.path.dirname(os.path.abspath(__file__))
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
 
@@ -18,5 +18,5 @@ def app_data_path(relative_path: str = "") -> str:
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path) if relative_path else base

@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Dict, List
 
-from utils import app_data_path
+from app_core.utils import app_data_path
 
 
 # ══════════════════════════════════════════════════════════════════════════

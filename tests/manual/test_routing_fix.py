@@ -32,7 +32,7 @@ def main():
 
     # ── 1. Load Bridge ──────────────────────────────────────────
     print("\n[1] Importing bridge...")
-    from bridge import Bridge
+    from app_core.bridge import Bridge
     b = Bridge()
     print("    Bridge created.")
 

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from database import ChatDatabase, migrate_json_to_sqlite
+from app_core.database import ChatDatabase, migrate_json_to_sqlite
 
 
 class ChatDatabaseTests(unittest.TestCase):

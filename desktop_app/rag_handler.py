@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
-from utils import app_data_path
-from system_tools import TokenOptimizer
+from app_core.utils import app_data_path
+from app_core.system_tools import TokenOptimizer
 
 
 class RAGHandlerMixin:
@@ -89,7 +89,7 @@ class RAGHandlerMixin:
     def _init_rag_async(self):
         def _worker():
             try:
-                from rag_manager import RAGManager
+                from app_core.rag_manager import RAGManager
                 mgr = RAGManager(base_directory=app_data_path("rag_databases"))
                 self.rag_manager = mgr
                 if not getattr(self, '_shutting_down', False):
@@ -269,7 +269,7 @@ class RAGHandlerMixin:
             return ""
 
     def _create_temporary_rag_for_uploaded_file(self, file_name):
-        from rag_manager import RAGDatabase
+        from app_core.rag_manager import RAGDatabase
         import uuid
 
         if not hasattr(self, "uploaded_content") or not self.uploaded_content:
@@ -648,8 +648,12 @@ class RAGHandlerMixin:
                 all_context += f"\n⚠️ RAG database '{rag_name}' not found\n"
                 continue
 
-            # Use full knowledge.md as context for complete coverage
-            knowledge_md = self.rag_manager.read_knowledge_markdown(rag_name)
+            # Use full knowledge.md as context for complete coverage when the
+            # manager supports it; lightweight managers may only expose retrieve().
+            knowledge_md = ""
+            read_knowledge = getattr(self.rag_manager, "read_knowledge_markdown", None)
+            if callable(read_knowledge):
+                knowledge_md = read_knowledge(rag_name)
             if knowledge_md:
                 all_context += f"\n=== FULL KNOWLEDGE BASE [{rag_name}] ===\n"
                 all_context += knowledge_md
@@ -669,6 +673,22 @@ class RAGHandlerMixin:
                 if not sources_used:
                     sources_used.append(rag_name)
             else:
+                results = self.rag_manager.retrieve(rag_name, query, k=k)
+                if results:
+                    all_context += f"\n--- Context from [{rag_name}] ---\n"
+                    db = self.rag_manager.databases.get(rag_name)
+                    for chunk, _score in results:
+                        all_context += chunk + "\n"
+                        self.last_rag_hits += 1
+                        src = ""
+                        if db and chunk in db.chunks:
+                            try:
+                                src = db.get_chunk_source(db.chunks.index(chunk))
+                            except (ValueError, IndexError):
+                                src = ""
+                        sources_used.append(src or rag_name)
+                    sources_used = list(dict.fromkeys(sources_used))
+                    continue
                 all_context += f"\n⚠️ No relevant content found in [{rag_name}]\n"
 
         return all_context, sources_used

@@ -24,8 +24,8 @@ webview_stub.windows = []
 sys.modules.setdefault("webview", webview_stub)
 
 
-from bridge import Bridge
-from rag_manager import RAGManager
+from app_core.bridge import Bridge
+from app_core.rag_manager import RAGManager
 
 try:
     from llama_cpp import Llama

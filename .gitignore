@@ -17,6 +17,9 @@ dist/
 
 # Runtime data and logs
 *.log
+logs/*.log
+logs/app_stdout.txt
+logs/app_stderr.txt
 app_stdout.txt
 app_stderr.txt
 debug_chat*.log
@@ -24,11 +27,22 @@ sql_debug.log
 
 # Local app state
 chats.db
+local_api_key.txt
+activation_passkey.txt
+generated_activation_key.txt
 webview_data/
 agent_temp/
 exports/
 processed_files/
 rag_databases/
+pdf_extract_cache/
+
+# Generated scratch scripts
+task_script*.py
+
+# Local/generated artifacts
+artifacts/*.wav
+artifacts/*.pdf
 
 # Large model assets
 models/

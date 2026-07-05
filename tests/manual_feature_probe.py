@@ -16,7 +16,7 @@ if str(DESKTOP_APP) not in sys.path:
     sys.path.insert(0, str(DESKTOP_APP))
 
 from rag_handler import RAGHandlerMixin
-from rag_manager import RAGManager
+from app_core.rag_manager import RAGManager
 from ui_components import UIComponentsMixin
 
 try:

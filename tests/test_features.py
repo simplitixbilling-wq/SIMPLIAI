@@ -24,7 +24,7 @@ import importlib, inspect
 
 # Pull only what we need from bridge without running main()
 bridge_source = open(
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge.py"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app_core", "bridge.py"),
     encoding="utf-8"
 ).read()
 

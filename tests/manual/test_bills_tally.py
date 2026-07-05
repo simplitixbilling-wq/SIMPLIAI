@@ -14,7 +14,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
-from bridge import Bridge
+from app_core.bridge import Bridge
 
 
 def read_file(path):
